@@ -1,0 +1,31 @@
+rfdata_root: /root/autodl-tmp/ResMamba_Signal_Model/dataset
+pool: pretrain_train
+iq_normalize: joint_power
+dataset_balanced_sampling: true
+balanced_sampling_strategy: length_bucket
+sequence_packing: false
+# communication_emitters 见 configs/excluded_datasets.yaml，不参与预训练 pool
+# pad + 同长度桶 batch；桶间均匀、桶内各子 H5 等权（length_bucket 默认行为）
+# 2048 桶 bs=256 峰值约 74GB（95GB 卡）；短序列桶显存更低
+epochs: 5
+batch_size: 192
+num_workers: 12
+prefetch_factor: 4
+max_grad_norm: 1.0
+early_stopping_patience: 0
+early_stopping_min_delta: 0.0
+gradient_accumulation_steps: 2
+learning_rate: 5.0e-5
+warmup_steps: 1500
+lr_schedule: warmup_cosine
+lr_min_ratio: 0.1
+lr_scale_with_grad_accum: true
+loss_weights:
+  mae: 1.0
+  physical: 0.2
+  future: 0.05
+  mod_metric: 0.05
+  emitter_metric: 0.05
+  multi_consistency: 0.05
+  orthogonality: 0.02
+  vicreg: 0.01

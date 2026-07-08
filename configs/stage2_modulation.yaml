@@ -1,0 +1,24 @@
+stage: stage2
+task: modulation
+pool: downstream_modulation_train
+val_pool: downstream_modulation_val
+iq_normalize: joint_power
+# 同 I/Q 长度组 batch；桶间等权、桶内子 H5 等权
+dataset_balanced_sampling: true
+balanced_sampling_strategy: length_bucket
+selection_metric: f1
+early_stopping_patience: 8
+val_subset_fraction: 0.2
+val_subset_seed: 42
+val_subset_resample_each_epoch: true
+gradient_accumulation_steps: 2
+warmup_steps: 1000
+lr_schedule: warmup_cosine
+lr_min_ratio: 0.1
+lr_scale_with_grad_accum: true
+freeze_backbone: true
+unfreeze_modulation_backbone: true
+unfreeze_emitter_backbone: false
+learning_rate: 0.00005
+batch_size: 256
+epochs: 40

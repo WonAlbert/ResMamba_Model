@@ -1,0 +1,17 @@
+model:
+  d_model: 64
+  encoder_layers: 1
+  decoder_layers: 1
+  space_layers: 1
+  mamba_d_state: 16
+  mamba_d_conv: 4
+  mamba_expand: 2
+  mamba_headdim: 32
+  dropout: 0.1
+  patch_size: 8
+  mask_ratio: 0.5
+  max_tokens: 64
+  num_datasets: 8
+  num_mod_classes: 64
+  num_emitters: 256
+  num_prototypes: 32

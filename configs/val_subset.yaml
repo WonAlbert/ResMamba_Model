@@ -1,0 +1,7 @@
+# 所有阶段 / 所有任务：每 epoch 验证使用各子 H5 内按类别均匀抽取的子集
+val_subset_fraction: 0.2
+val_subset_seed: 42
+val_subset_resample_each_epoch: true
+# 下列子数据集验证时使用全量 val（不受 fraction / max_per_dataset 限制）
+val_subset_full_datasets:
+  - open_real_data

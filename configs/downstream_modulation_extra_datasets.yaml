@@ -1,0 +1,4 @@
+# 调制识别下游 pool 额外纳入的数据集（H5 内 source_label_id 与 mod_label_id 对齐）
+datasets:
+  - open_real_data
+  - electromagnetic_0926

@@ -1,0 +1,29 @@
+stage: stage2
+task: emitter
+pool: downstream_emitter_train
+val_pool: downstream_emitter_val
+emitter_downstream_datasets:
+  - adsb2
+  - wifi150
+  - radar_emitters
+iq_normalize: joint_power
+dataset_balanced_sampling: true
+balanced_sampling_strategy: length_bucket_class
+selection_metric: per_dataset_macro_acc
+early_stopping_patience: 10
+val_subset_fraction: 0.2
+val_subset_seed: 42
+val_subset_resample_each_epoch: true
+gradient_accumulation_steps: 4
+warmup_steps: 100
+lr_schedule: warmup_cosine
+lr_min_ratio: 0.1
+lr_scale_with_grad_accum: true
+# 微调：解冻完整 backbone（freeze_backbone=false）；任务路径开关在此无效
+freeze_backbone: false
+unfreeze_modulation_backbone: false
+unfreeze_emitter_backbone: false
+emitter_contrastive_weight: 0.25
+learning_rate: 0.0001
+batch_size: 32
+epochs: 50

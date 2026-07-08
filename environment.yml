@@ -1,0 +1,11 @@
+# 本项目绑定 conda 环境 won（Python 3.10 + CUDA PyTorch）
+# 创建：conda env create -f environment.yml
+# 更新：conda env update -f environment.yml --prune
+name: won
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - -r requirements.txt

@@ -1,0 +1,4 @@
+# 仅从 stage2 下游任务与微调适配 pool 中排除（预训练 pool 仍保留）
+# xidian14 在下游调制/聚类表现差，改由 open_real_data / electromagnetic_0926 承担非 RML 域
+datasets:
+  - xidian14

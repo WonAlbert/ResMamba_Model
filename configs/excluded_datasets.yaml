@@ -1,0 +1,4 @@
+# 从所有 task pool（含预训练、下游、预测、聚类）中排除的子数据集
+# communication_emitters（30 类通信个体）质量/域差异大，不参与任何下游与预训练 pool
+datasets:
+  - communication_emitters

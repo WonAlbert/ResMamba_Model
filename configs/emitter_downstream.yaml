@@ -1,0 +1,6 @@
+# 个体识别下游 stage2 / 微调使用的 emitter 子数据集
+# communication_emitters 已在 configs/excluded_datasets.yaml 中全局排除
+datasets:
+  - adsb2
+  - wifi150
+  - radar_emitters
