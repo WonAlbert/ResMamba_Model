@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "resmamba-signal-model"
 version = "0.1.0"
-description = "ResMamba RF signal foundation model with multi-space routing and metric pretraining losses."
+description = "ResMamba RF signal foundation model with hybrid Mamba-Transformer encoder and Lightning training."
 requires-python = ">=3.10"
 dependencies = [
   "torch>=2.1",
@@ -13,6 +13,7 @@ dependencies = [
   "h5py>=3.8",
   "pyyaml>=6.0",
   "einops>=0.7.0",
+  "lightning>=2.4",
 ]
 
 [tool.setuptools]
@@ -21,3 +22,10 @@ package-dir = {"" = "."}
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["resmamba_signal_model*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+filterwarnings = [
+  "ignore:`isinstance\\(treespec, LeafSpec\\)` is deprecated:FutureWarning",
+]

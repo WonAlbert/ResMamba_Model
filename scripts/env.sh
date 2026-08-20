@@ -27,6 +27,8 @@ conda activate "${_CONDA_ENV_NAME}"
 cd "${_PROJECT_ROOT}"
 export PYTHONPATH="${_PROJECT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 export RFDATA_ROOT="${RFDATA_ROOT:-${_PROJECT_ROOT}/dataset}"
+# Hugging Face 国内镜像（https://hf-mirror.com）；直连可 export HF_ENDPOINT=https://huggingface.co
+export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-20}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-20}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-20}"

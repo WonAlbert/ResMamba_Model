@@ -10,3 +10,5 @@ def normalize_thread_env(default: str | None = None) -> None:
     for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         if os.environ.get(key, "0") in ("", "0"):
             os.environ[key] = default
+    # 必须在首次 CUDA 初始化之前设置，缓解碎片 OOM、便于吃满 96GB
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
