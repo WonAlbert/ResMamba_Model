@@ -86,8 +86,8 @@ python scripts/infer.py --task modulation --checkpoint runs/experiments/<run>/ck
 
 - **Encoder**：`M-M-M-M-M-T`；预训练 `encode_visible_only`；超长序列 chunk 均值记忆 + RoPE。
 - **Decoder**：恰好 1 层 `DecoderBlock`；token 通路重建，readout 通路 `[DEC]` + AttnPool → `z`。
-- **Tokenizer**：共享 stem + 多尺度时域 + 频域分带；无 dataset/task token。
-- **物理约束**：patch 级 log_power / PAPR / IQ 相关 / 方差比 / 谱质心；分类在归一化表征空间，重建在 RevIN denorm 后。
+- **Tokenizer**：共享 stem + 多尺度时域 + 复数双侧频谱分带（`fft` + `fftshift` 后再均分）；无 dataset/task token。
+- **物理约束**：patch 级 log_power / PAPR / IQ 相关 / 方差比 / 谱质心（`fftfreq`）；软约束 SmoothL1 + 硬约束能量投影。分类在归一化表征空间，重建在 RevIN denorm 后。
 - **变长**：`sequence_packing=true`；`TokenBudgetSampler`；`L < 16` 报错；`L > 8192` 重叠切块。
 - **多域**：`z` 上 Domain GRL；跨域 InfoNCE 仅标签可对齐时启用。
 
