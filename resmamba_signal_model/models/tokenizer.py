@@ -6,128 +6,144 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from resmamba_signal_model.models.physics import PHYS_DIM, patch_physics, safe_angle, safe_complex_abs
+from resmamba_signal_model.models.varlen import n_patches, pad_time_to_patch, patchify_iq
+
 
 @dataclass
-class MultiScaleTokenizerConfig:
-    d_model: int = 256
-    patch_size: int = 8
-    max_tokens: int = 1024
-    num_datasets: int = 16
-    num_tasks: int = 2
+class TimeFreqTokenizerConfig:
+    d_model: int = 640
+    patch_size: int = 16
+    stem_channels: int = 64
     kernels: tuple[int, ...] = field(default_factory=lambda: (4, 8, 16, 32))
+    freq_bands: int = 8
     dropout: float = 0.1
+    physics_bias: bool = True
+    phase_plugin: bool = False
+    l_min: int = 16
 
 
-class ResConv1DBlock(nn.Module):
-    def __init__(self, channels: int, kernel_size: int, dropout: float = 0.0) -> None:
-        super().__init__()
-        pad = kernel_size // 2
-        self.net = nn.Sequential(
-            nn.GroupNorm(1, channels), nn.GELU(), nn.Conv1d(channels, channels, kernel_size, padding=pad),
-            nn.Dropout(dropout), nn.GroupNorm(1, channels), nn.GELU(), nn.Conv1d(channels, channels, 1),
-        )
-        self.kernel_size = kernel_size
+def _band_pool(logmag: torch.Tensor, n_bands: int) -> torch.Tensor:
+    """将 rfft log-magnitude 均分成 n_bands。``logmag``: [..., F]。"""
+    n_freq = int(logmag.shape[-1])
+    bands = max(1, min(int(n_bands), n_freq))
+    edges = torch.linspace(0, n_freq, bands + 1, device=logmag.device)
+    parts: list[torch.Tensor] = []
+    for i in range(bands):
+        start = int(edges[i].item())
+        end = max(start + 1, int(edges[i + 1].item()))
+        parts.append(logmag[..., start:end].mean(dim=-1))
+    pooled = torch.stack(parts, dim=-1)
+    if bands < n_bands:
+        pooled = F.pad(pooled, (0, n_bands - bands))
+    return pooled
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.net(x)
-        if y.shape[-1] != x.shape[-1]:
-            y = y[..., : x.shape[-1]]
-        return x + y
 
+class TimeFreqTokenizer(nn.Module):
+    """共享 stem + 时域 depthwise 多尺度 + 与时间对齐的频域分带，不注入任务 token。"""
 
-class MultiScaleResNetTokenizer(nn.Module):
-    num_special_tokens = 4
-    physical_token_index = 3
-
-    def __init__(self, cfg: MultiScaleTokenizerConfig) -> None:
+    def __init__(self, cfg: TimeFreqTokenizerConfig) -> None:
         super().__init__()
         self.cfg = cfg
-        branch_dim = max(8, cfg.d_model // len(cfg.kernels))
-        self.branches = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv1d(2, branch_dim, kernel_size=k, stride=cfg.patch_size, padding=k // 2),
-                ResConv1DBlock(branch_dim, k, dropout=cfg.dropout),
-                ResConv1DBlock(branch_dim, max(3, k // 2), dropout=cfg.dropout),
-            )
-            for k in cfg.kernels
-        ])
-        self.patch_proj = nn.Sequential(nn.LayerNorm(branch_dim * len(cfg.kernels)), nn.Linear(branch_dim * len(cfg.kernels), cfg.d_model), nn.GELU(), nn.Linear(cfg.d_model, cfg.d_model))
-        self.physical_proj = nn.Sequential(nn.LayerNorm(5), nn.Linear(5, cfg.d_model), nn.GELU(), nn.Linear(cfg.d_model, cfg.d_model))
-        self.dataset_embed = nn.Embedding(cfg.num_datasets + 1, cfg.d_model)
-        self.task_embed = nn.Embedding(cfg.num_tasks, cfg.d_model)
-        self.cls = nn.Parameter(torch.zeros(1, 1, cfg.d_model))
-        self.pos = nn.Parameter(torch.zeros(1, cfg.max_tokens + self.num_special_tokens, cfg.d_model))
+        c = cfg.stem_channels
+        self.stem = nn.Conv1d(2, c, kernel_size=7, stride=1, padding=3)
+        self.time_branches = nn.ModuleList(
+            [
+                nn.Conv1d(c, c, kernel_size=k, stride=cfg.patch_size, padding=k // 2, groups=c)
+                for k in cfg.kernels
+            ]
+        )
+        self.time_fuse = nn.Conv1d(c * len(cfg.kernels), cfg.d_model, kernel_size=1)
+        self.freq_proj = nn.Linear(cfg.freq_bands, cfg.d_model)
+        self.gate = nn.Linear(cfg.d_model * 2, cfg.d_model)
+        self.physics_proj = nn.Linear(PHYS_DIM, cfg.d_model) if cfg.physics_bias else None
+        self.phase_proj = nn.Linear(4, cfg.d_model, bias=False) if cfg.phase_plugin else None
         self.dropout = nn.Dropout(cfg.dropout)
-        nn.init.normal_(self.cls, std=0.02)
-        nn.init.normal_(self.pos, std=0.02)
+        self.norm = nn.LayerNorm(cfg.d_model)
 
-    @staticmethod
-    def physical_stats(iq: torch.Tensor, sample_mask: torch.Tensor | None = None) -> torch.Tensor:
-        b, _c, length = iq.shape
+    def _time_tokens(self, iq: torch.Tensor, n_tok: int) -> torch.Tensor:
+        h = self.stem(iq)
+        branches = []
+        for conv in self.time_branches:
+            y = conv(h)
+            if y.shape[-1] >= n_tok:
+                y = y[..., :n_tok]
+            else:
+                y = F.pad(y, (0, n_tok - y.shape[-1]))
+            branches.append(y)
+        fused = self.time_fuse(torch.cat(branches, dim=1))
+        return fused.transpose(1, 2).contiguous()
+
+    def _freq_tokens(self, iq_patches: torch.Tensor) -> torch.Tensor:
+        i = iq_patches[:, :, 0].float()
+        q = iq_patches[:, :, 1].float()
+        z = torch.complex(i, q)
+        spec = torch.fft.fft(z, dim=-1)
+        logmag = safe_complex_abs(spec).log()
+        logmag = logmag[..., : spec.shape[-1] // 2 + 1]
+        bands = _band_pool(logmag, self.cfg.freq_bands)
+        return self.freq_proj(bands.to(dtype=iq_patches.dtype))
+
+    def _phase_tokens(self, iq_patches: torch.Tensor) -> torch.Tensor:
+        """相对相位增量 + 相邻样本共轭相关，仅 RF 复数对启用。"""
+        i = iq_patches[:, :, 0].float()
+        q = iq_patches[:, :, 1].float()
+        z = torch.complex(i, q)
+        phase = safe_angle(i, q)
+        dphi = torch.diff(phase, dim=-1, prepend=phase[..., :1])
+        dphi = torch.atan2(torch.sin(dphi), torch.cos(dphi))
+        mean_dphi = dphi.mean(dim=-1)
+        std_dphi = dphi.std(dim=-1, unbiased=False)
+        if z.shape[-1] > 1:
+            conj = (z[..., :-1].conj() * z[..., 1:]).mean(dim=-1)
+        else:
+            conj = torch.zeros_like(z[..., 0])
+        stats = torch.stack([mean_dphi, std_dphi, conj.real, conj.imag], dim=-1)
+        stats = torch.nan_to_num(stats, nan=0.0, posinf=0.0, neginf=0.0)
+        assert self.phase_proj is not None
+        return self.phase_proj(stats.to(dtype=iq_patches.dtype))
+
+    def forward(
+        self,
+        iq: torch.Tensor,
+        sample_mask: torch.Tensor | None = None,
+        *,
+        modality_id: torch.Tensor | None = None,
+        complex_pair: torch.Tensor | bool | None = True,
+        **_unused,
+    ) -> dict[str, torch.Tensor]:
+        if iq.ndim != 3 or iq.shape[1] != 2:
+            raise ValueError(f"tokenizer 期望 iq [B,2,L]，当前 {tuple(iq.shape)}")
+        batch, _c, length = iq.shape
         if sample_mask is None:
-            sample_mask = torch.ones(b, length, dtype=torch.bool, device=iq.device)
-        mask = sample_mask.unsqueeze(1).float()
-        denom = mask.sum(dim=-1).clamp_min(1.0)
-        power_t = iq.float().square().sum(dim=1)
-        power = (power_t * sample_mask.float()).sum(dim=-1) / sample_mask.float().sum(dim=-1).clamp_min(1.0)
-        peak = power_t.masked_fill(~sample_mask, 0.0).max(dim=-1).values.clamp_min(1.0e-8)
-        papr = peak / power.clamp_min(1.0e-8)
-        mean = (iq.float() * mask).sum(dim=-1, keepdim=True) / denom.unsqueeze(-1)
-        centered = (iq.float() - mean) * mask
-        var = centered.square().sum(dim=-1) / denom
-        corr = (centered[:, 0] * centered[:, 1]).sum(dim=-1) / (denom[:, 0] * torch.sqrt(var[:, 0] * var[:, 1]).clamp_min(1.0e-8))
-        ratio = var[:, 0] / var[:, 1].clamp_min(1.0e-8)
-        stats = torch.stack([torch.log1p(power), torch.log1p(peak), papr, corr, torch.log1p(ratio)], dim=-1)
-        return torch.nan_to_num(stats, nan=0.0, posinf=0.0, neginf=0.0)
-
-    def _patchify_iq(self, iq: torch.Tensor, sample_mask: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
-        b, c, length = iq.shape
-        p = self.cfg.patch_size
-        pad = (p - length % p) % p
-        if pad:
-            iq = F.pad(iq, (0, pad))
-            if sample_mask is not None:
-                sample_mask = F.pad(sample_mask, (0, pad), value=False)
-        patches = iq.unfold(-1, p, p).transpose(1, 2).contiguous()
-        patch_mask = torch.ones(b, patches.shape[1], dtype=torch.bool, device=iq.device)
-        if sample_mask is not None:
-            patch_mask = sample_mask.unfold(-1, p, p).any(dim=-1)
-        return patches, patch_mask
-
-    def forward(self, iq: torch.Tensor, sample_mask: torch.Tensor | None = None, dataset_id: torch.Tensor | None = None, task_type_id: torch.Tensor | None = None, **_metadata) -> dict[str, torch.Tensor]:
-        b, _c, length = iq.shape
-        if sample_mask is None:
-            sample_mask = torch.ones(b, length, dtype=torch.bool, device=iq.device)
-        branch_tokens = [branch(iq) for branch in self.branches]
-        min_t = min(x.shape[-1] for x in branch_tokens)
-        conv = torch.cat([x[..., :min_t] for x in branch_tokens], dim=1).transpose(1, 2).contiguous()
-        patch_tokens = self.patch_proj(conv)
-        iq_patches, patch_mask = self._patchify_iq(iq, sample_mask)
-        limit = min(patch_tokens.shape[1], patch_mask.shape[1], self.cfg.max_tokens)
-        patch_tokens = patch_tokens[:, :limit]
-        patch_mask = patch_mask[:, :limit]
-        iq_patches = iq_patches[:, :limit]
-
-        if dataset_id is None:
-            dataset_id = torch.zeros(b, dtype=torch.long, device=iq.device)
-        dataset_id = dataset_id.long().clamp(0, self.cfg.num_datasets)
-        if task_type_id is None:
-            task_type_id = torch.zeros(b, dtype=torch.long, device=iq.device)
-        task_type_id = task_type_id.long().clamp(0, self.cfg.num_tasks - 1)
-        cls = self.cls.expand(b, -1, -1)
-        dataset_token = self.dataset_embed(dataset_id).unsqueeze(1)
-        task_token = self.task_embed(task_type_id).unsqueeze(1)
-        physical_stats = self.physical_stats(iq, sample_mask)
-        physical_token = self.physical_proj(physical_stats).unsqueeze(1)
-        tokens = torch.cat([cls, dataset_token, task_token, physical_token, patch_tokens], dim=1)
-        token_mask = torch.cat([torch.ones(b, self.num_special_tokens, dtype=torch.bool, device=iq.device), patch_mask], dim=1)
-        tokens = self.dropout(tokens + self.pos[:, : tokens.shape[1]])
+            sample_mask = torch.ones(batch, length, dtype=torch.bool, device=iq.device)
+        orig_len = length
+        n_tok = n_patches(length, self.cfg.patch_size)
+        iq_p, mask_p = pad_time_to_patch(iq, sample_mask, self.cfg.patch_size)
+        time_tok = self._time_tokens(iq_p, n_tok)
+        iq_patches, patch_mask = patchify_iq(iq, sample_mask, self.cfg.patch_size)
+        n_tok = min(n_tok, iq_patches.shape[1], time_tok.shape[1])
+        time_tok = time_tok[:, :n_tok]
+        iq_patches = iq_patches[:, :n_tok]
+        patch_mask = patch_mask[:, :n_tok]
+        freq_tok = self._freq_tokens(iq_patches)
+        gate = torch.sigmoid(self.gate(torch.cat([time_tok, freq_tok], dim=-1)))
+        tokens = gate * time_tok + (1.0 - gate) * freq_tok
+        phys, phys_mask = patch_physics(iq_patches, modality_id=modality_id, complex_pair=complex_pair, return_mask=True)
+        phys = phys.detach()
+        if self.physics_proj is not None:
+            tokens = tokens + self.physics_proj(phys.to(dtype=tokens.dtype))
+        if self.phase_proj is not None:
+            tokens = tokens + self._phase_tokens(iq_patches)
+        tokens = self.dropout(self.norm(tokens))
+        tokens = tokens.masked_fill(~patch_mask.unsqueeze(-1), 0.0)
         return {
             "tokens": torch.nan_to_num(tokens),
-            "token_mask": token_mask,
+            "token_mask": patch_mask,
             "patch_mask": patch_mask,
             "iq_patch_targets": iq_patches,
-            "physical_stats": physical_stats,
-            "patch_offset": self.num_special_tokens,
-            "physical_token_index": self.physical_token_index,
+            "patch_physics": phys,
+            "physics_mask": phys_mask,
+            "orig_length": torch.full((batch,), orig_len, device=iq.device, dtype=torch.long),
+            "patch_offset": 0,
         }
