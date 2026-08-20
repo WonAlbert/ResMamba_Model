@@ -42,11 +42,27 @@ def flip_segments(x: torch.Tensor, cu_seqlens: torch.Tensor, *, dim: int = 1) ->
     return out
 
 
+def flip_packed_tokens(x: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+    """向量化反转 packed (1, total, D) 中每条序列；结果仍按 cu_seqlens 拼接。"""
+    padded, valid = unpack_packed_tokens(x, cu_seqlens)
+    lengths = valid.sum(dim=1)
+    max_len = padded.shape[1]
+    idx = torch.arange(max_len, device=x.device).view(1, -1)
+    rev_pos = (lengths.unsqueeze(1) - 1 - idx).clamp(min=0)
+    gather_index = rev_pos.unsqueeze(-1).expand_as(padded)
+    flipped = padded.gather(1, gather_index).masked_fill(~valid.unsqueeze(-1), 0)
+    return repack_tokens(flipped, cu_seqlens)
+
+
 def apply_segments(x: torch.Tensor, cu_seqlens: torch.Tensor, fn, *, dim: int = 1) -> torch.Tensor:
     parts: list[torch.Tensor] = []
     for start, end in segment_slices(cu_seqlens):
+        if end <= start:
+            continue
         seg = x.narrow(dim, start, end - start)
         parts.append(fn(seg))
+    if not parts:
+        return x
     return torch.cat(parts, dim=dim)
 
 
@@ -93,3 +109,32 @@ def repack_tokens(y: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
     if not parts:
         return y.new_zeros(1, 0, y.shape[-1])
     return torch.cat(parts, dim=1)
+
+
+def pack_valid_tokens(tokens: torch.Tensor, valid: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """将 ``[B, N, D]`` 中 ``valid`` 位置按行优先打包为 ``[1, total, D]``。"""
+    if tokens.ndim != 3 or valid.ndim != 2:
+        raise ValueError(f"pack_valid_tokens 期望 tokens [B,N,D]、valid [B,N]，当前 {tuple(tokens.shape)} / {tuple(valid.shape)}")
+    if tokens.shape[:2] != valid.shape:
+        raise ValueError("tokens 与 valid 的 batch/长度不一致")
+    lengths = valid.sum(dim=1).to(dtype=torch.long)
+    packed = tokens[valid].unsqueeze(0)
+    if packed.numel() == 0:
+        packed = tokens.new_zeros(1, 0, tokens.shape[-1])
+    cu_seqlens = build_cu_seqlens(lengths, device=tokens.device)
+    seq_idx = build_seq_idx(lengths, device=tokens.device)
+    return packed, cu_seqlens, seq_idx
+
+
+def scatter_packed_tokens(packed: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """将 packed ``[1, total, D]`` 按 ``valid`` 行优先写回 ``[B, N, D]``。"""
+    if packed.ndim != 3 or packed.shape[0] != 1:
+        raise ValueError(f"scatter_packed_tokens 期望 packed [1, total, D]，当前 {tuple(packed.shape)}")
+    out = packed.new_zeros(valid.shape[0], valid.shape[1], packed.shape[-1])
+    n_valid = int(valid.sum().item())
+    if n_valid == 0:
+        return out
+    if packed.shape[1] != n_valid:
+        raise ValueError(f"packed 长度 {packed.shape[1]} 与 valid 计数 {n_valid} 不一致")
+    out[valid] = packed.reshape(-1, packed.shape[-1])
+    return out

@@ -12,16 +12,23 @@ from resmamba_signal_model.data.rfdata import RFDataH5Dataset, RFDataPoolDataset
 from resmamba_signal_model.data.sampling import pool_segments
 from resmamba_signal_model.training.emitter_labels import h5_dataset_name
 
-LABEL_FIELD_CANDIDATES = ("emitter_id", "mod_label_id", "source_label_id", "global_label_id")
+LABEL_FIELD_CANDIDATES = (
+    "canonical_mod_label_id",
+    "global_emitter_id",
+    "emitter_id",
+    "mod_label_id",
+    "source_label_id",
+    "global_label_id",
+)
 
 
 def resolve_val_label_field(stage: str, task: str) -> str:
     if stage == "pretrain":
         return "auto"
     if task == "emitter":
-        return "emitter_id"
+        return "global_emitter_id"
     if task == "modulation":
-        return "mod_label_id"
+        return "canonical_mod_label_id"
     if task == "clustering":
         return "global_label_id"
     if task == "prediction":
