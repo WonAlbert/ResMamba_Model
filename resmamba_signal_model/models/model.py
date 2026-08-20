@@ -473,7 +473,13 @@ class SignalFoundationModel(nn.Module):
         stacked = feats[0] if len(feats) == 1 else torch.stack(feats, dim=0).mean(dim=0)
         return self.domain_disc(self.grl(stacked))
 
-    def _attach_uti_readouts(self, out: dict[str, Any], *, task: str = "pretrain") -> dict[str, Any]:
+    def _attach_uti_readouts(
+        self,
+        out: dict[str, Any],
+        *,
+        task: str = "pretrain",
+        allow_dataset_condition: bool = True,
+    ) -> dict[str, Any]:
         if self.task_interface is None:
             return out
         patch_h = out.get("h_general", out.get("patch_h"))
@@ -494,6 +500,9 @@ class SignalFoundationModel(nn.Module):
         target_coord = out.get("target_mask", torch.zeros_like(out["patch_mask"]))
         query_coords = torch.cat([pos, target_coord.to(dtype=patch_h.dtype).unsqueeze(-1)], dim=-1)
         spec = default_task_spec(task)
+        metadata = out.get("task_metadata")
+        if not allow_dataset_condition and isinstance(metadata, dict):
+            metadata = {k: v for k, v in metadata.items() if k != "dataset_id"}
         features = self.task_interface(
             out.get("z_general", out["z"]),
             patch_h,
@@ -501,7 +510,7 @@ class SignalFoundationModel(nn.Module):
             spec,
             recon_norm=out.get("recon_norm"),
             views=view_pairs,
-            metadata=out.get("task_metadata"),
+            metadata=metadata,
             query_coords=query_coords,
         )
         out["uti_pooled"] = features.pooled
@@ -1377,13 +1386,17 @@ class SignalFoundationModel(nn.Module):
                     dataset_id=dataset_id,
                 )
             elif mode in ("pretrain", "mae"):
+                # 任务无关预训练：Decoder/UTI 条件不注入 dataset_id，避免重建偷域。
+                pretrain_meta = task_metadata
+                if isinstance(pretrain_meta, dict):
+                    pretrain_meta = {k: v for k, v in pretrain_meta.items() if k != "dataset_id"}
                 task_context = self.task_interface.condition_vector(
                     default_task_spec("pretrain"),
                     iq_t.shape[0],
                     device=iq_t.device,
                     dtype=iq_t.dtype,
-                    metadata=task_metadata,
-                    dataset_id=dataset_id,
+                    metadata=pretrain_meta,
+                    dataset_id=None,
                 )
         if truncate:
             with torch.no_grad():
@@ -1413,7 +1426,7 @@ class SignalFoundationModel(nn.Module):
             out["task_metadata"] = task_metadata
 
         if mode in ("pretrain", "mae") and self.task_interface is not None:
-            out = self._attach_uti_readouts(out, task="pretrain")
+            out = self._attach_uti_readouts(out, task="pretrain", allow_dataset_condition=False)
         if task_mode and task:
             out = self.forward_tasks(out, task, dataset_id=dataset_id)
         return out

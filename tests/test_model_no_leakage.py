@@ -165,3 +165,20 @@ def test_stage2_prediction_grads_go_to_head_not_frozen_decoder() -> None:
     assert any(grad is not None and float(grad.abs().sum()) > 0.0 for grad in head_grads)
     for param in model.decoder.parameters():
         assert param.grad is None
+
+
+def test_pretrain_ignores_dataset_id_in_decoder_condition() -> None:
+    """预训练改变 dataset_id 不得改变骨干表征/重建（条件不注入域）。"""
+    torch.manual_seed(0)
+    model = SignalFoundationModel(_cfg(build_task_interface=True, build_task_heads=True)).eval()
+    iq = torch.randn(2, 2, 64)
+    mask = torch.ones(2, 64, dtype=torch.bool)
+    batch0 = {"iq": iq, "sample_mask": mask, "dataset_id": torch.zeros(2, dtype=torch.long)}
+    batch1 = {"iq": iq, "sample_mask": mask, "dataset_id": torch.ones(2, dtype=torch.long)}
+    torch.manual_seed(42)
+    out0 = model(batch0, mode="pretrain")
+    torch.manual_seed(42)
+    out1 = model(batch1, mode="pretrain")
+    assert torch.allclose(out0["z"], out1["z"], atol=1.0e-5, rtol=1.0e-5)
+    assert torch.allclose(out0["recon_norm"], out1["recon_norm"], atol=1.0e-5, rtol=1.0e-5)
+    assert torch.allclose(out0["uti_pooled"], out1["uti_pooled"], atol=1.0e-5, rtol=1.0e-5)
