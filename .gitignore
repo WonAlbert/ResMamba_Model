@@ -1,7 +1,14 @@
+# Local / IDE
 .conda-env
 .vscode
-.gitignore
 .pytest_cache
+*.pytest_cache
+__pycache__/
+*.pyc
+.ssh
+.ssh.pub
+
+# Secrets / env
 .env
 .env.local
 .env.development
@@ -10,18 +17,24 @@
 .env.development.local
 .env.test.local
 .env.production.local
-.env.development
-.env.test
-.env.production
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
+
+# Datasets and derived artifacts (do not upload)
+dataset/
 *.h5
-*.pytest_cache
-events.*
-*.log
+*.hdf5
+*.npy
+*.npz
+*.zip
+
+# Training runs, logs, checkpoints, TensorBoard
+runs/
+checkpoints/
+*.ckpt
 *.pt
-*.pyc
+*.pth
+*.log
+events.*
 checkpoints.json
 run_config.json
+*_launch.log
+*_current_run_name.txt
