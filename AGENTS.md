@@ -64,7 +64,7 @@ python scripts/infer.py --task modulation --checkpoint runs/experiments/<run>/ck
 
 ### 阶段二（仅训练任务头 / 冻结骨干）
 
-条件：`--stage stage2`，骨干冻结，`train_heads: true`，截断反传；从预训练 `best.ckpt` 初始化。
+条件：`--stage stage2`，骨干冻结；训 UTI + 任务头；并训 **`z_general` 线性探针**（指标 `val/acc_{task}_z`，用于验收通用表征，不替代主头）。截断反传；从预训练 `best.ckpt` 初始化。
 
 | 任务 | 指标 | 阈值 |
 |------|------|------|
@@ -89,9 +89,9 @@ python scripts/infer.py --task modulation --checkpoint runs/experiments/<run>/ck
 - **Tokenizer**：共享 stem + 多尺度时域 + 复数双侧频谱分带（`fft` + `fftshift` 后再均分）；无 dataset/task token。
 - **物理约束**：patch 级 log_power / PAPR / IQ 相关 / 方差比 / 谱质心（`fftfreq`）；软约束 SmoothL1 + 硬约束能量投影。分类在归一化表征空间，重建在 RevIN denorm 后。
 - **变长**：`sequence_packing=true`；`TokenBudgetSampler`；`L < 16` 报错；`L > 8192` 重叠切块。
-- **多域**：`z` 上 Domain GRL；跨域 InfoNCE 仅标签可对齐时启用。
+- **多域**：Domain GRL **只**约束 UTI 声明不变的低秩视图（默认 `semantic`），梯度不进入 `z_general`；预训练默认关闭 domain 损失。跨域对比学习仅在下游标签可对齐时启用（如调制 contrastive），预训练无 InfoNCE。
 
-预训练损失：`L_mae + λ_phys L_phys + λ_impute L_span + λ_readout L_global_phys + λ_domain L_grl`。默认 `iq_normalize: none`（幅度由 RevIN 处理）。
+预训练损失（默认权重见 `configs/pretrain.yaml`）：`L_mae + λ_phys L_phys + λ_impute L_span + λ_struct L_structure + λ_phase L_structure_phase + λ_readout L_global_phys + λ_latent L_EMA(z)`。`domain` / `uti_*` 默认关闭，避免预训练偏离任务无关骨干学习。默认 `iq_normalize: none`（幅度由 RevIN 处理）。预训练不向 Decoder/UTI 注入 `dataset_id`。
 
 ## 配置索引
 

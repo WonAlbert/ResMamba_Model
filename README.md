@@ -41,7 +41,7 @@ pytest -q
 - **Tokenizer**：共享 stem + depthwise 多尺度时域 + 与时间对齐的频域分带；无 dataset/task token。
 - **物理约束**：patch 级 log_power / PAPR / IQ 相关 / 方差比 / 谱质心；软约束 SmoothL1 + 硬约束能量投影。分类/聚类在归一化表征空间，重建在 RevIN denorm 之后计算。
 - **变长协议**：`sequence_packing=true`；`TokenBudgetSampler`；`L < L_min=16` 报错；`L > chunk_len=8192` 重叠切块；训练截断增强 `p_trunc=0.3`。
-- **多域**：`z` 上 Domain GRL；跨域 InfoNCE 仅在标签可对齐时（如下游调制）。
+- **多域**：Domain GRL 仅作用于 UTI 不变视图（不进 `z_general`）；预训练默认 `domain: 0`。跨域对比仅下游标签可对齐时使用，预训练无 InfoNCE。
 
 主类：`SignalFoundationModel` / `SignalModelConfig`（`resmamba_signal_model`）。
 
@@ -138,4 +138,4 @@ python scripts/infer.py --task modulation --checkpoint runs/experiments/<run>/ck
 | `configs/datasets.yaml` | 数据池白名单 |
 | `configs/val_subset.yaml` | 验证子集抽样比例 |
 
-预训练损失：`L_mae + λ_phys L_phys + λ_impute L_span + λ_readout L_global_phys + λ_domain L_grl`。
+预训练损失（见 `configs/pretrain.yaml`）：`L_mae + λ_phys L_phys + λ_impute L_span + λ_struct L_structure (+ λ_phase) + λ_readout L_global_phys + λ_latent L_EMA(z)`；`domain`/`uti_*` 默认关闭。预训练不向 Decoder 注入 `dataset_id`。
