@@ -6,7 +6,12 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
-from sklearn.metrics import adjusted_rand_score, f1_score, normalized_mutual_info_score
+from sklearn.metrics import (
+    adjusted_rand_score,
+    f1_score,
+    homogeneity_completeness_v_measure,
+    normalized_mutual_info_score,
+)
 
 
 def _to_numpy(x: torch.Tensor | np.ndarray) -> np.ndarray:
@@ -138,6 +143,81 @@ def classification_epoch_scores(
     }
 
 
+def mean_clusters_per_class(
+    pred_clusters: torch.Tensor | np.ndarray,
+    true_labels: torch.Tensor | np.ndarray,
+    mask: torch.Tensor | np.ndarray | None = None,
+) -> float:
+    """每个真类平均占用多少预测簇；>1 表示过分割倾向。"""
+    pred_np = _to_numpy(pred_clusters)
+    true_np = _to_numpy(true_labels)
+    valid = _valid_mask(true_np, mask)
+    if valid.sum() < 2:
+        return 0.0
+    pred_np = pred_np[valid]
+    true_np = true_np[valid]
+    counts: list[float] = []
+    for lab in np.unique(true_np):
+        counts.append(float(len(np.unique(pred_np[true_np == lab]))))
+    return float(np.mean(counts)) if counts else 0.0
+
+
+def majority_merge_labels(
+    pred_clusters: torch.Tensor | np.ndarray,
+    true_labels: torch.Tensor | np.ndarray,
+    mask: torch.Tensor | np.ndarray | None = None,
+) -> np.ndarray:
+    """将每个预测簇映射到多数真类标签（合并过分割后的伪标签）。"""
+    pred_np = _to_numpy(pred_clusters).astype(np.int64, copy=True)
+    true_np = _to_numpy(true_labels)
+    valid = _valid_mask(true_np, mask)
+    merged = np.full_like(pred_np, fill_value=-1)
+    if valid.sum() == 0:
+        return merged
+    for cid in np.unique(pred_np[valid]):
+        sel = valid & (pred_np == cid)
+        labs, counts = np.unique(true_np[sel], return_counts=True)
+        merged[pred_np == cid] = int(labs[int(np.argmax(counts))])
+    return merged
+
+
+def clustering_overseg_scores(
+    pred_clusters: torch.Tensor | np.ndarray,
+    true_labels: torch.Tensor | np.ndarray,
+    mask: torch.Tensor | np.ndarray | None = None,
+) -> dict[str, float]:
+    """过分割诊断：活跃簇数、每类平均簇数、completeness、多数合并后 NMI。"""
+    pred_np = _to_numpy(pred_clusters)
+    true_np = _to_numpy(true_labels)
+    valid = _valid_mask(true_np, mask)
+    if valid.sum() < 2:
+        return {
+            "n_active_clusters": 0.0,
+            "n_true_classes": 0.0,
+            "mean_clusters_per_class": 0.0,
+            "homogeneity": 0.0,
+            "completeness": 0.0,
+            "v_measure": 0.0,
+            "nmi_merged": 0.0,
+        }
+    pred_v = pred_np[valid]
+    true_v = true_np[valid]
+    n_active = float(len(np.unique(pred_v)))
+    n_true = float(len(np.unique(true_v)))
+    homo, comp, v_meas = _sklearn_metric(homogeneity_completeness_v_measure, true_v, pred_v)
+    merged = majority_merge_labels(pred_v, true_v)
+    nmi_merged = float(_sklearn_metric(normalized_mutual_info_score, true_v, merged))
+    return {
+        "n_active_clusters": n_active,
+        "n_true_classes": n_true,
+        "mean_clusters_per_class": mean_clusters_per_class(pred_v, true_v),
+        "homogeneity": float(homo),
+        "completeness": float(comp),
+        "v_measure": float(v_meas),
+        "nmi_merged": nmi_merged,
+    }
+
+
 def clustering_epoch_scores(
     preds: torch.Tensor | np.ndarray,
     labels: torch.Tensor | np.ndarray,
@@ -149,6 +229,7 @@ def clustering_epoch_scores(
     labels_np = _to_numpy(labels)
     overall = nmi_score(preds_np, labels_np)
     overall_ari = ari_score(preds_np, labels_np)
+    overseg = clustering_overseg_scores(preds_np, labels_np)
     n_valid = int(_valid_mask(labels_np).sum())
     datasets: dict[str, dict[str, float]] = {}
     if dataset_ids is not None:
@@ -162,11 +243,13 @@ def clustering_epoch_scores(
             if n < 2:
                 continue
             name = dataset_display_name(did, dataset_names)
-            datasets[name] = {
+            row = {
                 "nmi": nmi_score(preds_np[mask], labels_np[mask]),
                 "ari": ari_score(preds_np[mask], labels_np[mask]),
                 "n": float(n),
             }
+            row.update(clustering_overseg_scores(preds_np[mask], labels_np[mask]))
+            datasets[name] = row
     mean_nmi = float(np.mean([row["nmi"] for row in datasets.values()])) if datasets else overall
     mean_ari = float(np.mean([row["ari"] for row in datasets.values()])) if datasets else overall_ari
     return {
@@ -177,6 +260,7 @@ def clustering_epoch_scores(
         "mean_ari": mean_ari,
         "n": float(n_valid),
         "datasets": datasets,
+        **overseg,
     }
 
 

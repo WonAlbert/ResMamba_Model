@@ -38,6 +38,10 @@ lambda_recon: 0.0
 modulation_contrastive_weight: 0.25
 emitter_contrastive_weight: 0.25
 supervised_clustering: false
+cluster_utilization_weight: 0.02
+cluster_balance_mix: 0.35
+cluster_sinkhorn_epsilon: 0.1
+cluster_consistency_weight: 1.0
 use_dataset_bias: false
 train_encoder: false
 train_decoder: false

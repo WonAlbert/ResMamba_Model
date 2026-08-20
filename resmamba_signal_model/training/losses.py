@@ -358,10 +358,17 @@ def unsupervised_clustering_loss(
     logits_alt: torch.Tensor | None = None,
     prototypes: torch.Tensor | None = None,
     temperature: float = 0.1,
-    utilization_weight: float = 0.1,
+    utilization_weight: float = 0.02,
     consistency_weight: float = 1.0,
+    balance_mix: float = 0.35,
+    sinkhorn_epsilon: float = 0.1,
+    sinkhorn_iters: int = 3,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """跨视图均衡原型分配 + utilization + 一致性；不使用标签。"""
+    """跨视图原型一致性；Sinkhorn 均衡可混合削弱，降低过分割压力。
+
+    ``balance_mix``∈[0,1]：1=纯 Sinkhorn 均摊；0=仅用 softmax 目标（更易塌缩但不易过分割）。
+    默认 0.35 + 较低 ``utilization_weight``，避免 强制占满全部原型槽。
+    """
     parts: dict[str, torch.Tensor] = {}
     z1 = safe_l2_normalize(embedding.float(), dim=-1)
     if embedding_alt is None:
@@ -386,8 +393,20 @@ def unsupervised_clustering_loss(
         parts["cluster_consistency"] = zero
         parts["cluster_utilization"] = zero
         return zero, parts
-    q1 = sinkhorn_balanced_assignment(logits_a)
-    q2 = sinkhorn_balanced_assignment(logits_b)
+    mix = float(min(1.0, max(0.0, balance_mix)))
+    soft_a = F.softmax(logits_a, dim=-1)
+    soft_b = F.softmax(logits_b, dim=-1)
+    if mix > 0.0:
+        bal_a = sinkhorn_balanced_assignment(
+            logits_a, epsilon=float(sinkhorn_epsilon), n_iters=int(sinkhorn_iters)
+        )
+        bal_b = sinkhorn_balanced_assignment(
+            logits_b, epsilon=float(sinkhorn_epsilon), n_iters=int(sinkhorn_iters)
+        )
+        q1 = mix * bal_a + (1.0 - mix) * soft_a
+        q2 = mix * bal_b + (1.0 - mix) * soft_b
+    else:
+        q1, q2 = soft_a, soft_b
     consistency = 0.5 * (_soft_ce(logits_a, q2) + _soft_ce(logits_b, q1))
     usage_probs = 0.5 * (q1 + q2)
     utilization = _prototype_utilization(usage_probs)
@@ -697,6 +716,11 @@ def downstream_task_loss(
     distill_temperature: float = 2.0,
     distill_confidence: float = 0.5,
     prototype_anchor_weight: float = 0.0,
+    cluster_utilization_weight: float = 0.02,
+    cluster_consistency_weight: float = 1.0,
+    cluster_balance_mix: float = 0.35,
+    cluster_sinkhorn_epsilon: float = 0.1,
+    cluster_sinkhorn_iters: int = 3,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     parts: dict[str, torch.Tensor] = {}
     loss = outputs["z"].new_tensor(0.0) if "z" in outputs else outputs["mae_pred"].new_tensor(0.0)
@@ -776,6 +800,11 @@ def downstream_task_loss(
                 embedding_alt=outputs.get("cluster_embedding_view2"),
                 logits_alt=outputs.get("cluster_logits_view2"),
                 prototypes=outputs.get("cluster_prototypes"),
+                utilization_weight=float(cluster_utilization_weight),
+                consistency_weight=float(cluster_consistency_weight),
+                balance_mix=float(cluster_balance_mix),
+                sinkhorn_epsilon=float(cluster_sinkhorn_epsilon),
+                sinkhorn_iters=int(cluster_sinkhorn_iters),
             )
             parts.update(cluster_parts)
             parts["cluster_unsupervised"] = cluster_loss

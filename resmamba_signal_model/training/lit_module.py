@@ -502,6 +502,11 @@ class SignalLitModule(_Base):
                 distill_temperature=float(self.train_cfg.get("distill_temperature", 2.0)),
                 distill_confidence=float(self.train_cfg.get("distill_confidence", 0.5)),
                 prototype_anchor_weight=float(self.train_cfg.get("prototype_anchor_weight", 0.0)),
+                cluster_utilization_weight=float(self.train_cfg.get("cluster_utilization_weight", 0.02)),
+                cluster_consistency_weight=float(self.train_cfg.get("cluster_consistency_weight", 1.0)),
+                cluster_balance_mix=float(self.train_cfg.get("cluster_balance_mix", 0.35)),
+                cluster_sinkhorn_epsilon=float(self.train_cfg.get("cluster_sinkhorn_epsilon", 0.1)),
+                cluster_sinkhorn_iters=int(self.train_cfg.get("cluster_sinkhorn_iters", 3)),
             )
             n_tokens = outputs["n_tokens"].sum().clamp_min(1).to(dtype=loss.dtype)
             src_losses[name] = float(loss.detach())
@@ -797,6 +802,17 @@ class SignalLitModule(_Base):
             self._log_scalar("val/nmi_within_domain", info["mean_nmi"])
             self._log_scalar(f"val/macro_nmi_{task}", info["mean_nmi"])
             self._log_scalar(f"val/macro_ari_{task}", info["mean_ari"])
+            self._log_scalar("val/cluster_completeness" if task == "clustering" else f"val/completeness_{task}", info["completeness"])
+            self._log_scalar("val/cluster_homogeneity" if task == "clustering" else f"val/homogeneity_{task}", info["homogeneity"])
+            self._log_scalar("val/nmi_merged" if task == "clustering" else f"val/nmi_merged_{task}", info["nmi_merged"])
+            self._log_scalar(
+                "val/mean_clusters_per_class" if task == "clustering" else f"val/mean_clusters_per_class_{task}",
+                info["mean_clusters_per_class"],
+            )
+            self._log_scalar(
+                "val/n_active_clusters" if task == "clustering" else f"val/n_active_clusters_{task}",
+                info["n_active_clusters"],
+            )
             for dataset, row in (info.get("datasets") or {}).items():
                 self._log_scalar(f"val/nmi_{task}/{dataset}", row["nmi"])
         for task, bucket in self._val_recon.items():

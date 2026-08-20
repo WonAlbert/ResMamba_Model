@@ -5,7 +5,14 @@ import warnings
 import numpy as np
 import torch
 
-from resmamba_signal_model.training.metrics import classification_epoch_scores, clustering_epoch_scores, macro_f1, nmi_score
+from resmamba_signal_model.training.metrics import (
+    classification_epoch_scores,
+    clustering_epoch_scores,
+    clustering_overseg_scores,
+    macro_f1,
+    mean_clusters_per_class,
+    nmi_score,
+)
 
 
 def test_classification_epoch_scores_overall_and_per_dataset() -> None:
@@ -34,6 +41,23 @@ def test_clustering_epoch_scores_per_dataset() -> None:
     assert report["mean_nmi"] == (report["datasets"]["adsb2"]["nmi"] + report["datasets"]["wifi150"]["nmi"]) / 2
     assert "ari" in report
     assert -1.0 <= report["ari"] <= 1.0
+    assert report["n_active_clusters"] >= 1.0
+    assert report["mean_clusters_per_class"] >= 1.0
+    assert 0.0 <= report["completeness"] <= 1.0
+    assert 0.0 <= report["nmi_merged"] <= 1.0
+
+
+def test_oversegmentation_raises_mean_clusters_per_class() -> None:
+    # 一类被拆成多簇
+    labels = np.array([0, 0, 0, 0, 1, 1, 1, 1])
+    overseg = np.array([0, 1, 2, 3, 4, 5, 6, 7])
+    matched = np.array([0, 0, 0, 0, 1, 1, 1, 1])
+    assert mean_clusters_per_class(overseg, labels) == 4.0
+    assert mean_clusters_per_class(matched, labels) == 1.0
+    bad = clustering_overseg_scores(overseg, labels)
+    good = clustering_overseg_scores(matched, labels)
+    assert bad["completeness"] < good["completeness"]
+    assert bad["nmi_merged"] >= 0.0
 
 
 def test_high_cardinality_labels_do_not_warn() -> None:

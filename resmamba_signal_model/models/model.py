@@ -102,7 +102,7 @@ class SignalModelConfig:
     num_datasets: int = 32
     num_mod_classes: int = 256
     num_emitters: int = 512
-    num_prototypes: int = 128
+    num_prototypes: int = 32
     use_dataset_bias: bool = False
     low_rank_prototype: bool = True
     prototype_rank: int = 64

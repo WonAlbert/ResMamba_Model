@@ -321,3 +321,16 @@ def test_unsupervised_clustering_zero_vectors_and_huge_logits_finite() -> None:
     loss, parts = unsupervised_clustering_loss(z, logits)
     assert torch.isfinite(loss)
     assert all(torch.isfinite(value).all() for value in parts.values())
+
+
+def test_unsupervised_clustering_balance_mix_softens_sinkhorn() -> None:
+    torch.manual_seed(0)
+    z = F.normalize(torch.randn(32, 8), dim=-1)
+    logits = torch.randn(32, 16) * 3.0
+    _, hard = unsupervised_clustering_loss(z, logits, balance_mix=1.0, utilization_weight=0.0)
+    _, soft = unsupervised_clustering_loss(z, logits, balance_mix=0.0, utilization_weight=0.0)
+    assert torch.isfinite(hard["cluster_consistency"])
+    assert torch.isfinite(soft["cluster_consistency"])
+    # 纯 softmax 目标不应强制接近均匀占用
+    usage_soft = F.softmax(logits, dim=-1).mean(dim=0)
+    assert float(usage_soft.max() / usage_soft.clamp_min(1e-8).min()) > 1.5

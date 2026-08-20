@@ -329,7 +329,7 @@ class PrototypeClusteringHead(nn.Module):
         self,
         d_model: int,
         proj_dim: int = 128,
-        num_prototypes: int = 128,
+        num_prototypes: int = 32,
         temperature: float = 0.1,
         view_dropout: float = 0.1,
         low_rank_prototype: bool = False,

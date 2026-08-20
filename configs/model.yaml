@@ -37,7 +37,7 @@ model:
   num_datasets: 32
   num_mod_classes: 256
   num_emitters: 512
-  num_prototypes: 128
+  num_prototypes: 32
   use_dataset_bias: false
   low_rank_prototype: true
   prototype_rank: 64

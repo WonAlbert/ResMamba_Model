@@ -125,7 +125,7 @@ class PrototypeRegistry(nn.Module):
         self,
         dim: int,
         *,
-        num_prototypes: int | Mapping[str, int] = 128,
+        num_prototypes: int | Mapping[str, int] = 32,
         namespaces: Iterable[str] = DEFAULT_NAMESPACES,
     ) -> None:
         super().__init__()
