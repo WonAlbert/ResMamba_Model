@@ -41,19 +41,28 @@ def safe_angle(real: torch.Tensor, imag: torch.Tensor, eps: float = 1.0e-8) -> t
     return torch.atan2(imag_s, real_s)
 
 
-def _rfft_logmag_and_centroid(i: torch.Tensor, q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """对最后一维做 fft，返回 log-magnitude、归一化谱质心、谱扩展与幅度谱。"""
+def _fft_logmag_and_centroid(
+    i: torch.Tensor, q: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """对复数 I/Q 做双侧 ``fft``。
+
+    返回：
+    - ``logmag`` / ``mag``：完整频谱（长度 = 时域长度，不裁半）
+    - ``centroid`` / ``spread``：按 ``fftfreq``（周期/样本，约 ``[-0.5, 0.5)``）加权
+    - ``highband_ratio``：``|f| >= 0.25`` 的能量占比
+    """
     z = torch.complex(i.float(), q.float())
+    n_freq = int(z.shape[-1])
     spec = safe_complex_abs(torch.fft.fft(z, dim=-1))
     logmag = spec.log()
-    freqs = torch.linspace(0.0, 1.0, spec.shape[-1], device=spec.device, dtype=spec.dtype)
-    view = (1,) * (spec.ndim - 1) + (spec.shape[-1],)
+    freqs = torch.fft.fftfreq(n_freq, d=1.0, device=spec.device, dtype=spec.dtype)
+    view = (1,) * (spec.ndim - 1) + (n_freq,)
     freq = freqs.view(view)
     mass = spec.sum(dim=-1).clamp_min(1.0e-8)
     centroid = (spec * freq).sum(dim=-1) / mass
     spread = safe_sqrt((spec * (freq - centroid.unsqueeze(-1)).square()).sum(dim=-1) / mass)
-    half = spec.shape[-1] // 2 + 1
-    return logmag[..., :half], centroid, spread.clamp(0.0, 1.0), spec[..., :half]
+    highband_ratio = (spec * (freq.abs() >= 0.25).to(dtype=spec.dtype)).sum(dim=-1) / mass
+    return logmag, centroid, spread.clamp(0.0, 1.0), spec, highband_ratio.clamp(0.0, 1.0)
 
 
 def _spectral_entropy(mag: torch.Tensor) -> torch.Tensor:
@@ -133,7 +142,7 @@ def _iq_physics_from_channels(i: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
     corr = (ic * qc).mean(dim=-1) / (var_i.sqrt() * var_q.sqrt())
     iq_var_ratio = (var_i / var_q).clamp(1.0e-2, 64.0)
 
-    _logmag, centroid, spread, mag = _rfft_logmag_and_centroid(i, q)
+    _logmag, centroid, spread, mag, highband_ratio = _fft_logmag_and_centroid(i, q)
     phase = safe_angle(i.float(), q.float())
     dphi = torch.diff(phase, dim=-1, prepend=phase[..., :1])
     dphi = torch.atan2(torch.sin(dphi), torch.cos(dphi))
@@ -141,11 +150,7 @@ def _iq_physics_from_channels(i: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
     live_f = live.to(dtype=dphi.dtype)
     cfo_proxy = (dphi * live_f).sum(dim=-1) / live_f.sum(dim=-1).clamp_min(1.0)
 
-    mag_mass = mag.sum(dim=-1).clamp_min(1.0e-8)
     entropy = _spectral_entropy(mag)
-    n_freq = mag.shape[-1]
-    high = mag[..., n_freq // 2 :].sum(dim=-1)
-    highband_ratio = (high / mag_mass).clamp(0.0, 1.0)
 
     axis_norm = (var_i + var_q).sqrt()
     if i.shape[-1] > 1:
@@ -245,17 +250,14 @@ def sequence_physics(
     var_q = var[:, 1].clamp_min(1.0e-8)
     corr = (centered[:, 0] * centered[:, 1]).sum(dim=-1) / (denom * torch.sqrt(var_i * var_q))
     ratio = (var_i / var_q).clamp(1.0e-2, 64.0)
-    _logmag, centroid, spread, mag = _rfft_logmag_and_centroid(x[:, 0], x[:, 1])
+    _logmag, centroid, spread, mag, highband_ratio = _fft_logmag_and_centroid(x[:, 0], x[:, 1])
     phase = safe_angle(x[:, 0], x[:, 1])
     dphi = torch.diff(phase, dim=-1, prepend=phase[..., :1])
     dphi = torch.atan2(torch.sin(dphi), torch.cos(dphi))
     live = ((x[:, 0].square() + x[:, 1].square()) > 1.0e-8).to(dtype=dphi.dtype)
     cfo_proxy = (dphi * mask * live).sum(dim=-1) / (mask * live).sum(dim=-1).clamp_min(1.0)
 
-    mag_mass = mag.sum(dim=-1).clamp_min(1.0e-8)
     entropy = _spectral_entropy(mag)
-    n_freq = mag.shape[-1]
-    highband_ratio = (mag[..., n_freq // 2 :].sum(dim=-1) / mag_mass).clamp(0.0, 1.0)
     axis_norm = (var_i + var_q).sqrt()
     if length > 1:
         drift = 0.5 * (

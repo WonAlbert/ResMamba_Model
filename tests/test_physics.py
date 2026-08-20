@@ -7,6 +7,7 @@ from resmamba_signal_model.models.physics import (
     MODALITY_IMU,
     MODALITY_RF,
     MODALITY_SONAR,
+    _fft_logmag_and_centroid,
     patch_physics,
     physics_constraint_loss,
     physics_feature_mask,
@@ -108,3 +109,30 @@ def test_envelope_sqrt_through_revin_is_finite() -> None:
     loss.backward()
     assert torch.isfinite(revin.gamma.grad).all()
     assert torch.isfinite(revin.beta.grad).all()
+
+
+def _complex_tone(n: int, freq: float) -> tuple[torch.Tensor, torch.Tensor]:
+    t = torch.arange(n, dtype=torch.float32)
+    phase = 2.0 * torch.pi * freq * t
+    return torch.cos(phase), torch.sin(phase)
+
+
+def test_fft_keeps_full_bilateral_spectrum() -> None:
+    i, q = _complex_tone(64, 0.125)
+    logmag, centroid, spread, mag, highband = _fft_logmag_and_centroid(i.unsqueeze(0), q.unsqueeze(0))
+    assert logmag.shape[-1] == 64
+    assert mag.shape[-1] == 64
+    assert torch.isfinite(centroid).all()
+    assert torch.isfinite(spread).all()
+    assert 0.0 <= float(highband) <= 1.0
+
+
+def test_spectral_centroid_uses_fftfreq_sign() -> None:
+    n = 128
+    i_pos, q_pos = _complex_tone(n, 0.2)
+    i_neg, q_neg = _complex_tone(n, -0.2)
+    _a, c_pos, _s, _m, _h = _fft_logmag_and_centroid(i_pos.unsqueeze(0), q_pos.unsqueeze(0))
+    _a, c_neg, _s, _m, _h = _fft_logmag_and_centroid(i_neg.unsqueeze(0), q_neg.unsqueeze(0))
+    assert float(c_pos) > 0.1
+    assert float(c_neg) < -0.1
+    assert abs(float(c_pos) + float(c_neg)) < 0.05

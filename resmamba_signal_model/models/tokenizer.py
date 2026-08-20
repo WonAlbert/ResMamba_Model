@@ -24,7 +24,7 @@ class TimeFreqTokenizerConfig:
 
 
 def _band_pool(logmag: torch.Tensor, n_bands: int) -> torch.Tensor:
-    """将 rfft log-magnitude 均分成 n_bands。``logmag``: [..., F]。"""
+    """将双侧频谱 log-magnitude 均分成 n_bands。``logmag``: [..., F]（已按频率轴排序）。"""
     n_freq = int(logmag.shape[-1])
     bands = max(1, min(int(n_bands), n_freq))
     edges = torch.linspace(0, n_freq, bands + 1, device=logmag.device)
@@ -40,7 +40,7 @@ def _band_pool(logmag: torch.Tensor, n_bands: int) -> torch.Tensor:
 
 
 class TimeFreqTokenizer(nn.Module):
-    """共享 stem + 时域 depthwise 多尺度 + 与时间对齐的频域分带，不注入任务 token。"""
+    """共享 stem + 时域 depthwise 多尺度 + 复数双侧频谱分带，不注入任务 token。"""
 
     def __init__(self, cfg: TimeFreqTokenizerConfig) -> None:
         super().__init__()
@@ -75,12 +75,13 @@ class TimeFreqTokenizer(nn.Module):
         return fused.transpose(1, 2).contiguous()
 
     def _freq_tokens(self, iq_patches: torch.Tensor) -> torch.Tensor:
+        """复数 I/Q 双侧 FFT：保留负频，fftshift 后再均分频带。"""
         i = iq_patches[:, :, 0].float()
         q = iq_patches[:, :, 1].float()
         z = torch.complex(i, q)
         spec = torch.fft.fft(z, dim=-1)
         logmag = safe_complex_abs(spec).log()
-        logmag = logmag[..., : spec.shape[-1] // 2 + 1]
+        logmag = torch.fft.fftshift(logmag, dim=-1)
         bands = _band_pool(logmag, self.cfg.freq_bands)
         return self.freq_proj(bands.to(dtype=iq_patches.dtype))
 

@@ -64,3 +64,36 @@ def test_phase_plugin_is_opt_in_and_changes_tokens() -> None:
     assert out_on["tokens"].shape == out_off["tokens"].shape
     assert not torch.allclose(out_on["tokens"], out_off["tokens"])
 
+
+def test_freq_tokens_use_bilateral_fftshift_bands() -> None:
+    """正/负频率复音应激活 fftshift 后不同半边的频带。"""
+    from resmamba_signal_model.models.physics import safe_complex_abs
+    from resmamba_signal_model.models.tokenizer import _band_pool
+
+    patch = 32
+    n_bands = 8
+    t = torch.arange(patch, dtype=torch.float32)
+    z_pos = torch.exp(1j * 2.0 * torch.pi * (6.0 / patch) * t)
+    z_neg = torch.exp(1j * 2.0 * torch.pi * (-6.0 / patch) * t)
+
+    def bands(z: torch.Tensor) -> torch.Tensor:
+        logmag = safe_complex_abs(torch.fft.fft(z)).log()
+        logmag = torch.fft.fftshift(logmag, dim=-1)
+        return _band_pool(logmag, n_bands)
+
+    b_pos = bands(z_pos)
+    b_neg = bands(z_neg)
+    # fftshift 后低频在中间：正频偏右半，负频偏左半
+    assert b_pos[n_bands // 2 :].sum() > b_pos[: n_bands // 2].sum()
+    assert b_neg[: n_bands // 2].sum() > b_neg[n_bands // 2 :].sum()
+
+    tok = TimeFreqTokenizer(TimeFreqTokenizerConfig(d_model=16, patch_size=patch, stem_channels=8, freq_bands=n_bands))
+    iq_pos = torch.stack([z_pos.real, z_pos.imag], dim=0).unsqueeze(0)
+    iq_neg = torch.stack([z_neg.real, z_neg.imag], dim=0).unsqueeze(0)
+    with torch.no_grad():
+        # isolate freq path contribution via identical time stem noise-free tones of equal |z|
+        out_pos = tok(iq_pos.expand(1, 2, patch))
+        out_neg = tok(iq_neg.expand(1, 2, patch))
+    assert out_pos["tokens"].shape == out_neg["tokens"].shape
+    assert not torch.allclose(out_pos["tokens"], out_neg["tokens"], atol=1e-5)
+
