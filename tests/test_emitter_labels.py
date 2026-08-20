@@ -10,21 +10,24 @@ from resmamba_signal_model.training.emitter_labels import (
 )
 
 
-def test_emitter_downstream_datasets_exclude_communication() -> None:
-    datasets = load_emitter_downstream_datasets(config_path=Path("configs/emitter_downstream.yaml"))
-    assert datasets == ["adsb2", "wifi150", "radar_emitters"]
+def test_emitter_downstream_datasets_wisig_primary() -> None:
+    datasets = load_emitter_downstream_datasets(config_path=Path("configs/datasets.yaml"))
+    assert datasets[0] == "wisig"
+    assert datasets == ["wisig", "adsb2"]
+    assert "wifi150" not in datasets
     assert "communication_emitters" not in datasets
+    assert "radar_emitters" not in datasets
 
 
 def test_filter_emitter_downstream_pool() -> None:
     files = [
-        "adsb2_test.h5",
-        "communication_emitters_test.h5",
-        "wifi150_test.h5",
-        "radar_emitters_test.h5",
+        "adsb2_train.h5",
+        "communication_emitters_train.h5",
+        "wifi150_train.h5",
+        "radar_emitters_train.h5",
     ]
-    filtered = filter_emitter_downstream_pool(files, ["adsb2", "wifi150", "radar_emitters"])
-    assert filtered == ["adsb2_test.h5", "radar_emitters_test.h5", "wifi150_test.h5"]
+    filtered = filter_emitter_downstream_pool(files, ["adsb2", "wifi150"])
+    assert filtered == ["adsb2_train.h5", "wifi150_train.h5"]
 
 
 def test_global_emitter_label_map_counts() -> None:
@@ -33,19 +36,19 @@ def test_global_emitter_label_map_counts() -> None:
         return
 
     label_map = build_global_emitter_label_map(root)
-    assert label_map.num_emitters == 260
+    assert label_map.num_emitters == 250
     assert label_map.offsets[6] == 0
-    assert label_map.offsets[7] == 100
-    assert label_map.offsets[9] == 250
-    assert 8 not in label_map.offsets
+    assert label_map.offsets[11] == 100
+    assert 7 not in label_map.offsets
+    assert 9 not in label_map.offsets
 
 
 def test_global_emitter_labels_avoid_collision() -> None:
-    lookup = torch.tensor([-1, -1, -1, -1, -1, -1, 0, 100, -1, 250], dtype=torch.long)
-    dataset_id = torch.tensor([6, 7, 9], dtype=torch.long)
+    lookup = torch.tensor([-1, -1, -1, -1, -1, -1, 0, -1, -1, -1, -1, 100], dtype=torch.long)
+    dataset_id = torch.tensor([6, 11, 9], dtype=torch.long)
     emitter_id = torch.tensor([5, 5, 5], dtype=torch.long)
     labels = global_emitter_labels(dataset_id, emitter_id, lookup)
-    assert labels.tolist() == [5, 105, 255]
+    assert labels.tolist() == [5, 105, -1]
 
 
 def test_global_emitter_labels_invalid_dataset() -> None:

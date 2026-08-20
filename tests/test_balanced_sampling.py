@@ -10,13 +10,16 @@ import torch
 from resmamba_signal_model.data.rfdata import RFDataH5Dataset, RFDataPoolDataset
 from resmamba_signal_model.data.sampling import (
     LengthBucketBalancedBatchSampler,
+    LengthBucketDynamicBatchSampler,
     LengthBucketPKBatchSampler,
     build_dataset_balanced_sampler,
     build_segment_class_indices,
     build_uniform_sampler,
     format_sampling_plan,
+    parse_dynamic_batch_size_schedule,
     pool_segments,
     resolve_balanced_sampling_strategy,
+    resolve_dynamic_batch_size,
     resolve_pk_sampling_params,
 )
 
@@ -48,6 +51,7 @@ def test_resolve_balanced_sampling_strategy() -> None:
     assert resolve_balanced_sampling_strategy(enabled=True, strategy="length_bucket") == "length_bucket"
     assert resolve_balanced_sampling_strategy(enabled=True, strategy="length_bucket_class") == "length_bucket_class"
     assert resolve_balanced_sampling_strategy(enabled=True, strategy="length_bucket_pk") == "length_bucket_pk"
+    assert resolve_balanced_sampling_strategy(enabled=True, strategy="length_bucket_dynamic") == "length_bucket_dynamic"
     assert (
         resolve_balanced_sampling_strategy(enabled=True, strategy="length_bucket_proportional")
         == "length_bucket_proportional"
@@ -250,3 +254,55 @@ def test_format_sampling_plan_pk() -> None:
     text = format_sampling_plan(pool, "length_bucket_pk")  # type: ignore[arg-type]
     assert "length_bucket_pk" in text
     assert "PK" in text
+
+
+def test_parse_and_resolve_dynamic_batch_size_schedule() -> None:
+    schedule = parse_dynamic_batch_size_schedule(
+        [
+            {"max_length": 128, "batch_size": 418},
+            {"max_length": 1024, "batch_size": 70},
+            {"max_length": 2048, "batch_size": 35},
+            {"max_length": None, "batch_size": 14},
+        ]
+    )
+    assert resolve_dynamic_batch_size(128, schedule) == 418
+    assert resolve_dynamic_batch_size(1000, schedule) == 70
+    assert resolve_dynamic_batch_size(1024, schedule) == 70
+    assert resolve_dynamic_batch_size(2048, schedule) == 35
+    assert resolve_dynamic_batch_size(4096, schedule) == 14
+
+
+def test_length_bucket_dynamic_batch_sampler() -> None:
+    pool = _FakePool(
+        [
+            _FakeSubDataset(Path("short_a.h5"), 1000, 128),
+            _FakeSubDataset(Path("short_b.h5"), 2000, 128),
+            _FakeSubDataset(Path("mid_a.h5"), 800, 1024),
+            _FakeSubDataset(Path("long_a.h5"), 500, 2048),
+        ]
+    )
+    offset = 0
+    index_to_length: dict[int, int] = {}
+    for sub in pool.datasets:
+        for i in range(len(sub)):
+            index_to_length[offset + i] = sub.signal_length
+        offset += len(sub)
+
+    schedule = [
+        {"max_length": 128, "batch_size": 32},
+        {"max_length": 1024, "batch_size": 16},
+        {"max_length": 2048, "batch_size": 8},
+        {"max_length": None, "batch_size": 4},
+    ]
+    sampler = LengthBucketDynamicBatchSampler(pool, schedule=schedule, num_batches=40, seed=7)  # type: ignore[arg-type]
+    assert sampler.batch_size_by_length == {128: 32, 1024: 16, 2048: 8}
+    for batch in sampler:
+        lengths = {index_to_length[idx] for idx in batch}
+        assert len(lengths) == 1
+        length = next(iter(lengths))
+        assert len(batch) == sampler.batch_size_by_length[length]
+
+    text = format_sampling_plan(pool, "length_bucket_dynamic", dynamic_batch_size_schedule=schedule)  # type: ignore[arg-type]
+    assert "length_bucket_dynamic" in text
+    assert "batch_size=32" in text
+    assert "batch_size=8" in text

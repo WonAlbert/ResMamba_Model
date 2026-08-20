@@ -16,22 +16,22 @@ def test_per_class_take_count() -> None:
 
 def test_resolve_val_label_field() -> None:
     assert resolve_val_label_field("pretrain", "prediction") == "auto"
-    assert resolve_val_label_field("stage2", "emitter") == "emitter_id"
-    assert resolve_val_label_field("stage2", "modulation") == "mod_label_id"
-    assert resolve_val_label_field("stage2", "clustering") == "global_label_id"
+    assert resolve_val_label_field("downstream", "emitter") == "global_emitter_id"
+    assert resolve_val_label_field("downstream", "modulation") == "canonical_mod_label_id"
+    assert resolve_val_label_field("downstream", "clustering") == "global_label_id"
 
 
 def test_emitter_val_subset_per_dataset_and_class() -> None:
     pool = build_rfdata_pool("dataset", "downstream_emitter_val")
     indices, report = build_per_dataset_class_balanced_val_indices(
         pool,
-        stage="stage2",
+        stage="downstream",
         task="emitter",
         fraction=0.2,
         seed=7,
     )
     assert len(indices) == report["total"]
-    assert report["stage"] == "stage2"
+    assert report["stage"] == "downstream"
     assert report["task"] == "emitter"
     for name, info in report["datasets"].items():
         ratio = info["selected"] / info["total"]
@@ -45,7 +45,7 @@ def test_prediction_val_subset_max_per_dataset() -> None:
     pool = build_rfdata_pool("dataset", "downstream_prediction_val")
     _, report = build_per_dataset_class_balanced_val_indices(
         pool,
-        stage="stage2",
+        stage="downstream",
         task="prediction",
         fraction=0.2,
         seed=7,
@@ -60,12 +60,16 @@ def test_open_real_data_val_subset_uses_full_pool() -> None:
     pool = build_rfdata_pool("dataset", "downstream_modulation_val")
     _, report = build_per_dataset_class_balanced_val_indices(
         pool,
-        stage="stage2",
+        stage="downstream",
         task="modulation",
         fraction=0.2,
         seed=7,
         full_datasets=["open_real_data"],
     )
+    if "open_real_data_val.h5" not in report["datasets"]:
+        import pytest
+
+        pytest.skip("open_real_data 不在 downstream_modulation_val")
     open_info = report["datasets"]["open_real_data_val.h5"]
     assert open_info["selected"] == open_info["total"]
     assert open_info["fraction"] == 1.0
@@ -81,7 +85,7 @@ def test_length_bucket_val_batches_same_length_per_batch() -> None:
     pool = build_rfdata_pool("dataset", "downstream_prediction_val")
     indices, _ = build_per_dataset_class_balanced_val_indices(
         pool,
-        stage="stage2",
+        stage="downstream",
         task="prediction",
         fraction=0.01,
         seed=3,

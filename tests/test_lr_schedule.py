@@ -1,20 +1,16 @@
 from __future__ import annotations
 
 import argparse
-from types import SimpleNamespace
 
 import torch
 
-from resmamba_signal_model.training.lr_schedule import WarmupCosineLR, scale_lr_for_grad_accum
-
-import sys
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "scripts"))
-from train_pipeline import (  # noqa: E402
+from resmamba_signal_model.training.lr_schedule import (
+    LightningCompatLRScheduler,
+    WarmupCosineLR,
+    as_torch_lr_scheduler,
     build_lr_scheduler,
     resolve_lr_schedule,
+    scale_lr_for_grad_accum,
     should_reset_lr_schedule_on_resume,
     use_cosine_lr_decay,
 )
@@ -32,7 +28,7 @@ def test_resolve_lr_schedule_defaults_to_cosine() -> None:
     assert resolve_lr_schedule(args, {"lr_schedule": "warmup_constant"}) == "warmup_constant"
 
 
-def test_build_lr_scheduler_stage2_cosine() -> None:
+def test_build_lr_scheduler_warmup_cosine() -> None:
     model = torch.nn.Linear(4, 2)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1.2e-3)
     scheduler = build_lr_scheduler(
@@ -56,6 +52,25 @@ def test_build_lr_scheduler_stage2_cosine() -> None:
         scheduler.step()
     final_lr = optimizer.param_groups[0]["lr"]
     assert abs(final_lr - 1.2e-4) < 1e-8
+
+
+def test_as_torch_lr_scheduler_wraps_warmup_cosine() -> None:
+    model = torch.nn.Linear(4, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    wrapped = build_lr_scheduler(
+        optimizer,
+        peak_lr=1.0e-3,
+        warmup_steps=2,
+        total_optimizer_steps=10,
+        use_cosine_decay=True,
+    )
+    scheduler = as_torch_lr_scheduler(wrapped)
+    assert isinstance(scheduler, torch.optim.lr_scheduler.LRScheduler)
+    assert isinstance(scheduler, LightningCompatLRScheduler)
+    assert isinstance(scheduler.wrapped, WarmupCosineLR)
+    first = optimizer.param_groups[0]["lr"]
+    scheduler.step()
+    assert optimizer.param_groups[0]["lr"] >= first
 
 
 def test_scale_lr_for_grad_accum() -> None:

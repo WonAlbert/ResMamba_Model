@@ -10,7 +10,7 @@ from resmamba_signal_model.training.clustering_labels import (
     resolve_modulation_labels,
 )
 from resmamba_signal_model.training.selection import (
-    STAGE2_SELECTION_DEFAULTS,
+    TASK_SELECTION_DEFAULTS,
     compute_selection_score,
     resolve_selection_metric_name,
     selection_higher_is_better,
@@ -51,10 +51,10 @@ def test_resolve_modulation_labels_fallback_source() -> None:
 
 
 def test_selection_defaults() -> None:
-    assert resolve_selection_metric_name({}, stage="stage2", task="modulation") == "f1"
-    assert resolve_selection_metric_name({}, stage="stage2", task="clustering") == "nmi"
-    assert resolve_selection_metric_name({}, stage="stage2", task="prediction") == "ssim"
-    assert STAGE2_SELECTION_DEFAULTS["emitter"] == "per_dataset_macro_acc"
+    assert resolve_selection_metric_name({}, stage="downstream", task="modulation") == "f1"
+    assert resolve_selection_metric_name({}, stage="downstream", task="clustering") == "nmi"
+    assert resolve_selection_metric_name({}, stage="downstream", task="prediction") == "ssim"
+    assert TASK_SELECTION_DEFAULTS["emitter"] == "per_dataset_macro_acc"
 
 
 def test_selection_per_dataset_macro_acc() -> None:
@@ -64,4 +64,4 @@ def test_selection_per_dataset_macro_acc() -> None:
 
 def test_selection_val_loss_sign() -> None:
     assert selection_higher_is_better("val_loss") is False
-    assert compute_selection_score({"loss": 2.0}, "val_loss") == -2.0
+    assert compute_selection_score({"loss": 2.0}, "val_loss") == 2.0

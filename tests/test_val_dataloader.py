@@ -1,24 +1,24 @@
-from resmamba_signal_model.data.rfdata import build_rfdata_pool, pad_iq_collate
-from scripts.train_pipeline import build_val_dataloader
+from pathlib import Path
+
+import pytest
+import torch
+
+from resmamba_signal_model.data.rfdata import build_rfdata_pool, variable_length_collate
+from resmamba_signal_model.data.sampling import TokenBudgetSampler, pool_sample_lengths
 
 
-def test_val_length_bucket_dataloader_fetch() -> None:
+@pytest.mark.skipif(not Path("dataset/label_maps.json").exists(), reason="no rfdata")
+def test_val_token_budget_dataloader_fetch() -> None:
     pool = build_rfdata_pool("dataset", "downstream_prediction_val")
-    loader = build_val_dataloader(
-        pool,
-        batch_size=4,
-        collate_fn=pad_iq_collate,
-        num_workers=0,
-        pin_memory=False,
-        stage="stage2",
-        task="prediction",
-        subset_fraction=0.01,
-        subset_seed=1,
-        epoch=1,
-        resample_each_epoch=False,
-        max_per_dataset=20,
-        length_bucket_batching=True,
-    )
+    lengths = pool_sample_lengths(pool)
+    sampler = TokenBudgetSampler(lengths, token_budget=64, patch_size=8, num_batches=1, seed=1)
+    loader = torch.utils.data.DataLoader(pool, batch_sampler=sampler, collate_fn=variable_length_collate, num_workers=0)
     batch = next(iter(loader))
     assert "iq" in batch
-    assert batch["iq"].shape[0] <= 4
+    iq = batch["iq"]
+    if torch.is_tensor(iq):
+        assert iq.ndim == 3
+        assert iq.shape[0] >= 1
+    else:
+        assert isinstance(iq, list)
+        assert len(iq) >= 1

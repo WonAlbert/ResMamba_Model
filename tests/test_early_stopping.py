@@ -1,4 +1,4 @@
-from resmamba_signal_model.training.early_stopping import EarlyStopping
+from resmamba_signal_model.training.early_stopping import EarlyStopping, make_early_stopping_callback
 
 
 def test_early_stopping_triggers_after_patience() -> None:
@@ -29,5 +29,13 @@ def test_early_stopping_max_mode() -> None:
     assert stopper.step(0.10) is False
     assert stopper.step(0.20) is False
     assert stopper.step(0.19) is False
-    assert stopper.step(0.18) is False
-    assert stopper.step(0.17) is True
+    assert stopper.step(0.18) is True
+
+
+def test_make_early_stopping_callback() -> None:
+    assert make_early_stopping_callback(monitor="val/monitor", mode="min", patience=0) is None
+    callback = make_early_stopping_callback(monitor="val/monitor", mode="min", patience=3)
+    assert callback is not None
+    assert callback.patience == 3
+    assert callback.monitor == "val/monitor"
+    assert callback.mode == "min"

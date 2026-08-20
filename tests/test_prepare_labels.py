@@ -14,7 +14,7 @@ def test_infer_npy_labels_numeric(tmp_path: Path) -> None:
     np.save(root / "Y_train.npy", np.array([0, 1, 99, 99], dtype=np.int64))
     np.save(root / "Y_val.npy", np.array([50, 50], dtype=np.int64))
     labels = infer_npy_labels(root, [("train", "train"), ("val", "val")], None)
-    assert labels == {str(i): i for i in range(100)}
+    assert labels == {"0": 0, "1": 1, "50": 50, "99": 99}
 
 
 def test_quality_mask_per_class() -> None:
