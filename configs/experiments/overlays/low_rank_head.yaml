@@ -1,0 +1,4 @@
+# 低秩原型头（现为默认；此 overlay 显式打开 rank=64）
+model:
+  low_rank_prototype: true
+  prototype_rank: 64

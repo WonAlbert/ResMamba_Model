@@ -1,0 +1,11 @@
+_base_:
+  - ../stage2.yaml
+  - overlays/enc3.yaml
+sota_gate:
+  window: C_confirm
+  job: confirm_slot_b_stage2
+  slot: b
+  seeds: [0, 1, 2]
+  report:
+    unified: [val/f1_modulation, val/acc_emitter, val/multitask_geomean]
+    dataset_specific: [val/f1_modulation/*, val/acc_emitter/*]

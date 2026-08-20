@@ -1,0 +1,3 @@
+# 旧版深层 Cosine/MLP 头对照（兼容旧 ckpt 结构）
+model:
+  low_rank_prototype: false

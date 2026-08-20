@@ -1,0 +1,3 @@
+# BiMamba2 双向权重共享消融
+model:
+  share_bidirectional_weights: true

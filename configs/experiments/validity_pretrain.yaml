@@ -1,0 +1,7 @@
+# 0–8h 有效性基线预训练：当前正式架构（encoder=5、三目标、UTI v2）
+# 依赖：mamba kernel、split_manifest.json、H5 semantic stamp
+_base_: ../pretrain.yaml
+sota_gate:
+  window: A_validity
+  job: validity_pretrain
+  fail_fast: true

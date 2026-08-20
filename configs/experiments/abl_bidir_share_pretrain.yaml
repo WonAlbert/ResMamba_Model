@@ -1,0 +1,6 @@
+_base_:
+  - ../pretrain.yaml
+  - overlays/bidir_share.yaml
+sota_gate:
+  window: B_ablation
+  job: abl_bidir_share_pretrain

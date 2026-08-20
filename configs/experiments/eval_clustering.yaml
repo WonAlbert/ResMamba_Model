@@ -1,0 +1,8 @@
+# 60–72h 无监督聚类；--task clustering
+_base_: ../stage3.yaml
+sota_gate:
+  window: D_eval
+  job: eval_clustering
+  task: clustering
+supervised_clustering: false
+clustering_view2: true

@@ -1,0 +1,3 @@
+# 仅 z_general，关闭 UTI v2 specialist views
+model:
+  use_specialist_views: false

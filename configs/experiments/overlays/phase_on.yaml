@@ -1,0 +1,3 @@
+# tokenizer 相对相位 / 共轭统计插件
+model:
+  phase_plugin: true

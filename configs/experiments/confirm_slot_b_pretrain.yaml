@@ -1,0 +1,9 @@
+# 28–60h 次优配置 B 占位；B 完成后按 selected.json 替换 overlay。
+_base_:
+  - ../pretrain.yaml
+  - overlays/enc3.yaml
+sota_gate:
+  window: C_confirm
+  job: confirm_slot_b_pretrain
+  slot: b
+  seeds: [0, 1, 2]
