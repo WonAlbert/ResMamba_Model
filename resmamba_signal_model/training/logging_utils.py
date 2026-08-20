@@ -96,17 +96,17 @@ def _format_task_report_lines(report: dict[str, Any]) -> list[str]:
                 )
         elif kind == "reconstruction":
             parts = [
-                f"ssim={_fmt_metric(float(info['ssim']))}",
                 f"mse={_fmt_metric(float(info['mse']))}",
-                f"mean_ssim={_fmt_metric(float(info['mean_ssim']))}",
                 f"mean_mse={_fmt_metric(float(info['mean_mse']))}",
+                f"ssim={_fmt_metric(float(info['ssim']))}",
+                f"mean_ssim={_fmt_metric(float(info['mean_ssim']))}",
                 f"n={int(info.get('n', 0))}",
             ]
             lines.append(f"{task}  " + "  ".join(parts))
             for dataset, row in sorted((info.get("datasets") or {}).items()):
                 lines.append(
-                    f"  {dataset}  ssim={_fmt_metric(float(row['ssim']))}  "
-                    f"mse={_fmt_metric(float(row['mse']))}  n={int(row.get('n', 0))}"
+                    f"  {dataset}  mse={_fmt_metric(float(row['mse']))}  "
+                    f"ssim={_fmt_metric(float(row['ssim']))}  n={int(row.get('n', 0))}"
                 )
     return lines
 

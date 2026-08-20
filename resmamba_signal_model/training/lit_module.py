@@ -657,8 +657,12 @@ class SignalLitModule(_Base):
     def _collect_recon(self, task: str, packed: dict[str, Any], batch_u: dict[str, Any]) -> None:
         if packed.get("recon_norm") is None and packed.get("mae_pred") is None and packed.get("pred_patches") is None:
             return
+        spec = self.catalog.get(task)
+        kind = spec.kind if spec is not None else self.catalog.kind(task) if task else None
+        if kind not in ("prediction", "imputation"):
+            kind = task if task in ("prediction", "imputation") else kind
         try:
-            pred, target, mask = reconstruction_eval_pair(packed)
+            pred, target, mask = reconstruction_eval_pair(packed, kind=kind)
         except (KeyError, ValueError):
             return
         if pred is None or target is None:
@@ -789,18 +793,25 @@ class SignalLitModule(_Base):
                 per_dataset[dataset] = {"ssim": ds_ssim, "mse": ds_mse, "n": float(row["n"])}
             info = reconstruction_epoch_scores(ssim, mse, int(bucket["n"]), per_dataset)
             report[task] = info
-            self._log_scalar("val/impute_mse" if task in ("prediction", "imputation", "pretrain") else f"val/mse_{task}", mse)
+            # prediction / imputation 主指标：masked recon MSE
+            self._log_scalar(f"val/mse_{task}", mse)
             if task == "prediction":
+                self._log_scalar("val/mse_prediction", mse)
                 self._log_scalar("val/ssim", ssim)
                 self._log_scalar("val/ssim_prediction", ssim)
             elif task == "imputation":
+                self._log_scalar("val/mse_imputation", mse)
+                self._log_scalar("val/impute_mse", mse)
                 self._log_scalar("val/ssim_imputation", ssim)
             else:
+                if task == "pretrain":
+                    self._log_scalar("val/impute_mse", mse)
                 self._log_scalar(f"val/ssim_{task}", ssim)
+            self._log_scalar(f"val/macro_mse_{task}", info["mean_mse"])
             self._log_scalar(f"val/macro_ssim_{task}", info["mean_ssim"])
             for dataset, row in per_dataset.items():
-                self._log_scalar(f"val/ssim_{task}/{dataset}", row["ssim"])
                 self._log_scalar(f"val/mse_{task}/{dataset}", row["mse"])
+                self._log_scalar(f"val/ssim_{task}/{dataset}", row["ssim"])
         if self._val_openset:
             scores = torch.cat([item[0] for item in self._val_openset], dim=0)
             y_unknown = torch.cat([item[1] for item in self._val_openset], dim=0)
@@ -826,7 +837,7 @@ class SignalLitModule(_Base):
             recon = reconstruction_monitor_loss(parts)
             if self._is_finite_metric(recon):
                 self.log("val/recon", recon, on_epoch=True, prog_bar=True, add_dataloader_idx=True, batch_size=batch_size)
-            pred, target, mask = reconstruction_eval_pair(packed)
+            pred, target, mask = reconstruction_eval_pair(packed, kind="pretrain")
             ssim = ssim_iq(pred, target, mask)
             mse = masked_patch_mse(pred, target, mask)
             # recon_mse：全部 target patch 上的 MSE；保留 impute_mse 别名兼容旧日志/门控
@@ -851,8 +862,15 @@ class SignalLitModule(_Base):
             elif info.get("kind") == "clustering":
                 metrics.setdefault("val/nmi" if task == "clustering" else f"val/nmi_{task}", info["nmi"])
             elif info.get("kind") == "reconstruction":
-                key = "val/ssim_prediction" if task == "prediction" else f"val/ssim_{task}"
-                metrics.setdefault(key, info["ssim"])
+                if task == "prediction":
+                    metrics.setdefault("val/mse_prediction", info["mse"])
+                    metrics.setdefault("val/ssim_prediction", info["ssim"])
+                elif task == "imputation":
+                    metrics.setdefault("val/mse_imputation", info["mse"])
+                    metrics.setdefault("val/ssim_imputation", info["ssim"])
+                else:
+                    metrics.setdefault(f"val/mse_{task}", info["mse"])
+                    metrics.setdefault(f"val/ssim_{task}", info["ssim"])
         return metrics
 
     def on_validation_epoch_end(self) -> None:

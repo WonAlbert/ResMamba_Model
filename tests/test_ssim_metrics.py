@@ -36,6 +36,47 @@ def test_reconstruction_eval_pair_prefers_norm_space() -> None:
     assert mask is not None and bool(mask.all())
 
 
+def test_reconstruction_eval_pair_prediction_uses_suffix_mask_only() -> None:
+    pred = torch.zeros(2, 4, 2, 4)
+    target = torch.ones_like(pred)
+    suffix = torch.tensor([[False, False, True, True], [False, True, True, False]])
+    span = torch.ones(2, 4, dtype=torch.bool)
+    target_mask = suffix | span
+    out = {
+        "pred_patches": pred,
+        "patch_targets_norm": target,
+        "suffix_mask": suffix,
+        "span_mask": span,
+        "target_mask": target_mask,
+        "recon_mask": target_mask,
+        "mae_mask": torch.ones(2, 4, dtype=torch.bool),
+    }
+    _, _, mask = reconstruction_eval_pair(out, kind="prediction")
+    assert mask is not None
+    assert torch.equal(mask, suffix)
+    mse = masked_patch_mse(pred, target, mask)
+    # only masked positions: 4 True cells, each channel/patch mean err = 1 -> mse=1
+    assert float(mse) == pytest.approx(1.0)
+
+
+def test_reconstruction_eval_pair_imputation_uses_span_mask_only() -> None:
+    pred = torch.zeros(1, 4, 2, 4)
+    target = torch.ones_like(pred)
+    span = torch.tensor([[True, True, False, False]])
+    suffix = torch.tensor([[False, False, True, True]])
+    out = {
+        "pred_patches": pred,
+        "patch_targets_norm": target,
+        "span_mask": span,
+        "suffix_mask": suffix,
+        "target_mask": span | suffix,
+        "recon_mask": span | suffix,
+    }
+    _, _, mask = reconstruction_eval_pair(out, kind="imputation")
+    assert mask is not None
+    assert torch.equal(mask, span)
+
+
 def test_masked_patch_mse_uses_mask() -> None:
     pred = torch.zeros(2, 2, 2, 4)
     target = torch.zeros_like(pred)

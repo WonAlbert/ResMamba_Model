@@ -454,7 +454,7 @@ def build_gate_jobs() -> list[GateJob]:
             depends_on=("confirm_slot_a_stage2",),
             init_from_job="confirm_slot_a_stage2",
             requires=full,
-            metrics=("val/ssim", "val/ssim_prediction"),
+            metrics=("val/mse_prediction", "val/ssim_prediction"),
         ),
         _job(
             id="eval_imputation",
@@ -467,7 +467,7 @@ def build_gate_jobs() -> list[GateJob]:
             depends_on=("confirm_slot_a_stage2",),
             init_from_job="confirm_slot_a_stage2",
             requires=full,
-            metrics=("val/ssim_imputation",),
+            metrics=("val/mse_imputation",),
         ),
         _job(
             id="probe_cross_domain",

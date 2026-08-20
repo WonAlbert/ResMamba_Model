@@ -202,14 +202,42 @@ def reconstruction_epoch_scores(
 
 def reconstruction_eval_pair(
     outputs: dict,
+    *,
+    kind: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """优先用 RevIN 归一化空间的重建对，避免原始幅度把 SSIM/MSE 撑爆。"""
-    pred = outputs.get("recon_norm")
+    """取重建预测/目标，并按任务返回应对齐的 mask。
+
+    - 优先 RevIN 归一化空间（``recon_norm`` / ``pred_patches``）。
+    - ``kind=prediction`` → ``suffix_mask``；``kind=imputation`` → ``span_mask``；
+      均与 ``target_mask`` 相交，保证只在被 mask 的 patch 上评测。
+    """
+    pred = outputs.get("pred_patches")
+    if pred is None:
+        pred = outputs.get("recon_norm")
     target = outputs.get("patch_targets_norm")
     if pred is None or target is None:
-        pred = outputs["mae_pred"]
-        target = outputs["patch_targets"]
-    mask = outputs.get("recon_mask")
+        pred = outputs.get("mae_pred", pred)
+        target = outputs.get("patch_targets", target)
+    if pred is None or target is None:
+        raise KeyError("reconstruction_eval_pair 需要 pred/target（pred_patches|recon_norm|mae_pred）")
+
+    mask: torch.Tensor | None = None
+    task_kind = str(kind or "").strip().lower() or None
+    if task_kind in ("prediction", "imputation", "mae", "pretrain"):
+        from resmamba_signal_model.training.losses import resolve_recon_mask
+
+        mask_kind = "mae" if task_kind in (None, "pretrain", "mae") else task_kind
+        # pretrain 重建评测用全部 target（mae∪span），与 train recon_mask 一致
+        if task_kind in (None, "pretrain"):
+            mask = outputs.get("recon_mask")
+            if mask is None:
+                mask = outputs.get("target_mask")
+            if mask is None:
+                mask = resolve_recon_mask(outputs, "mae")
+        else:
+            mask = resolve_recon_mask(outputs, mask_kind)
+    if mask is None:
+        mask = outputs.get("recon_mask")
     if mask is None:
         mask = outputs.get("target_mask")
     if mask is None:

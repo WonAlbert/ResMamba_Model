@@ -7,8 +7,8 @@ TASK_SELECTION_DEFAULTS: dict[str, str] = {
     "modulation": "f1",
     "emitter": "per_dataset_macro_acc",
     "clustering": "nmi",
-    "prediction": "ssim",
-    "imputation": "ssim",
+    "prediction": "mse",
+    "imputation": "mse",
 }
 STAGE2_SELECTION_DEFAULTS = TASK_SELECTION_DEFAULTS
 
@@ -68,6 +68,10 @@ def resolve_checkpoint_monitor_name(train_cfg: dict[str, Any], *, stage: str, ta
     if task_name and task_name not in ("all",):
         if metric == "nmi" and task_name == "clustering":
             return "val/nmi"
+        if metric in ("mse", "recon_mse") and task_name == "prediction":
+            return "val/mse_prediction"
+        if metric in ("mse", "recon_mse") and task_name == "imputation":
+            return "val/mse_imputation"
         if metric == "ssim" and task_name == "prediction":
             return "val/ssim"
         if metric == "ssim" and task_name == "imputation":
@@ -143,6 +147,13 @@ def compute_selection_score(val_metrics: dict[str, float], metric_name: str) -> 
     if metric_name == "val_loss":
         return float(val_metrics.get("loss", float("inf")))
 
+    if metric_name in ("mse", "recon_mse"):
+        # 选模/几何平均约定越大越好：用 1/(1+mse) 把 masked MSE 转成收益分数
+        mse = float(val_metrics.get("mse", val_metrics.get("recon_mse", float("inf"))))
+        if not math.isfinite(mse):
+            return 0.0
+        return 1.0 / (1.0 + max(mse, 0.0))
+
     if metric_name in val_metrics:
         return float(val_metrics[metric_name])
 
@@ -150,4 +161,5 @@ def compute_selection_score(val_metrics: dict[str, float], metric_name: str) -> 
 
 
 def selection_higher_is_better(metric_name: str) -> bool:
-    return _normalize_metric_name(metric_name) != "val_loss"
+    key = _normalize_metric_name(metric_name)
+    return key not in ("val_loss", "mse", "recon_mse")

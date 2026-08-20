@@ -109,13 +109,13 @@ profiles:
       clustering: [clustering_train, clustering_val]
   prediction:
     task: prediction
-    checkpoint_monitor: val/ssim
-    checkpoint_mode: max
+    checkpoint_monitor: val/mse_prediction
+    checkpoint_mode: min
     task_pools:
       prediction: [downstream_prediction_train, downstream_prediction_val]
   imputation:
     task: imputation
-    checkpoint_monitor: val/ssim_imputation
-    checkpoint_mode: max
+    checkpoint_monitor: val/mse_imputation
+    checkpoint_mode: min
     task_pools:
       imputation: [downstream_prediction_train, downstream_prediction_val]

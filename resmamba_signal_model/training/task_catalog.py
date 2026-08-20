@@ -33,8 +33,8 @@ KIND_MONITOR: dict[str, str] = {
     "classification": "f1",
     "emitter": "per_dataset_macro_acc",
     "clustering": "nmi",
-    "prediction": "ssim",
-    "imputation": "ssim",
+    "prediction": "mse",
+    "imputation": "mse",
 }
 
 SOURCE_TO_BUILTIN_TASK: dict[str, str] = {

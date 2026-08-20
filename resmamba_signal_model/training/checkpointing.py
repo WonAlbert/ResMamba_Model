@@ -154,7 +154,7 @@ def _metric_from_callbacks(callback_metrics: dict[str, Any], *keys: str) -> floa
 
 
 _VAL_TASK_METRIC_RE = re.compile(
-    r"^val/(?P<metric>acc|f1|nmi|ssim|macro_acc|macro_f1)_(?P<task>[^/]+)(?:/(?P<dataset>.+))?$"
+    r"^val/(?P<metric>acc|f1|nmi|ssim|mse|macro_acc|macro_f1|macro_mse|macro_ssim)_(?P<task>[^/]+)(?:/(?P<dataset>.+))?$"
 )
 _DATALOADER_IDX_RE = re.compile(r"/dataloader_idx_\d+$")
 
@@ -174,6 +174,12 @@ def extract_task_selection_metrics(callback_metrics: dict[str, Any]) -> dict[str
         if name in ("val/nmi", "val/nmi_within_domain"):
             add("clustering", "nmi" if name == "val/nmi" else "nmi_within_domain", raw)
             continue
+        if name in ("val/mse_prediction", "val/mse"):
+            add("prediction", "mse", raw)
+            continue
+        if name in ("val/mse_imputation", "val/impute_mse"):
+            add("imputation", "mse", raw)
+            continue
         if name in ("val/ssim", "val/ssim_prediction"):
             add("prediction", "ssim", raw)
             continue
@@ -190,6 +196,10 @@ def extract_task_selection_metrics(callback_metrics: dict[str, Any]) -> dict[str
             add(task, "per_dataset_macro_acc", raw)
         elif metric == "macro_f1":
             add(task, "per_dataset_macro_f1", raw)
+        elif metric == "macro_mse":
+            add(task, "mse", raw)
+        elif metric == "macro_ssim":
+            add(task, "ssim", raw)
         elif dataset:
             add(task, f"{metric}/{dataset}", raw)
         else:

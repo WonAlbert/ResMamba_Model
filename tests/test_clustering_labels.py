@@ -53,7 +53,7 @@ def test_resolve_modulation_labels_fallback_source() -> None:
 def test_selection_defaults() -> None:
     assert resolve_selection_metric_name({}, stage="downstream", task="modulation") == "f1"
     assert resolve_selection_metric_name({}, stage="downstream", task="clustering") == "nmi"
-    assert resolve_selection_metric_name({}, stage="downstream", task="prediction") == "ssim"
+    assert resolve_selection_metric_name({}, stage="downstream", task="prediction") == "mse"
     assert TASK_SELECTION_DEFAULTS["emitter"] == "per_dataset_macro_acc"
 
 
