@@ -1,4 +1,4 @@
-# 所有阶段 / 所有任务：每 epoch 验证使用各子 H5 内按类别均匀抽取的子集
+# 验证子集：每 epoch 在各子 H5 内按类别均匀抽取
 val_subset_fraction: 0.2
 val_subset_seed: 42
 val_subset_resample_each_epoch: true

@@ -1,0 +1,65 @@
+# 下游：分类 / 个体 / 聚类 / 预测 / 插补 CombinedLoader
+model_config: configs/model.yaml
+rfdata_root: /root/autodl-tmp/ResMamba_Signal_Model/dataset
+iq_normalize: none
+sequence_packing: true
+mix_strategy: token_share
+combine_then_pack: true
+balanced_sampling: false
+balanced_sampling_strategy: length_bucket
+token_budget: 4096
+steps_per_epoch: 200
+val_batches: 50
+val_seed: 0
+seed: 0
+min_ratio: 0.05
+synthetic: false
+amp: true
+amp_dtype: bfloat16
+epochs: 10
+checkpoint_monitor: val/multitask_geomean
+checkpoint_mode: max
+early_stopping_patience: 3
+num_workers: 4
+max_grad_norm: 1.0
+learning_rate: 1.0e-4
+warmup_steps: 200
+lr_schedule: warmup_cosine
+lr_min_ratio: 0.1
+lambda_recon: 0.1
+modulation_contrastive_weight: 0.25
+emitter_contrastive_weight: 0.25
+use_dataset_bias: false
+train_encoder: true
+train_decoder: true
+train_heads: true
+token_normalized_loss: true
+clustering_view2: true
+distill_weight: 0.0
+prototype_anchor_weight: 0.0
+absorb_unknown: false
+loss_weights:
+  physical: 0.1
+  domain: 0.1
+tasks:
+  - modulation
+  - emitter
+  - clustering
+  - prediction
+  - imputation
+task_pools:
+  classification: [downstream_modulation_train, downstream_modulation_val]
+  emitter: [downstream_emitter_train, downstream_emitter_val]
+  clustering: [clustering_train, clustering_val]
+  prediction: [downstream_prediction_train, downstream_prediction_val]
+  imputation: [downstream_prediction_train, downstream_prediction_val]
+profiles:
+  tiny:
+    model_config: configs/model_tiny.yaml
+    synthetic: true
+    epochs: 1
+    token_budget: 256
+    steps_per_epoch: 2
+    limit_train_batches: 2
+    num_workers: 0
+    warmup_steps: 1

@@ -1,28 +1,28 @@
 model:
-  d_model: 64
+  d_model: 640
   encoder_mamba_layers: 5
   encoder_transformer_layers: 1
   decoder_mamba_layers: 1
-  mamba_d_state: 16
+  mamba_d_state: 64
   mamba_d_conv: 4
   mamba_expand: 2
-  mamba_headdim: 32
+  mamba_headdim: 64
   mamba_ngroups: 1
-  mamba_chunk_size: 64
+  mamba_chunk_size: 256
   scan_direction: bidirectional
-  require_mamba_kernel: false
-  allow_fallback_mamba: true
+  require_mamba_kernel: true
+  allow_fallback_mamba: false
   share_bidirectional_weights: false
   norm_type: rmsnorm
   drop_path: 0.0
-  attn_num_heads: 4
+  attn_num_heads: 8
   attn_ffn_expand: 2
-  attn_window: 64
-  dropout: 0.0
-  patch_size: 8
+  attn_window: 1024
+  dropout: 0.1
+  patch_size: 16
   mask_ratio: 0.5
-  stem_channels: 16
-  freq_bands: 4
+  stem_channels: 64
+  freq_bands: 8
   physics_bias: true
   physics_project: true
   revin_std_min: 0.01
@@ -34,10 +34,10 @@ model:
   chunk_len: 8192
   chunk_overlap: 0.125
   p_trunc: 0.3
-  num_datasets: 8
-  num_mod_classes: 16
-  num_emitters: 32
-  num_prototypes: 16
+  num_datasets: 32
+  num_mod_classes: 256
+  num_emitters: 512
+  num_prototypes: 128
   use_dataset_bias: false
   low_rank_prototype: true
   prototype_rank: 64

@@ -1,0 +1,83 @@
+# 阶段二：冻结骨干 + 截断反传，只训 UTI 与五个任务头（LP 探测段）
+# 生成任务走 Prediction/ImputationHead，不解冻 decoder / adapters
+model_config: configs/model.yaml
+rfdata_root: /root/autodl-tmp/ResMamba_Signal_Model/dataset
+iq_normalize: none
+sequence_packing: true
+mix_strategy: token_share
+combine_then_pack: true
+balanced_sampling: false
+balanced_sampling_strategy: length_bucket
+token_budget: 12288
+steps_per_epoch: 1000
+val_batches: 50
+val_seed: 0
+seed: 0
+check_val_every_n_epoch: 1
+min_ratio: 0.05
+synthetic: false
+amp: true
+amp_dtype: bfloat16
+epochs: 20
+checkpoint_monitor: val/multitask_geomean
+checkpoint_mode: max
+early_stopping_patience: 3
+num_workers: 20
+prefetch_factor: 4
+cache_iq_in_memory: auto
+max_grad_norm: 1.0
+learning_rate: 1.0e-3
+warmup_steps: 500
+lr_schedule: warmup_cosine
+lr_min_ratio: 0.1
+token_normalized_loss: true
+clustering_view2: true
+distill_weight: 0.0
+prototype_anchor_weight: 0.0
+absorb_unknown: false
+lambda_recon: 0.0
+modulation_contrastive_weight: 0.25
+emitter_contrastive_weight: 0.25
+supervised_clustering: false
+use_dataset_bias: false
+train_encoder: false
+train_decoder: false
+train_heads: true
+truncate_backward: true
+skip_recon: true
+loss_weights:
+  physical: 0.0
+  domain: 0.0
+tasks:
+  - modulation
+  - emitter
+  - clustering
+  - prediction
+  - imputation
+# 增加任务示例：
+# - name: sonar
+#   kind: classification
+#   source: sonar
+#   num_classes: 16
+# task_kinds:
+#   sonar: classification
+task_pools:
+  classification: [downstream_modulation_train, downstream_modulation_val]
+  emitter: [downstream_emitter_train, downstream_emitter_val]
+  clustering: [clustering_train, clustering_val]
+  prediction: [downstream_prediction_train, downstream_prediction_val]
+  imputation: [downstream_prediction_train, downstream_prediction_val]
+profiles:
+  tiny:
+    model_config: configs/model_tiny.yaml
+    synthetic: true
+    epochs: 1
+    token_budget: 256
+    steps_per_epoch: 2
+    limit_train_batches: 2
+    limit_val_batches: 1
+    val_batches: 1
+    num_workers: 0
+    warmup_steps: 1
+    learning_rate: 1.0e-3
+    require_mamba_kernel: false
