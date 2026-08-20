@@ -41,9 +41,17 @@ def count_trainable_by_module(model: nn.Module, top_level_names: Iterable[str] |
     return rows
 
 
+def format_param_ratio(total: int, trainable: int) -> str:
+    ratio = (100.0 * trainable / total) if total else 0.0
+    return f"训练参数/全部参数量: {trainable:,} / {total:,} ({ratio:.2f}%)"
+
+
 def format_param_stats(model: nn.Module, *, top_level_names: Iterable[str] | None = None) -> str:
     total, trainable = count_params(model)
-    lines = [f"total_params={total:,} trainable_params={trainable:,} trainable_ratio={100.0 * trainable / total:.2f}%"]
+    lines = [
+        format_param_ratio(total, trainable),
+        f"total_params={total:,} trainable_params={trainable:,} trainable_ratio={100.0 * trainable / total if total else 0.0:.2f}%",
+    ]
     for row in count_trainable_by_module(model, top_level_names):
         lines.append(
             f"  {row['module']}: trainable={int(row['trainable']):,} "

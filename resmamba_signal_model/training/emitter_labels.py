@@ -8,7 +8,8 @@ import torch
 import yaml
 
 CONFIG_ROOT = Path(__file__).resolve().parents[2] / "configs"
-DEFAULT_EMITTER_DOWNSTREAM_CONFIG = CONFIG_ROOT / "emitter_downstream.yaml"
+DEFAULT_EMITTER_DOWNSTREAM_CONFIG = CONFIG_ROOT / "datasets.yaml"
+LEGACY_EMITTER_DOWNSTREAM_CONFIG = CONFIG_ROOT / "emitter_downstream.yaml"
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,24 @@ class GlobalEmitterLabelMap:
 
     def dataset_name(self, dataset_id: int) -> str:
         return self.dataset_names.get(int(dataset_id), f"dataset_{int(dataset_id)}")
+
+
+def load_emitter_namespace_num_emitters(rfdata_root: str | Path | None) -> int | None:
+    """读取 ``label_maps.json`` 里 ``emitter_namespace.num_emitters``。"""
+    if rfdata_root is None:
+        return None
+    path = Path(rfdata_root) / "label_maps.json"
+    if not path.is_file():
+        return None
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    namespace = payload.get("emitter_namespace") or {}
+    if namespace.get("num_emitters") is not None:
+        return int(namespace["num_emitters"])
+    namespaced = namespace.get("namespaced_to_id")
+    if isinstance(namespaced, dict) and namespaced:
+        return len(namespaced)
+    return None
 
 
 def load_emitter_downstream_datasets(
@@ -50,6 +69,16 @@ def load_emitter_downstream_datasets(
     path = Path(config_path) if config_path is not None else DEFAULT_EMITTER_DOWNSTREAM_CONFIG
     if path.is_file():
         with path.open("r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        section = data.get("emitter_downstream")
+        if isinstance(section, dict) and section.get("datasets"):
+            return [str(name) for name in section["datasets"]]
+        datasets = data.get("datasets")
+        if datasets:
+            return [str(name) for name in datasets]
+
+    if LEGACY_EMITTER_DOWNSTREAM_CONFIG.is_file():
+        with LEGACY_EMITTER_DOWNSTREAM_CONFIG.open("r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
         datasets = data.get("datasets")
         if datasets:

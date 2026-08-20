@@ -65,8 +65,12 @@ def global_cluster_labels(
     return out
 
 
-def load_dataset_id_names(rfdata_root: str | Path) -> dict[int, str]:
+def load_dataset_id_names(rfdata_root: str | Path | None) -> dict[int, str]:
+    if not rfdata_root:
+        return {}
     path = Path(rfdata_root) / "label_maps.json"
+    if not path.is_file():
+        return {}
     with path.open("r", encoding="utf-8") as f:
         raw = json.load(f).get("datasets", {})
     return {int(k): str(v) for k, v in raw.items()}

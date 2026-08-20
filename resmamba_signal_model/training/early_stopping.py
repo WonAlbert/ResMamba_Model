@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 
 class EarlyStopping:
     """在验证指标长期无改善时触发停止。"""
@@ -56,3 +58,29 @@ class EarlyStopping:
         mode = state.get("mode")
         if mode in ("min", "max"):
             self.mode = str(mode)
+
+
+def make_early_stopping_callback(
+    *,
+    monitor: str,
+    mode: str,
+    patience: int,
+    min_delta: float = 0.0,
+) -> Any | None:
+    """patience<=0 时关闭；否则监控与 best ckpt 相同的验证指标。"""
+    if int(patience) <= 0:
+        return None
+    if mode not in ("min", "max"):
+        raise ValueError(f"early stopping mode 必须为 min 或 max，当前为 {mode!r}")
+    try:
+        from lightning.pytorch.callbacks import EarlyStopping as LightningEarlyStopping
+    except ImportError:  # pragma: no cover
+        return None
+    return LightningEarlyStopping(
+        monitor=monitor,
+        mode=mode,
+        patience=int(patience),
+        min_delta=float(min_delta),
+        verbose=True,
+        check_on_train_epoch_end=False,
+    )
