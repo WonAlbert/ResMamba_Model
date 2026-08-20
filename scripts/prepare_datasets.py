@@ -12,26 +12,54 @@ from resmamba_signal_model.thread_env import normalize_thread_env
 normalize_thread_env()
 
 import argparse
+import ast
 from collections import Counter, defaultdict
+import csv
 import json
+import os
 import pickle
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import h5py
 import numpy as np
 import yaml
 from scipy.signal import hilbert
 
+from resmamba_signal_model.data.contracts import (
+    CAPTURE_METADATA_KEYS,
+    MISSING_METADATA,
+    SIGNAL_CONTRACT_VERSION,
+)
+from resmamba_signal_model.data.labels import (
+    build_emitter_namespace,
+    build_modulation_ontology,
+)
+from resmamba_signal_model.data.splits import (
+    ImmutableManifestError,
+    assert_manifest_files_unchanged,
+    build_split_manifest,
+    load_manifest,
+    write_immutable_manifest,
+)
 from resmamba_signal_model.training.clustering_labels import GLOBAL_LABEL_NAMESPACE, global_cluster_labels
 from resmamba_signal_model.training.emitter_labels import (
     filter_emitter_downstream_pool,
     h5_dataset_name,
     load_emitter_downstream_datasets,
 )
+from resmamba_signal_model.data.wisig_manytx import (
+    WiSigBlockSink,
+    emitter_labels,
+    stream_manytx_blocks,
+)
 from resmamba_signal_model.training.pool_filters import (
+    filter_dataset_pool,
     filter_excluded_dataset_pool,
-    load_downstream_excluded_datasets,
+    load_downstream_modulation_datasets,
     load_downstream_modulation_extra_datasets,
+    load_downstream_shared_datasets,
     load_excluded_datasets,
+    load_pretrain_datasets,
 )
 
 
@@ -39,6 +67,17 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE = ROOT.parent
 NON_EMITTER = WORKSPACE / "辐射源（非个体）识别数据"
 EMITTER = WORKSPACE / "个体辐射源数据"
+EXTERNAL = ROOT / "dataset" / "external"
+PANORADIO_MODES = [
+    "morse", "psk31", "psk63", "qpsk31", "rtty45_170", "rtty50_170", "rtty100_850",
+    "olivia8_250", "olivia16_500", "olivia16_1000", "olivia32_1000", "dominoex11",
+    "mt63_1000", "navtex", "usb", "lsb", "am", "fax",
+]
+RADCOM_VARIANTS = (
+    ("radcom_dynamic", 13, "RadComDynamic.hdf5", 0.0),
+    ("radcom_awgn", 14, "RadComAWGN.hdf5", 0.0),
+    ("radcom_ota", 15, "RadComOta2.45GHz.hdf5", None),
+)
 RML2016_ORDER = ["8PSK", "AM-DSB", "AM-SSB", "BPSK", "CPFSK", "GFSK", "PAM4", "QAM16", "QAM64", "QPSK", "WBFM"]
 RML2018_ORDER = [
     "32PSK", "16APSK", "32QAM", "FM", "GMSK", "32APSK", "OQPSK", "8ASK",
@@ -48,8 +87,8 @@ RML2018_ORDER = [
 ]
 EVAL_QUALITY_DATASETS = frozenset({"rml2018_1a", "adsb2", "wifi150", "xidian14"})
 EVAL_QUALITY_SPLITS = ("val", "test")
-# 仅 val/test、不做类别均衡的数据集（test:val = 8:2，不参与 MAE 预训练）
-VAL_TEST_ONLY_DATASETS = frozenset({"open_real_data"})
+# 仅 val/test、不做类别均衡的数据集（不参与 MAE 预训练时的旧约定；open_real_data 已改为 train/val）
+VAL_TEST_ONLY_DATASETS = frozenset()
 VAL_TEST_SPLIT_RATIO = 0.8
 RML2018_EVAL_MIN_SNR = 6.0
 
@@ -127,9 +166,15 @@ def _quality_mask_global(iq: np.ndarray, *, strict: bool = False) -> tuple[np.nd
 class Writer:
     FIELDS = {
         "length": ("i4", 0), "dataset_id": ("i4", 0), "task_type_id": ("i1", 0),
-        "snr": ("f4", np.nan), "mod_label_id": ("i4", -1), "emitter_id": ("i4", -1),
+        "snr": ("f4", np.nan), "mod_label_id": ("i4", -1), "canonical_mod_label_id": ("i4", -1),
+        "emitter_id": ("i4", -1), "global_emitter_id": ("i4", -1),
         "source_label_id": ("i4", -1), "global_label_id": ("i4", -1),
     }
+    STRING_FIELDS = {
+        **{key: MISSING_METADATA for key in CAPTURE_METADATA_KEYS},
+        "capture_date": MISSING_METADATA,
+    }
+    ALL_FIELDS = tuple(FIELDS) + tuple(STRING_FIELDS)
 
     def __init__(self, path: Path, length: int, dtype, dataset_id: int, task_id: int, source: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -144,11 +189,67 @@ class Writer:
             key: self.f.create_dataset(key, (0,), maxshape=(None,), dtype=spec[0], chunks=(max(1024, chunk),), fillvalue=spec[1])
             for key, spec in self.FIELDS.items()
         }
+        string_dtype = h5py.string_dtype(encoding="utf-8")
+        self.string_ds = {
+            key: self.f.create_dataset(
+                key,
+                (0,),
+                maxshape=(None,),
+                dtype=string_dtype,
+                chunks=(max(1024, chunk),),
+                fillvalue=default,
+            )
+            for key, default in self.STRING_FIELDS.items()
+        }
         self.f.attrs.update({
             "source_path": str(source), "scale_policy": "none",
             "quality_filter": "finite, non-silent, robust-power-8MAD, PAPR<=100, lag1-correlation>=1e-3",
+            "channel_axis": 1,
+            "signal_contract_version": SIGNAL_CONTRACT_VERSION,
+            "missing_metadata_marker": MISSING_METADATA,
         })
         self.count = 0
+        self._known_group_metadata = Counter()
+
+    @staticmethod
+    def _select_meta(value, keep: np.ndarray | None):
+        value = np.asarray(value)
+        if keep is not None and value.ndim and value.shape[0] == keep.shape[0]:
+            return value[keep]
+        return value
+
+    @staticmethod
+    def _string_meta(value):
+        array = np.asarray(value)
+        if array.ndim == 0:
+            item = array.item()
+            if isinstance(item, bytes):
+                item = item.decode("utf-8", errors="replace")
+            return str(item)
+        return np.asarray([
+            item.decode("utf-8", errors="replace") if isinstance(item, bytes) else str(item)
+            for item in array.reshape(-1)
+        ], dtype=object).reshape(array.shape)
+
+    def _append_metadata(self, start: int, end: int, keep: np.ndarray | None, meta: dict, defaults: dict) -> None:
+        for key, ds in self.ds.items():
+            ds.resize(end, axis=0)
+            value = meta.get(key, defaults.get(key, ds.fillvalue))
+            ds[start:end] = self._select_meta(value, keep)
+        for key, ds in self.string_ds.items():
+            ds.resize(end, axis=0)
+            value = meta.get(key, self.STRING_FIELDS[key])
+            selected = self._string_meta(self._select_meta(value, keep))
+            ds[start:end] = selected
+            if key in CAPTURE_METADATA_KEYS:
+                if np.asarray(selected).ndim == 0:
+                    known = str(np.asarray(selected).item()) not in ("", MISSING_METADATA)
+                    self._known_group_metadata[key] += (end - start) if known else 0
+                else:
+                    self._known_group_metadata[key] += sum(
+                        str(item) not in ("", MISSING_METADATA)
+                        for item in np.asarray(selected).reshape(-1)
+                    )
 
     def append_clean(self, iq: np.ndarray, removed: Counter, **meta) -> None:
         iq = as_iq(iq)
@@ -166,11 +267,7 @@ class Writer:
         self.iq.resize(end, axis=0)
         self.iq[start:end] = iq
         defaults = {"length": self.length, "dataset_id": self.dataset_id, "task_type_id": self.task_id}
-        for key, ds in self.ds.items():
-            ds.resize(end, axis=0)
-            value = meta.get(key, defaults.get(key, ds.fillvalue))
-            value = np.asarray(value)
-            ds[start:end] = value[keep] if value.ndim else value
+        self._append_metadata(start, end, keep, meta, defaults)
         self.count = end
 
     def append_raw(self, iq: np.ndarray, **meta) -> None:
@@ -180,14 +277,15 @@ class Writer:
         self.iq.resize(end, axis=0)
         self.iq[start:end] = iq
         defaults = {"length": self.length, "dataset_id": self.dataset_id, "task_type_id": self.task_id}
-        for key, ds in self.ds.items():
-            ds.resize(end, axis=0)
-            value = meta.get(key, defaults.get(key, ds.fillvalue))
-            ds[start:end] = value
+        self._append_metadata(start, end, None, meta, defaults)
         self.count = end
 
     def close(self):
         self.f.attrs["sample_count"] = self.count
+        self.f.attrs["group_metadata_known_counts"] = json.dumps(
+            {key: int(self._known_group_metadata[key]) for key in CAPTURE_METADATA_KEYS},
+            sort_keys=True,
+        )
         self.f.close()
 
 
@@ -195,8 +293,11 @@ class Context:
     def __init__(self, output: Path):
         self.output, self.h5 = output, output / "h5"
         self.maps = self._load_json(output / "label_maps.json", {
-            "datasets": {}, "modulations": {}, "emitters": {}, "sources": {}, "task_pools": {},
+            "datasets": {}, "modulations": {}, "emitters": {}, "sources": {},
+            "receivers": {}, "sessions": {}, "task_pools": {},
         })
+        for key in ("datasets", "modulations", "emitters", "sources", "receivers", "sessions", "task_pools"):
+            self.maps.setdefault(key, {})
         self.report = self._load_json(output / "cleaning_report.json", None)
         if self.report is None:
             self.report = {
@@ -207,7 +308,18 @@ class Context:
                     "extreme_filter": "finite/non-silent, per-class robust power 4 MAD, PAPR <= 30",
                     "npy_label_maps": "numeric Y_*.npy labels are inferred from data; string labels use configured name maps",
                     "unlabelled_snr": "stricter lag-1 correlation proxy; SNR remains NaN",
-                    "split": "after cleaning, balance classes inside each dataset, then stratified 8:1:1 train/val/test",
+                    "split": (
+                        "preserve verified capture groups when available; otherwise mark group metadata "
+                        "unavailable and use the dataset's documented sample-level split"
+                    ),
+                    "group_metadata": (
+                        f"receiver_id/session_id/channel_id/capture_id are always present; "
+                        f"{MISSING_METADATA!r} means unavailable from source"
+                    ),
+                    "group_split_claims": (
+                        "Only datasets whose immutable split manifest says verified_group_held_out "
+                        "may be reported as receiver/session/capture held out"
+                    ),
                     "split_usage": "*_train.h5: MAE pretrain only; *_val.h5: all validation and model selection; *_test.h5: downstream/finetune training only (not for evaluation)",
                     "eval_quality_datasets": sorted(EVAL_QUALITY_DATASETS),
                     "eval_quality_filter": "val/test only: per-class power 3 MAD, PAPR <= 20, lag1-correlation >= 0.05",
@@ -217,7 +329,7 @@ class Context:
                 "excluded": {
                     "ADSB-1 and ADSB-3": "SHA256 confirms duplicate copies; ADSB-2 is used to avoid leakage",
                     "WIFIDATASET/62ft.rar": "RAR archive only; no RAR extractor is installed",
-                    "wisig/ManyTx.pkl.zip": "compressed archive only; not expanded automatically",
+                    "wisig/ManyTx.pkl.zip": "superseded when ManyTx.pkl is present; use --datasets wisig",
                     "XSRPdatav1": "capture dates are present but emitter identities are absent",
                 },
             }
@@ -226,6 +338,18 @@ class Context:
             self.report["policy"].update({
                 "extreme_filter": "finite/non-silent, per-class robust power 4 MAD, PAPR <= 30",
                 "npy_label_maps": "numeric Y_*.npy labels are inferred from data; string labels use configured name maps",
+                "split": (
+                    "preserve verified capture groups when available; otherwise mark group metadata "
+                    "unavailable and use the dataset's documented sample-level split"
+                ),
+                "group_metadata": (
+                    f"receiver_id/session_id/channel_id/capture_id are always present; "
+                    f"{MISSING_METADATA!r} means unavailable from source"
+                ),
+                "group_split_claims": (
+                    "Only datasets whose immutable split manifest says verified_group_held_out "
+                    "may be reported as receiver/session/capture held out"
+                ),
                 "split_usage": "*_train.h5: MAE pretrain only; *_val.h5: all validation and model selection; *_test.h5: downstream/finetune training only (not for evaluation)",
                 "eval_quality_datasets": sorted(EVAL_QUALITY_DATASETS),
                 "eval_quality_filter": "val/test only: per-class power 3 MAD, PAPR <= 20, lag1-correlation >= 0.05",
@@ -434,7 +558,7 @@ def copy_records(inputs: list[Path], selected: np.ndarray, writer: Writer) -> No
                 local = selected[lo_pos:hi_pos] - offset
                 for start in range(0, len(local), 2048):
                     idx = local[start:start + 2048]
-                    meta = {key: np.asarray(f[key][idx]) for key in Writer.FIELDS if key in f}
+                    meta = {key: np.asarray(f[key][idx]) for key in Writer.ALL_FIELDS if key in f}
                     writer.append_raw(np.asarray(f["iq"][idx]), **meta)
                 cursor = hi_pos
             offset = hi
@@ -524,7 +648,12 @@ def sync_label_maps_from_balanced(ctx: Context) -> None:
         "source_label_id": "sources",
     }
     for name, entry in ctx.report.get("datasets", {}).items():
-        split_meta = entry.get("balanced_split") or entry.get("val_test_split") or {}
+        split_meta = (
+            entry.get("balanced_split")
+            or entry.get("val_test_split")
+            or entry.get("group_heldout_split")
+            or {}
+        )
         label_field = split_meta.get("label_field")
         map_key = field_to_map.get(label_field or "")
         if not map_key:
@@ -582,12 +711,56 @@ def register_val_test_only(ctx: Context, name: str, entry: dict) -> None:
         }
 
 
+def register_group_heldout(ctx: Context, name: str, entry: dict) -> None:
+    """保留源 capture 划分，禁止 rebalance 再次按样本随机拆分。"""
+    split_paths: list[Path] = []
+    split_report: dict[str, dict] = {}
+    label_field: str | None = None
+    for split in ("train", "val", "test"):
+        info = entry.get("splits", {}).get(split)
+        if info is None:
+            continue
+        path = ctx.h5 / str(info["file"])
+        if not path.is_file():
+            continue
+        with h5py.File(path, "r") as f:
+            if int(f["iq"].shape[0]) == 0:
+                continue
+            task_id = int(f["task_type_id"][0])
+        current_label_field = choose_label_field([path])
+        if label_field is None:
+            label_field = current_label_field
+        elif current_label_field != label_field:
+            raise ValueError(
+                f"{name} 的 group-held-out split 标签字段不一致: "
+                f"{label_field!r} != {current_label_field!r}"
+            )
+        ctx.final_label_fields[path.name] = current_label_field
+        ctx.pool[split].append((path.name, task_id))
+        split_paths.append(path)
+        split_report[split] = {
+            "kept": int(info.get("kept", 0)),
+            "file": path.name,
+        }
+    if len(split_paths) < 2:
+        raise ValueError(f"{name} 声称 group-held-out，但少于两个非空 split")
+    entry.pop("balanced_split", None)
+    entry["group_heldout_split"] = {
+        "label_field": label_field,
+        "preserve_capture_groups": True,
+        "splits": split_report,
+    }
+
+
 def rebalance_all(ctx: Context) -> None:
     ctx.pool = defaultdict(list)
     dataset_names = sorted(ctx.touched) if ctx.touched else sorted(ctx.report.get("datasets", {}))
     for name in dataset_names:
         entry = ctx.report.get("datasets", {}).get(name)
         if entry is None:
+            continue
+        if entry.get("split_provenance", {}).get("claim_group_held_out"):
+            register_group_heldout(ctx, name, entry)
             continue
         if name in VAL_TEST_ONLY_DATASETS:
             register_val_test_only(ctx, name, entry)
@@ -608,11 +781,11 @@ def _load_h5_records(path: Path) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     with h5py.File(path, "r") as f:
         n = int(f["iq"].shape[0])
         iq_parts: list[np.ndarray] = []
-        meta: dict[str, list[np.ndarray]] = {key: [] for key in Writer.FIELDS}
+        meta: dict[str, list[np.ndarray]] = {key: [] for key in Writer.ALL_FIELDS}
         for start in range(0, n, 2048):
             end = min(start + 2048, n)
             iq_parts.append(np.asarray(f["iq"][start:end]))
-            for key in Writer.FIELDS:
+            for key in Writer.ALL_FIELDS:
                 if key in f:
                     meta[key].append(np.asarray(f[key][start:end]))
         iq = np.concatenate(iq_parts, axis=0)
@@ -666,7 +839,7 @@ def refine_eval_split_h5(
         chunk_idx = selected_idx[start:start + 2048]
         chunk_meta = {
             key: meta[key][chunk_idx]
-            for key in Writer.FIELDS
+            for key in Writer.ALL_FIELDS
             if meta.get(key) is not None
         }
         writer.append_raw(iq[chunk_idx], **chunk_meta)
@@ -753,8 +926,453 @@ def rml10b(ctx: Context, dataset_id: int):
         ctx.done(name, split, writers[split], raw[split], removed[split], labels)
 
 
+def wisig_manytx(ctx: Context, dataset_id: int, *, equalized: int = 0) -> None:
+    """WiSig ManyTx 个体识别：按完整 Rx/Day capture 做 group-held-out。
+
+    旧 ``X_train/X_val/X_test.npy`` 不携带 receiver/capture sidecar，无法证明
+    group-held-out，因此不再把它当作可信划分输入。
+    """
+    name = "wisig"
+    root = EMITTER / "wisig"
+    npy_root = root / "npy_data" / ("equalized_data_0" if equalized == 0 else "equalized_data_1")
+    pkl_path = root / "ManyTx.pkl"
+    if not pkl_path.is_file():
+        has_legacy_npy = all(
+            (npy_root / f"X_{split}.npy").is_file()
+            for split in ("train", "val", "test")
+        )
+        if has_legacy_npy:
+            raise ValueError(
+                f"{npy_root} 只有旧的样本级预拆分 NPY，且缺少 receiver/session/capture sidecar；"
+                "无法验证 group-held-out。请提供原始 ManyTx.pkl 后重新转换。"
+            )
+        raise FileNotFoundError(
+            f"未找到 {pkl_path}；可信 WiSig 划分必须从原始 pickle 恢复 Rx/Day 元数据"
+        )
+    ctx.maps["datasets"][str(dataset_id)] = name
+    writers = {
+        split: Writer(ctx.h5 / f"{name}_{split}.h5", 256, np.float32, dataset_id, 1, pkl_path)
+        for split in ("train", "val", "test")
+    }
+    removed = {split: Counter() for split in writers}
+    raw = Counter()
+
+    def on_batch(
+        split: str,
+        iq: np.ndarray,
+        labels: np.ndarray,
+        capture_metadata: dict[str, str],
+    ) -> None:
+        raw[split] += len(iq)
+        writers[split].append_clean(
+            iq.astype(np.float32, copy=False),
+            removed[split],
+            emitter_id=labels,
+            **capture_metadata,
+        )
+
+    sink = WiSigBlockSink(equalized=equalized, on_batch=on_batch)
+    meta = stream_manytx_blocks(
+        pkl_path,
+        sink,
+    )
+    labels = emitter_labels(meta)
+    ctx.maps["emitters"][name] = labels
+    ctx.maps["receivers"][name] = dict(meta.receiver_ids)
+    ctx.maps["sessions"][name] = dict(meta.session_ids)
+    split_group_counts = Counter(meta.group_assignments.values())
+    for split in writers:
+        writers[split].f.attrs["split_strategy"] = meta.split_strategy
+        writers[split].f.attrs["group_field"] = "capture_id"
+        writers[split].f.attrs["receiver_id_map"] = json.dumps(meta.receiver_ids, ensure_ascii=False)
+        writers[split].f.attrs["session_id_map"] = json.dumps(meta.session_ids, ensure_ascii=False)
+        ctx.done(name, split, writers[split], raw[split], removed[split], labels)
+    entry = ctx.report["datasets"][name]
+    entry["split_provenance"] = {
+        "strategy": meta.split_strategy,
+        "group_fields": ["receiver_id", "session_id", "capture_id"],
+        "claim_group_held_out": True,
+        "verification": "pending immutable split manifest validation",
+        "groups_by_split": {
+            split: int(split_group_counts.get(split, 0))
+            for split in ("train", "val", "test")
+        },
+    }
+
+
+def _csv_field(row: dict[str, str], *names: str) -> str:
+    for name in names:
+        if name in row and row[name].strip():
+            return row[name].strip()
+        spaced = f" {name.strip()}"
+        if spaced in row and row[spaced].strip():
+            return row[spaced].strip()
+    raise KeyError(f"缺少字段 {names}，可用列: {list(row)}")
+
+
+def radcom_waveform_to_iq(waveform: np.ndarray) -> np.ndarray:
+    waveform = np.asarray(waveform, dtype=np.float32)
+    return np.stack([waveform[:128], waveform[128:]], axis=0)
+
+
+def parse_radcom_key(key: str) -> tuple[str, str, float, object]:
+    mod, sig, snr, sample_idx = ast.literal_eval(key)
+    return str(mod), str(sig), float(snr), sample_idx
+
+
+def build_radcom_label_maps(path: Path) -> tuple[dict[str, int], dict[str, int]]:
+    mods: set[str] = set()
+    sigs: set[str] = set()
+    with h5py.File(path, "r") as f:
+        for key in f.keys():
+            mod, sig, _, _ = parse_radcom_key(key)
+            mods.add(mod)
+            sigs.add(sig)
+    mod_labels = {name: idx for idx, name in enumerate(sorted(mods))}
+    sig_labels = {name: idx for idx, name in enumerate(sorted(sigs))}
+    return mod_labels, sig_labels
+
+
+def radcom_hdf5(
+    ctx: Context,
+    name: str,
+    dataset_id: int,
+    path: Path,
+    *,
+    snr_min: float | None = 0.0,
+    jobs: int = 1,
+) -> None:
+    if jobs > 1:
+        radcom_hdf5_parallel(ctx, name, dataset_id, path, snr_min=snr_min, jobs=jobs)
+        return
+    if not path.is_file():
+        raise FileNotFoundError(f"未找到 RadarComm HDF5: {path}")
+    mod_labels, sig_labels = build_radcom_label_maps(path)
+    ctx.maps["datasets"][str(dataset_id)] = name
+    ctx.maps["modulations"][name] = mod_labels
+    ctx.maps["sources"][name] = sig_labels
+    writer = Writer(ctx.h5 / f"{name}_train.h5", 128, np.float32, dataset_id, 0, path)
+    removed, raw = Counter(), 0
+    batch_iq: list[np.ndarray] = []
+    batch_mod: list[int] = []
+    batch_sig: list[int] = []
+    batch_snr: list[float] = []
+
+    def flush() -> None:
+        nonlocal batch_iq, batch_mod, batch_sig, batch_snr
+        if not batch_iq:
+            return
+        block = np.stack(batch_iq, axis=0)
+        writer.append_clean(
+            block,
+            removed,
+            mod_label_id=np.asarray(batch_mod, dtype=np.int32),
+            source_label_id=np.asarray(batch_sig, dtype=np.int32),
+            snr=np.asarray(batch_snr, dtype=np.float32),
+        )
+        batch_iq, batch_mod, batch_sig, batch_snr = [], [], [], []
+
+    with h5py.File(path, "r") as f:
+        for key in f.keys():
+            mod, sig, snr, _ = parse_radcom_key(key)
+            if snr_min is not None and snr <= snr_min:
+                removed["snr_le_min"] += 1
+                continue
+            raw += 1
+            batch_iq.append(radcom_waveform_to_iq(f[key][:]))
+            batch_mod.append(mod_labels[mod])
+            batch_sig.append(sig_labels[sig])
+            batch_snr.append(snr)
+            if len(batch_iq) >= 2048:
+                flush()
+    flush()
+    ctx.done(name, "train", writer, raw, removed, mod_labels)
+
+
+def _radcom_hdf5_part_worker(
+    keys: list[str],
+    src_path: str,
+    part_path: str,
+    dataset_id: int,
+    mod_labels: dict[str, int],
+    sig_labels: dict[str, int],
+    snr_min: float | None,
+) -> tuple[str, int, int, dict[str, int]]:
+    removed: Counter = Counter()
+    raw = 0
+    writer = Writer(
+        Path(part_path),
+        128,
+        np.float32,
+        dataset_id,
+        0,
+        Path(src_path),
+    )
+    batch_iq: list[np.ndarray] = []
+    batch_mod: list[int] = []
+    batch_sig: list[int] = []
+    batch_snr: list[float] = []
+
+    def flush() -> None:
+        nonlocal batch_iq, batch_mod, batch_sig, batch_snr
+        if not batch_iq:
+            return
+        block = np.stack(batch_iq, axis=0)
+        writer.append_clean(
+            block,
+            removed,
+            mod_label_id=np.asarray(batch_mod, dtype=np.int32),
+            source_label_id=np.asarray(batch_sig, dtype=np.int32),
+            snr=np.asarray(batch_snr, dtype=np.float32),
+        )
+        batch_iq, batch_mod, batch_sig, batch_snr = [], [], [], []
+
+    with h5py.File(src_path, "r") as f:
+        for key in keys:
+            mod, sig, snr, _ = parse_radcom_key(key)
+            if snr_min is not None and snr <= snr_min:
+                removed["snr_le_min"] += 1
+                continue
+            raw += 1
+            batch_iq.append(radcom_waveform_to_iq(f[key][:]))
+            batch_mod.append(mod_labels[mod])
+            batch_sig.append(sig_labels[sig])
+            batch_snr.append(snr)
+            if len(batch_iq) >= 2048:
+                flush()
+    flush()
+    writer.close()
+    return part_path, raw, writer.count, dict(removed)
+
+
+def _merge_h5_parts(parts: list[Path], out_path: Path, dataset_id: int, task_id: int, source: Path) -> int:
+    if not parts:
+        return 0
+    with h5py.File(parts[0], "r") as first:
+        length = int(first["iq"].shape[-1])
+        dtype = first["iq"].dtype
+    writer = Writer(out_path, length, dtype, dataset_id, task_id, source)
+    total = 0
+    for part in parts:
+        with h5py.File(part, "r") as f:
+            n = int(f["iq"].shape[0])
+            if n == 0:
+                continue
+            idx = np.arange(n, dtype=np.int64)
+            copy_records([part], idx, writer)
+            total += n
+    writer.close()
+    return total
+
+
+def radcom_hdf5_parallel(
+    ctx: Context,
+    name: str,
+    dataset_id: int,
+    path: Path,
+    *,
+    snr_min: float | None = 0.0,
+    jobs: int = 25,
+) -> None:
+    if not path.is_file():
+        raise FileNotFoundError(f"未找到 RadarComm HDF5: {path}")
+    jobs = max(1, int(jobs))
+    mod_labels, sig_labels = build_radcom_label_maps(path)
+    ctx.maps["datasets"][str(dataset_id)] = name
+    ctx.maps["modulations"][name] = mod_labels
+    ctx.maps["sources"][name] = sig_labels
+
+    with h5py.File(path, "r") as f:
+        keys = list(f.keys())
+    if snr_min is not None:
+        keys = [k for k in keys if parse_radcom_key(k)[2] > snr_min]
+
+    parts_dir = ctx.h5 / f"{name}__parts"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    for old in parts_dir.glob("part_*.h5"):
+        old.unlink(missing_ok=True)
+
+    chunks: list[list[str]] = [[] for _ in range(min(jobs, len(keys)))]
+    for i, key in enumerate(keys):
+        chunks[i % len(chunks)].append(key)
+
+    print(f"[parallel-radcom] {name} jobs={len(chunks)} keys={len(keys)}", flush=True)
+    removed: Counter = Counter()
+    raw = 0
+    part_paths: list[Path] = []
+    with ProcessPoolExecutor(max_workers=len(chunks)) as pool:
+        futures = []
+        for i, chunk in enumerate(chunks):
+            if not chunk:
+                continue
+            part_path = parts_dir / f"part_{i:03d}.h5"
+            futures.append(
+                pool.submit(
+                    _radcom_hdf5_part_worker,
+                    chunk,
+                    str(path),
+                    str(part_path),
+                    dataset_id,
+                    mod_labels,
+                    sig_labels,
+                    snr_min,
+                )
+            )
+        for fut in as_completed(futures):
+            part_file, part_raw, part_kept, part_removed = fut.result()
+            raw += part_raw
+            removed.update(part_removed)
+            if part_kept > 0:
+                part_paths.append(Path(part_file))
+            print(f"[parallel-radcom] part done kept={part_kept:,} raw={part_raw:,}", flush=True)
+
+    part_paths.sort()
+    out_train = ctx.h5 / f"{name}_train.h5"
+    out_train.unlink(missing_ok=True)
+    kept = _merge_h5_parts(part_paths, out_train, dataset_id, 0, path)
+    for part in part_paths:
+        part.unlink(missing_ok=True)
+    if parts_dir.exists():
+        parts_dir.rmdir()
+
+    ctx.touched.add(name)
+    entry = ctx.report["datasets"].setdefault(name, {"labels": mod_labels, "splits": {}})
+    entry["labels"] = mod_labels
+    entry["splits"]["train"] = {
+        "raw": raw,
+        "kept": kept,
+        "removed": dict(removed),
+        "file": out_train.name,
+    }
+    print(f"[parallel-radcom] {name} merged kept={kept:,} raw={raw:,}", flush=True)
+
+
+def panoradio_hf(ctx: Context, dataset_id: int) -> None:
+    name = "panoradio_hf"
+    root = EXTERNAL / "panoradio_hf"
+    npy_path = root / "dataset_panoradio_hf.npy"
+    tags_path = root / "dataset_panoradio_hf_tags.csv"
+    if not npy_path.is_file() or not tags_path.is_file():
+        raise FileNotFoundError(f"缺少 Panoradio HF 数据: {root}")
+    labels = {mode: idx for idx, mode in enumerate(PANORADIO_MODES)}
+    ctx.maps["datasets"][str(dataset_id)] = name
+    ctx.maps["modulations"][name] = labels
+
+    modes: list[str] = []
+    snrs: list[float] = []
+    with tags_path.open(encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            mode = _csv_field(row, "mode")
+            if mode not in labels:
+                raise ValueError(f"未知调制类型 {mode!r}")
+            modes.append(mode)
+            snrs.append(float(_csv_field(row, "snr")))
+
+    x = np.load(npy_path, mmap_mode="r")
+    if len(x) != len(modes):
+        raise ValueError(f"样本数不一致: npy={len(x)} tags={len(modes)}")
+    y = np.asarray([labels[m] for m in modes], dtype=np.int32)
+    snr_arr = np.asarray(snrs, dtype=np.float32)
+    keep = snr_arr > 0
+    removed = Counter({"snr_le_0_source_samples": int((~keep).sum())})
+    x = x[keep]
+    y = y[keep]
+    snr_arr = snr_arr[keep]
+
+    writer = Writer(ctx.h5 / f"{name}_train.h5", int(x.shape[-1]), np.float32, dataset_id, 0, root)
+    raw = len(x)
+    for start in range(0, len(x), 2048):
+        end = min(start + 2048, len(x))
+        block = as_iq(np.asarray(x[start:end])).astype(np.float32, copy=False)
+        writer.append_clean(
+            block,
+            removed,
+            mod_label_id=y[start:end],
+            snr=snr_arr[start:end],
+        )
+    ctx.done(name, "train", writer, raw, removed, labels)
+
+
+def cjr_mix(ctx: Context, dataset_id: int) -> None:
+    """CJR-mix：仅转换 train parquet → RFData H5。"""
+    from resmamba_signal_model.data.cjr_mix import (
+        list_parquet_files,
+        normalize_iq_array,
+        parse_iq_array,
+        require_pyarrow,
+        resolve_cjr_mix_root,
+    )
+
+    import pyarrow.parquet as pq
+
+    require_pyarrow()
+    name = "cjr_mix"
+    data_root = resolve_cjr_mix_root(ctx.output)
+    ctx.maps["datasets"][str(dataset_id)] = name
+
+    writer: Writer | None = None
+    removed = Counter()
+    raw = 0
+    label_ids: set[int] = set()
+    batch_iq: list[np.ndarray] = []
+    batch_mod: list[int] = []
+    batch_snr: list[float] = []
+
+    def flush() -> None:
+        nonlocal batch_iq, batch_mod, batch_snr
+        if not batch_iq or writer is None:
+            return
+        block = np.stack(batch_iq, axis=0)
+        writer.append_clean(
+            block,
+            removed,
+            mod_label_id=np.asarray(batch_mod, dtype=np.int32),
+            source_label_id=np.asarray(batch_mod, dtype=np.int32),
+            snr=np.asarray(batch_snr, dtype=np.float32),
+        )
+        batch_iq, batch_mod, batch_snr = [], [], []
+
+    for path in list_parquet_files(data_root, "train"):
+        pf = pq.ParquetFile(path)
+        for rg in range(pf.num_row_groups):
+            table = pf.read_row_group(rg, columns=["iq", "infer_class", "snr"])
+            infer = table.column("infer_class").to_numpy(zero_copy_only=False)
+            snrs = table.column("snr").to_numpy(zero_copy_only=False)
+            iq_col = table.column("iq")
+            for i in range(table.num_rows):
+                raw += 1
+                iq = normalize_iq_array(parse_iq_array(iq_col[i].as_py()), "abs")
+                label = int(infer[i])
+                label_ids.add(label)
+                if writer is None:
+                    labels = {str(v): v for v in sorted(label_ids)}
+                    ctx.maps["modulations"][name] = labels
+                    writer = Writer(
+                        ctx.h5 / f"{name}_train.h5",
+                        int(iq.shape[-1]),
+                        np.float32,
+                        dataset_id,
+                        0,
+                        data_root / "train",
+                    )
+                batch_iq.append(iq)
+                batch_mod.append(label)
+                batch_snr.append(float(snrs[i]))
+                if len(batch_iq) >= 256:
+                    flush()
+
+    flush()
+    if writer is None:
+        raise RuntimeError("CJR-mix train 为空")
+    labels = {str(v): v for v in sorted(label_ids)}
+    ctx.maps["modulations"][name] = labels
+    writer.f.attrs["scale_policy"] = "abs_max_clip5_at_convert"
+    writer.f.attrs["source_path"] = str(data_root / "train")
+    ctx.done(name, "train", writer, raw, removed, labels)
+
+
 def open_real_data(ctx: Context, dataset_id: int) -> None:
-    """open_realData round7 CSV → RFData H5；仅 test/val（8:2），不做类别均衡，不参与 MAE 预训练。"""
+    """open_realData round7 CSV → RFData H5；train/val（8:2），不做类别均衡。"""
     name = "open_real_data"
     root = NON_EMITTER / "open_realData" / "outputv2" / "round7_dataset"
     summary = json.loads((root / "manifests" / "summary.json").read_text(encoding="utf-8"))
@@ -809,10 +1427,10 @@ def open_real_data(ctx: Context, dataset_id: int) -> None:
     labels_all = labels_all[order]
 
     n = len(iq_all)
-    n_test = int(n * VAL_TEST_SPLIT_RATIO)
+    n_train = int(n * VAL_TEST_SPLIT_RATIO)
     split_blocks = [
-        ("test", iq_all[:n_test], labels_all[:n_test]),
-        ("val", iq_all[n_test:], labels_all[n_test:]),
+        ("train", iq_all[:n_train], labels_all[:n_train]),
+        ("val", iq_all[n_train:], labels_all[n_train:]),
     ]
 
     ctx.touched.add(name)
@@ -835,19 +1453,19 @@ def open_real_data(ctx: Context, dataset_id: int) -> None:
         entry["splits"][split_name] = {
             "raw": raw,
             "kept": writer.count,
-            "removed": dict(removed) if split_name == "test" else {},
+            "removed": dict(removed) if split_name == "train" else {},
             "file": out_path.name,
         }
 
     entry["val_test_split"] = {
         "label_field": "source_label_id",
-        "test_ratio": VAL_TEST_SPLIT_RATIO,
+        "train_ratio": VAL_TEST_SPLIT_RATIO,
         "no_class_balance": True,
         "total_kept": n,
         "classes": len(set(kept_labels)),
         "splits": {
             split: {"kept": entry["splits"][split]["kept"], "file": entry["splits"][split]["file"]}
-            for split in ("test", "val")
+            for split in ("train", "val")
         },
     }
 
@@ -895,6 +1513,76 @@ def _read_label_array(f: h5py.File, key: str, length: int) -> np.ndarray:
     return np.full(length, -1, dtype=np.int32)
 
 
+def _write_int_column(f: h5py.File, key: str, values: np.ndarray) -> None:
+    values = np.asarray(values, dtype=np.int32)
+    n = int(values.shape[0])
+    if key in f and tuple(f[key].shape) == (n,):
+        f[key][:] = values
+        return
+    if key in f:
+        del f[key]
+    f.create_dataset(
+        key,
+        data=values,
+        maxshape=(None,),
+        chunks=(max(1, min(max(n, 1), 4096)),),
+        fillvalue=-1,
+    )
+
+
+def stamp_semantic_namespaces(ctx: Context) -> dict[str, dict[str, int]]:
+    """写入 canonical modulation 与 namespaced emitter 的连续全局 ID。"""
+    ontology = build_modulation_ontology(
+        ctx.maps.get("modulations", {}),
+        existing=ctx.maps.get("modulation_ontology"),
+    )
+    emitter_namespace = build_emitter_namespace(
+        ctx.maps.get("emitters", {}),
+        existing=ctx.maps.get("emitter_namespace"),
+    )
+    ctx.maps["modulation_ontology"] = ontology.to_dict()
+    ctx.maps["canonical_modulations"] = dict(ontology.canonical_to_id)
+    ctx.maps["emitter_namespace"] = emitter_namespace.to_dict()
+    dataset_names = {
+        int(dataset_id): str(dataset_name)
+        for dataset_id, dataset_name in ctx.maps.get("datasets", {}).items()
+    }
+    canonical_stats: dict[str, int] = {}
+    emitter_stats: dict[str, int] = {}
+    if not ctx.h5.exists():
+        return {"canonical_mod_label_id": canonical_stats, "global_emitter_id": emitter_stats}
+    for path in sorted(ctx.h5.glob("*.h5")):
+        if "__balanced_" in path.name:
+            continue
+        with h5py.File(path, "r+") as f:
+            n = int(f["iq"].shape[0])
+            dataset_ids = _read_label_array(f, "dataset_id", n)
+            local_mod = _read_label_array(f, "mod_label_id", n)
+            local_emitter = _read_label_array(f, "emitter_id", n)
+            canonical = np.full(n, -1, dtype=np.int32)
+            global_emitter = np.full(n, -1, dtype=np.int32)
+            for dataset_id in np.unique(dataset_ids):
+                dataset_name = dataset_names.get(int(dataset_id))
+                if dataset_name is None:
+                    continue
+                choose = dataset_ids == dataset_id
+                canonical[choose] = ontology.map_local(dataset_name, local_mod[choose])
+                global_emitter[choose] = emitter_namespace.map_local(
+                    dataset_name,
+                    local_emitter[choose],
+                )
+            _write_int_column(f, "canonical_mod_label_id", canonical)
+            _write_int_column(f, "global_emitter_id", global_emitter)
+            canonical_stats[path.name] = int(np.sum(canonical >= 0))
+            emitter_stats[path.name] = int(np.sum(global_emitter >= 0))
+            f.attrs["modulation_ontology_version"] = ontology.version
+            f.attrs["emitter_namespace_version"] = emitter_namespace.version
+    return {
+        "canonical_mod_label_id": canonical_stats,
+        "global_emitter_id": emitter_stats,
+    }
+
+
 def stamp_global_label_ids(ctx: Context) -> dict[str, int]:
     """为每个 H5 样本写入跨数据集唯一的 global_label_id（用于 clustering）。"""
     if not ctx.h5.exists():
@@ -930,7 +1618,7 @@ def stamp_mod_label_ids(ctx: Context, dataset_names: list[str] | None = None) ->
     """将 source_label_id 镜像写入 mod_label_id（用于辐射源数据集参与调制下游）。"""
     if dataset_names is None:
         dataset_names = load_downstream_modulation_extra_datasets(
-            config_path=ROOT / "configs" / "downstream_modulation_extra_datasets.yaml"
+            config_path=ROOT / "configs" / "datasets.yaml"
         )
     allowed = set(dataset_names)
     stats: dict[str, int] = {}
@@ -992,78 +1680,114 @@ def pool_files_with_global_labels(ctx: Context, split_files: list[tuple[str, int
 def finalize_task_pools(ctx: Context) -> None:
     """构建 task_pools。
 
-    H5 后缀约定（pool 名中的 train/val 指训练流程角色，不等于 H5 文件名后缀）：
-    - *_train.h5  → 仅 pretrain_train（MAE 预训练）
-    - *_val.h5    → 各阶段唯一验证集（早停 / 选模 / 报告指标）
-    - *_test.h5   → 下游头与微调的训练数据（经 downstream_*_train、clustering_train 等 pool 读取，不作评测）
+    H5 后缀约定：
+    - *_train.h5：MAE 预训练（pretrain_train）或下游训练（downstream_*_train / clustering_train）
+    - *_val.h5：各阶段验证（早停 / 选模 / 报告指标）
+    白名单见 configs/datasets.yaml（pretrain / downstream_modulation / emitter_downstream）。
     """
     rebuild_pools_from_h5(ctx)
     train = sorted(ctx.pool["train"])
     val = sorted(ctx.pool["val"])
-    test = sorted(ctx.pool["test"])
     fields = ctx.final_label_fields
     pf = lambda split, **kw: pool_files(split, fields, **kw)
-    emitter_downstream = load_emitter_downstream_datasets(config_path=ROOT / "configs" / "emitter_downstream.yaml")
-    excluded = load_excluded_datasets(config_path=ROOT / "configs" / "excluded_datasets.yaml")
-    downstream_excluded = load_downstream_excluded_datasets(
-        config_path=ROOT / "configs" / "downstream_excluded_datasets.yaml"
-    )
-    modulation_extra = load_downstream_modulation_extra_datasets(
-        config_path=ROOT / "configs" / "downstream_modulation_extra_datasets.yaml"
-    )
+    config_path = ROOT / "configs" / "datasets.yaml"
+    pretrain_datasets = load_pretrain_datasets(config_path=config_path)
+    modulation_datasets = load_downstream_modulation_datasets(config_path=config_path)
+    emitter_downstream = load_emitter_downstream_datasets(config_path=config_path)
+    shared_datasets = load_downstream_shared_datasets(config_path=config_path)
+    excluded = load_excluded_datasets(config_path=config_path)
 
     def _pool(split_files: list[tuple[str, int]], **kwargs: object) -> list[str]:
         return filter_excluded_dataset_pool(pf(split_files, **kwargs), excluded)
 
-    def _downstream_pool(split_files: list[tuple[str, int]], **kwargs: object) -> list[str]:
-        return filter_excluded_dataset_pool(_pool(split_files, **kwargs), downstream_excluded)
+    def _whitelist_pool(
+        split_files: list[tuple[str, int]],
+        allowed: list[str],
+        **kwargs: object,
+    ) -> list[str]:
+        return filter_dataset_pool(_pool(split_files, **kwargs), allowed)
 
-    def _modulation_extra_pool(split_files: list[tuple[str, int]]) -> list[str]:
-        extra = set(modulation_extra)
-        return _downstream_pool(
-            [(filename, tid) for filename, tid in split_files if tid == 0 and h5_dataset_name(filename) in extra],
-        )
-
-    allowed_test = set(_pool(test))
-    allowed_val = set(_pool(val))
-    pretrain_excluded = set(excluded) | VAL_TEST_ONLY_DATASETS
-    downstream_test = set(_downstream_pool(test))
-    downstream_val = set(_downstream_pool(val))
-    modulation_train = sorted(
-        set(_downstream_pool(test, task_id=0, label_field="mod_label_id")) | set(_modulation_extra_pool(test))
+    modulation_train = _whitelist_pool(
+        train, modulation_datasets, task_id=0, label_field="mod_label_id"
     )
-    modulation_val = sorted(
-        set(_downstream_pool(val, task_id=0, label_field="mod_label_id")) | set(_modulation_extra_pool(val))
+    modulation_val = _whitelist_pool(
+        val, modulation_datasets, task_id=0, label_field="mod_label_id"
     )
+    emitter_train = filter_emitter_downstream_pool(
+        _whitelist_pool(train, emitter_downstream, task_id=1, label_field="emitter_id"),
+        emitter_downstream,
+    )
+    emitter_val = filter_emitter_downstream_pool(
+        _whitelist_pool(val, emitter_downstream, task_id=1, label_field="emitter_id"),
+        emitter_downstream,
+    )
+    shared_train = sorted(set(modulation_train) | set(emitter_train))
+    shared_val = sorted(set(modulation_val) | set(emitter_val))
+    shared_train = filter_dataset_pool(shared_train, shared_datasets)
+    shared_val = filter_dataset_pool(shared_val, shared_datasets)
 
     ctx.maps["task_pools"] = {
-        "pretrain_train": filter_excluded_dataset_pool(_pool(train), pretrain_excluded),
-        "pretrain_val": sorted(filter_excluded_dataset_pool(list(allowed_val), pretrain_excluded)),
+        "pretrain_train": _whitelist_pool(train, pretrain_datasets),
+        "pretrain_val": _whitelist_pool(val, pretrain_datasets),
         "downstream_modulation_train": modulation_train,
         "downstream_modulation_val": modulation_val,
-        "downstream_source_train": _downstream_pool(test, task_id=0, label_field="source_label_id"),
-        "downstream_source_val": _downstream_pool(val, task_id=0, label_field="source_label_id"),
-        "downstream_emitter_train": filter_emitter_downstream_pool(
-            _downstream_pool(test, task_id=1, label_field="emitter_id"),
-            emitter_downstream,
-        ),
-        "downstream_emitter_val": filter_emitter_downstream_pool(
-            _downstream_pool(val, task_id=1, label_field="emitter_id"),
-            emitter_downstream,
-        ),
-        "downstream_prediction_train": sorted(downstream_test),
-        "downstream_prediction_val": sorted(downstream_val),
+        "downstream_source_train": _whitelist_pool(train, modulation_datasets, task_id=0, label_field="source_label_id"),
+        "downstream_source_val": _whitelist_pool(val, modulation_datasets, task_id=0, label_field="source_label_id"),
+        "downstream_emitter_train": emitter_train,
+        "downstream_emitter_val": emitter_val,
+        "downstream_prediction_train": shared_train,
+        "downstream_prediction_val": shared_val,
         "clustering_train": pool_files_with_global_labels(
-            ctx, [(filename, tid) for filename, tid in test if filename in downstream_test]
+            ctx, [(filename, tid) for filename, tid in train if filename in set(shared_train)]
         ),
         "clustering_val": pool_files_with_global_labels(
-            ctx, [(filename, tid) for filename, tid in val if filename in downstream_val]
+            ctx, [(filename, tid) for filename, tid in val if filename in set(shared_val)]
         ),
     }
+    ctx.maps["pretrain_datasets"] = list(pretrain_datasets)
+    ctx.maps["downstream_modulation_datasets"] = list(modulation_datasets)
     ctx.maps["emitter_downstream_datasets"] = list(emitter_downstream)
+    ctx.maps["downstream_shared_datasets"] = list(shared_datasets)
     ctx.maps["excluded_datasets"] = list(excluded)
-    ctx.maps["downstream_excluded_datasets"] = list(downstream_excluded)
-    ctx.maps["downstream_modulation_extra_datasets"] = list(modulation_extra)
+
+
+def claimed_group_splits(ctx: Context) -> dict[str, str]:
+    claims: dict[str, str] = {}
+    for name, entry in ctx.report.get("datasets", {}).items():
+        provenance = entry.get("split_provenance", {})
+        if provenance.get("claim_group_held_out"):
+            claims[str(name)] = str(provenance.get("strategy", "group_held_out"))
+    return claims
+
+
+def finalize_split_manifest(ctx: Context) -> dict:
+    payload = build_split_manifest(
+        ctx.h5,
+        group_split_claims=claimed_group_splits(ctx),
+    )
+    digest = write_immutable_manifest(ctx.output / "split_manifest.json", payload)
+    for name, manifest_entry in payload.get("datasets", {}).items():
+        report_entry = ctx.report.get("datasets", {}).get(name)
+        if report_entry is None:
+            continue
+        provenance = report_entry.get("split_provenance")
+        if provenance is not None:
+            provenance["verification"] = manifest_entry["group_integrity"]["status"]
+    ctx.maps["split_manifest"] = {
+        "file": "split_manifest.json",
+        "sha256": digest,
+        "immutable": True,
+    }
+    ctx.report["split_manifest"] = {
+        "file": "split_manifest.json",
+        "sha256": digest,
+        "immutable": True,
+        "datasets": {
+            name: entry["group_integrity"]
+            for name, entry in payload.get("datasets", {}).items()
+        },
+    }
+    return payload
 
 
 def finalize(ctx: Context, *, refine_eval: bool = True) -> None:
@@ -1071,11 +1795,147 @@ def finalize(ctx: Context, *, refine_eval: bool = True) -> None:
     if refine_eval:
         refine_eval_splits(ctx)
     sync_label_maps_from_balanced(ctx)
+    stamp_semantic_namespaces(ctx)
     stamp_global_label_ids(ctx)
     finalize_task_pools(ctx)
+    finalize_split_manifest(ctx)
     ctx.output.mkdir(parents=True, exist_ok=True)
     (ctx.output / "label_maps.json").write_text(json.dumps(ctx.maps, ensure_ascii=False, indent=2), encoding="utf-8")
     (ctx.output / "cleaning_report.json").write_text(json.dumps(ctx.report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def build_registry() -> dict[str, object]:
+  registry: dict[str, object] = {
+      "electromagnetic_0926": lambda ctx: npy_dataset(ctx, "electromagnetic_0926", 0, NON_EMITTER / "0926电磁数据", 0, "source_label_id", {x: i for i, x in enumerate(["ADSB", "AIS", "AM", "FM", "GPS", "Iridium", "P25"])}, [("train", "train"), ("test", "val")], mirror_mod_label_id=True),
+      "xidian14": lambda ctx: npy_dataset(ctx, "xidian14", 1, NON_EMITTER / "xidian_npy_cls14", 0, "mod_label_id", None, [("train", "train"), ("val", "val")]),
+      "rml2016_04c": lambda ctx: rml_pickle(ctx, "rml2016_04c", 2, NON_EMITTER / "2016.04C.multisnr.pkl"),
+      "rml2016_10a": lambda ctx: rml_pickle(ctx, "rml2016_10a", 3, NON_EMITTER / "RML2016.10a_dict.pkl"),
+      "rml2016_10b": lambda ctx: rml10b(ctx, 4),
+      "rml2018_1a": lambda ctx: rml2018(ctx, 5),
+      "adsb2": lambda ctx: npy_dataset(ctx, "adsb2", 6, EMITTER / "ADSB-2", 1, "emitter_id", None, [("train", "train"), ("val", "val")]),
+      "wifi150": lambda ctx: npy_dataset(ctx, "wifi150", 7, EMITTER / "wifi_cls150", 1, "emitter_id", None, [("train", "train"), ("val", "val"), ("test", "test")]),
+      "communication_emitters": lambda ctx: dat_emitters(ctx, "communication_emitters", 8, EMITTER / "通信辐射源个体识别数据集", 2048, False),
+      "radar_emitters": lambda ctx: dat_emitters(ctx, "radar_emitters", 9, EMITTER / "雷达辐射源个体识别数据集", 1000, True),
+      "open_real_data": lambda ctx: open_real_data(ctx, 10),
+      "wisig": lambda ctx: wisig_manytx(ctx, 11),
+      "panoradio_hf": lambda ctx: panoradio_hf(ctx, 12),
+      "cjr_mix": lambda ctx: cjr_mix(ctx, 31),
+  }
+  for ds_name, ds_id, filename, snr_min in RADCOM_VARIANTS:
+      registry[ds_name] = (
+          lambda ctx, name=ds_name, dataset_id=ds_id, h5_name=filename, min_snr=snr_min: radcom_hdf5(
+              ctx, name, dataset_id, EXTERNAL / "radarcommdataset" / h5_name, snr_min=min_snr
+          )
+      )
+  return registry
+
+
+RADCOM_ALIASES = frozenset({"radarcomm", "radarcommdataset"})
+
+
+def resolve_selected_builds(selected: set[str], registry: dict[str, object]) -> list[str]:
+    if "all" in selected:
+        return sorted(registry)
+    names: list[str] = []
+    if selected & RADCOM_ALIASES:
+        names.extend(name for name, _, _, _ in RADCOM_VARIANTS)
+    for name in selected:
+        if name in registry:
+            names.append(name)
+    unknown = selected - set(names) - RADCOM_ALIASES - {"all"}
+    if unknown:
+        raise ValueError(f"未知数据集: {sorted(unknown)}；可选: {sorted(registry)}")
+    return sorted(set(names))
+
+
+def build_cache_dir(output: Path) -> Path:
+    path = output / ".build_cache"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def clear_dataset_h5(ctx: Context, name: str) -> None:
+    for suffix in ("train", "val", "test", "__balanced_train", "__balanced_val", "__balanced_test"):
+        (ctx.h5 / f"{name}_{suffix}.h5").unlink(missing_ok=True)
+
+
+def write_build_cache(ctx: Context, name: str) -> None:
+    entry = ctx.report["datasets"].get(name)
+    if entry is None:
+        raise RuntimeError(f"{name} 构建后缺少 cleaning_report 条目")
+    cache = {
+        "dataset_name": name,
+        "datasets_id_map": {ds_id: ds_name for ds_id, ds_name in ctx.maps.get("datasets", {}).items() if ds_name == name},
+        "modulations": ctx.maps.get("modulations", {}).get(name),
+        "sources": ctx.maps.get("sources", {}).get(name),
+        "emitters": ctx.maps.get("emitters", {}).get(name),
+        "receivers": ctx.maps.get("receivers", {}).get(name),
+        "sessions": ctx.maps.get("sessions", {}).get(name),
+        "report_entry": entry,
+    }
+    path = build_cache_dir(ctx.output) / f"{name}.json"
+    path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def merge_build_caches(ctx: Context, names: list[str] | None = None) -> list[str]:
+    cache_dir = build_cache_dir(ctx.output)
+    merged: list[str] = []
+    for path in sorted(cache_dir.glob("*.json")):
+        if names is not None and path.stem not in names:
+            continue
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        name = str(payload["dataset_name"])
+        ctx.touched.add(name)
+        ctx.report["datasets"][name] = payload["report_entry"]
+        for ds_id, ds_name in payload.get("datasets_id_map", {}).items():
+            ctx.maps.setdefault("datasets", {})[str(ds_id)] = ds_name
+        for map_key in ("modulations", "sources", "emitters", "receivers", "sessions"):
+            value = payload.get(map_key)
+            if value:
+                ctx.maps.setdefault(map_key, {})[name] = value
+        merged.append(name)
+    return merged
+
+
+def run_build(ctx: Context, name: str, registry: dict[str, object]) -> None:
+    clear_dataset_h5(ctx, name)
+    print(f"[build] {name}", flush=True)
+    registry[name](ctx)
+    write_build_cache(ctx, name)
+
+
+def _parallel_build_worker(output: str, dataset_name: str) -> str:
+    registry = build_registry()
+    ctx = Context(Path(output))
+    run_build(ctx, dataset_name, registry)
+    return dataset_name
+
+
+def run_builds_parallel(output: Path, names: list[str], jobs: int) -> None:
+    if jobs <= 1 or len(names) <= 1:
+        registry = build_registry()
+        ctx = Context(output)
+        for name in names:
+            run_build(ctx, name, registry)
+        merge_build_caches(ctx, names)
+        return
+    print(f"[parallel] jobs={min(jobs, len(names))} datasets={names}", flush=True)
+    with ProcessPoolExecutor(max_workers=min(jobs, len(names))) as pool:
+        futures = {pool.submit(_parallel_build_worker, str(output), name): name for name in names}
+        for future in as_completed(futures):
+            name = futures[future]
+            future.result()
+            print(f"[built] {name}", flush=True)
+    merge_build_caches(Context(output), names)
+
+
+def refuse_manifested_h5_mutation(ctx: Context, operation: str) -> None:
+    manifest_path = ctx.output / "split_manifest.json"
+    if manifest_path.exists():
+        raise ImmutableManifestError(
+            f"{operation} 会修改已有 split 对应的 H5，但 {manifest_path} 已锁定该数据版本；"
+            "请使用新的 --output 目录"
+        )
 
 
 def main():
@@ -1098,31 +1958,96 @@ def main():
         help="将 downstream_modulation_extra 数据集的 source_label_id 镜像为 mod_label_id（可与 --sync-label-maps 联用）",
     )
     parser.add_argument(
+        "--stamp-semantic-labels",
+        action="store_true",
+        help="写入 canonical_mod_label_id/global_emitter_id 并刷新标签命名空间",
+    )
+    parser.add_argument(
+        "--verify-splits",
+        action="store_true",
+        help="验证不可变 split manifest、H5 哈希及 capture/group 跨 split 重叠",
+    )
+    parser.add_argument(
         "--refine-eval-splits",
         action="store_true",
         help="仅对 rml2018_1a/adsb2/wifi150/xidian14 的 val/test 应用更严格质量过滤并刷新 task pool",
     )
+    parser.add_argument(
+        "--build-only",
+        action="store_true",
+        help="仅构建原始 H5 与 .build_cache，不执行 rebalance / label_maps 收尾",
+    )
+    parser.add_argument(
+        "--finalize-only",
+        action="store_true",
+        help="合并 .build_cache 并执行 rebalance、global_label_id、task_pools",
+    )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="并行构建数据集的工作进程数（>1 时各数据集独立构建）",
+    )
     args = parser.parse_args()
     ctx = Context(args.output)
+    if args.verify_splits:
+        manifest_path = ctx.output / "split_manifest.json"
+        if manifest_path.exists():
+            payload = load_manifest(manifest_path)
+            assert_manifest_files_unchanged(payload, ctx.h5)
+        else:
+            payload = finalize_split_manifest(ctx)
+            (ctx.output / "label_maps.json").write_text(
+                json.dumps(ctx.maps, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            (ctx.output / "cleaning_report.json").write_text(
+                json.dumps(ctx.report, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        print(f"[verify-splits] {manifest_path} sha256={payload['manifest_sha256']}", flush=True)
+        return
+    if args.finalize_only:
+        refuse_manifested_h5_mutation(ctx, "--finalize-only")
+        merged = merge_build_caches(ctx)
+        if merged:
+            print(f"[merge-cache] {merged}", flush=True)
+        finalize(ctx)
+        print(f"[done] {ctx.output}", flush=True)
+        return
     if args.refine_eval_splits:
+        refuse_manifested_h5_mutation(ctx, "--refine-eval-splits")
         refine_eval_splits(ctx)
+        stamp_semantic_namespaces(ctx)
         stamp_global_label_ids(ctx)
         finalize_task_pools(ctx)
+        finalize_split_manifest(ctx)
         ctx.output.mkdir(parents=True, exist_ok=True)
         (ctx.output / "label_maps.json").write_text(json.dumps(ctx.maps, ensure_ascii=False, indent=2), encoding="utf-8")
         (ctx.output / "cleaning_report.json").write_text(json.dumps(ctx.report, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"[refine-eval-splits] {ctx.output}", flush=True)
         return
-    if args.sync_label_maps or args.stamp_global_labels or args.stamp_mod_labels:
+    if (
+        args.sync_label_maps
+        or args.stamp_global_labels
+        or args.stamp_mod_labels
+        or args.stamp_semantic_labels
+    ):
+        if args.stamp_global_labels or args.stamp_mod_labels or args.stamp_semantic_labels:
+            refuse_manifested_h5_mutation(ctx, "label stamping")
         if args.sync_label_maps:
             sync_label_maps_from_balanced(ctx)
         mod_stamped: dict[str, int] = {}
         if args.stamp_mod_labels:
             mod_stamped = stamp_mod_label_ids(ctx)
+        namespace_stats: dict[str, dict[str, int]] = {}
+        if args.stamp_semantic_labels or args.stamp_mod_labels:
+            namespace_stats = stamp_semantic_namespaces(ctx)
         stamped: dict[str, int] = {}
         if args.stamp_global_labels:
             stamped = stamp_global_label_ids(ctx)
         finalize_task_pools(ctx)
+        finalize_split_manifest(ctx)
         ctx.output.mkdir(parents=True, exist_ok=True)
         (ctx.output / "label_maps.json").write_text(json.dumps(ctx.maps, ensure_ascii=False, indent=2), encoding="utf-8")
         (ctx.output / "cleaning_report.json").write_text(json.dumps(ctx.report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1132,26 +2057,27 @@ def main():
         if stamped:
             labeled = sum(stamped.values())
             print(f"[stamp-global-labels] {len(stamped)} files, {labeled} labeled samples", flush=True)
+        if namespace_stats:
+            mod_count = sum(namespace_stats["canonical_mod_label_id"].values())
+            emitter_count = sum(namespace_stats["global_emitter_id"].values())
+            print(
+                f"[stamp-semantic-labels] canonical_mod={mod_count}, global_emitter={emitter_count}",
+                flush=True,
+            )
         print(f"[sync-label-maps] {ctx.output}", flush=True)
         return
     selected = set(args.datasets)
-    jobs = [
-        ("electromagnetic_0926", lambda: npy_dataset(ctx, "electromagnetic_0926", 0, NON_EMITTER / "0926电磁数据", 0, "source_label_id", {x: i for i, x in enumerate(["ADSB", "AIS", "AM", "FM", "GPS", "Iridium", "P25"])}, [("train", "train"), ("test", "val")], mirror_mod_label_id=True)),
-        ("xidian14", lambda: npy_dataset(ctx, "xidian14", 1, NON_EMITTER / "xidian_npy_cls14", 0, "mod_label_id", None, [("train", "train"), ("val", "val")])),
-        ("rml2016_04c", lambda: rml_pickle(ctx, "rml2016_04c", 2, NON_EMITTER / "2016.04C.multisnr.pkl")),
-        ("rml2016_10a", lambda: rml_pickle(ctx, "rml2016_10a", 3, NON_EMITTER / "RML2016.10a_dict.pkl")),
-        ("rml2016_10b", lambda: rml10b(ctx, 4)),
-        ("rml2018_1a", lambda: rml2018(ctx, 5)),
-        ("adsb2", lambda: npy_dataset(ctx, "adsb2", 6, EMITTER / "ADSB-2", 1, "emitter_id", None, [("train", "train"), ("val", "val")])),
-        ("wifi150", lambda: npy_dataset(ctx, "wifi150", 7, EMITTER / "wifi_cls150", 1, "emitter_id", None, [("train", "train"), ("val", "val"), ("test", "test")])),
-        ("communication_emitters", lambda: dat_emitters(ctx, "communication_emitters", 8, EMITTER / "通信辐射源个体识别数据集", 2048, False)),
-        ("radar_emitters", lambda: dat_emitters(ctx, "radar_emitters", 9, EMITTER / "雷达辐射源个体识别数据集", 1000, True)),
-        ("open_real_data", lambda: open_real_data(ctx, 10)),
-    ]
-    for name, job in jobs:
-        if "all" in selected or name in selected:
-            print(f"[build] {name}", flush=True)
-            job()
+    refuse_manifested_h5_mutation(ctx, "dataset build")
+    registry = build_registry()
+    build_names = resolve_selected_builds(selected, registry)
+    if not build_names:
+        raise SystemExit("未选择任何数据集")
+    jobs = max(1, int(args.jobs))
+    run_builds_parallel(args.output, build_names, jobs)
+    if args.build_only:
+        print(f"[build-only] {build_names}", flush=True)
+        return
+    merge_build_caches(ctx, build_names)
     finalize(ctx)
     print(f"[done] {ctx.output}", flush=True)
 
