@@ -192,6 +192,9 @@ def extract_task_selection_metrics(callback_metrics: dict[str, Any]) -> dict[str
         metric = match.group("metric")
         task = match.group("task")
         dataset = match.group("dataset")
+        # z_general 线性探针（val/acc_modulation_z）仅作诊断，不进 multitask geomean。
+        if str(task).endswith("_z"):
+            continue
         if metric == "macro_acc":
             add(task, "per_dataset_macro_acc", raw)
         elif metric == "macro_f1":
