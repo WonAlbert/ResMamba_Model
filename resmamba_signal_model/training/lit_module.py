@@ -705,6 +705,14 @@ class SignalLitModule(_Base):
         if kind == "classification" and logits is not None:
             labels = batch_u.get(label_field or "canonical_mod_label_id", batch_u.get("mod_label_id"))
             self._collect_cls(task or "modulation", logits.argmax(dim=-1), labels, batch_u.get("dataset_id"))
+            z_probe = packed.get("z_probe_logits")
+            if z_probe is not None:
+                self._collect_cls(
+                    f"{task or 'modulation'}_z",
+                    z_probe.argmax(dim=-1),
+                    labels,
+                    batch_u.get("dataset_id"),
+                )
         if kind == "emitter" or (kind != "classification" and packed.get("emitter_logits") is not None):
             pred_e = packed.get("task_logits")
             if pred_e is None:
@@ -712,6 +720,14 @@ class SignalLitModule(_Base):
             if pred_e is not None:
                 labels_e = batch_u.get(label_field or "global_emitter_id", batch_u.get("emitter_id"))
                 self._collect_cls(task or "emitter", pred_e.argmax(dim=-1), labels_e, batch_u.get("dataset_id"))
+                z_probe = packed.get("z_probe_logits")
+                if z_probe is not None:
+                    self._collect_cls(
+                        f"{task or 'emitter'}_z",
+                        z_probe.argmax(dim=-1),
+                        labels_e,
+                        batch_u.get("dataset_id"),
+                    )
         cluster_logits = packed.get("cluster_logits")
         cluster_labels = batch_u.get("global_label_id")
         if cluster_logits is not None and cluster_labels is not None:

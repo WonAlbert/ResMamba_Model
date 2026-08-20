@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
+import torch
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -44,6 +46,7 @@ def test_stage2_freezes_backbone_trains_uti_heads() -> None:
     assert any(n.startswith("task_interface.") for n in names)
     assert any(n.startswith("modulation_head.") for n in names)
     assert any(n.startswith("emitter_head.") for n in names)
+    assert any(n.startswith("z_linear_probes.") for n in names)
     assert not any(n.startswith("encoder.") for n in names)
     assert not any(n.startswith("decoder.") for n in names)
     assert not any(n.startswith("tokenizer.") for n in names)
@@ -51,6 +54,20 @@ def test_stage2_freezes_backbone_trains_uti_heads() -> None:
     assert not any(n.startswith("shared_adapter.") for n in names)
     assert any(n.startswith("prediction_head.") for n in names)
     assert any(n.startswith("imputation_head.") for n in names)
+
+
+def test_stage2_emits_z_probe_logits() -> None:
+    model = _tiny()
+    apply_stage_freeze(model, "stage2", train_cfg={"truncate_backward": True, "skip_recon": True})
+    model.eval()
+    out = model(
+        {"iq": torch.randn(2, 2, 32), "sample_mask": torch.ones(2, 32, dtype=torch.bool)},
+        mode="task",
+        task="modulation",
+    )
+    assert "z_probe_logits" in out
+    assert out["z_probe_logits"].shape[0] == 2
+    assert out["z_probe_logits"].shape[1] == model.cfg.num_mod_classes
 
 
 def test_stage3_only_current_task() -> None:

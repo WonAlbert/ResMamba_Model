@@ -1,4 +1,5 @@
-# 阶段二：冻结骨干 + 截断反传，只训 UTI 与五个任务头（LP 探测段）
+# 阶段二：冻结骨干 + 截断反传，训 UTI + 五头，并训 z_general 线性探针
+# 主验收看 UTI 头；通用表征另报 val/acc_modulation_z / val/acc_emitter_z
 # 生成任务走 Prediction/ImputationHead，不解冻 decoder / adapters
 model_config: configs/model.yaml
 rfdata_root: /root/autodl-tmp/ResMamba_Signal_Model/dataset

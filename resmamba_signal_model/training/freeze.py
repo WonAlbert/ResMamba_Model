@@ -69,6 +69,7 @@ def apply_stage_freeze(
         model.skip_recon = bool(train_cfg.get("skip_recon", True))  # type: ignore[attr-defined]
         _set_module_grad(getattr(model, "task_interface", None), True)
         _set_module_grad(getattr(model, "prototype_registry", None), True)
+        _set_module_grad(getattr(model, "z_linear_probes", None), True)
         for _name, head in _iter_task_heads(model):
             _set_module_grad(head, True)
         return

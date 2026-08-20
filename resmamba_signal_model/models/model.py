@@ -230,6 +230,7 @@ class SignalFoundationModel(nn.Module):
         self.imputation_head: ImputationHead | None = None
         self.recognition_heads: RecognitionHeads | None = None
         self.extra_task_heads = nn.ModuleDict()
+        self.z_linear_probes = nn.ModuleDict()
         self.prototype_registry: PrototypeRegistry | None = None
         self.peft = None
         self.truncate_backward = False
@@ -262,6 +263,10 @@ class SignalFoundationModel(nn.Module):
             if cfg.build_task_heads:
                 for name in task_names:
                     self._attach_task_head(name, self._make_task_head(name))
+                    kind = self.task_kind(name)
+                    if kind in ("classification", "emitter"):
+                        n_cls = int(cfg.num_emitters if kind == "emitter" else cfg.num_mod_classes)
+                        self.z_linear_probes[name] = nn.Linear(cfg.d_model, n_cls)
         if cfg.build_adapters:
             self.task_adapters = nn.ModuleDict(
                 {name: TaskAdapter(cfg.d_model, down_dim=cfg.adapter_down_dim) for name in task_names}
@@ -291,6 +296,8 @@ class SignalFoundationModel(nn.Module):
         for head in self.iter_task_heads():
             for param in head.parameters():
                 param.requires_grad = train_heads
+        for param in self.z_linear_probes.parameters():
+            param.requires_grad = train_heads
         if self.task_adapters is not None:
             for param in self.task_adapters.parameters():
                 param.requires_grad = train_heads
@@ -1305,6 +1312,11 @@ class SignalFoundationModel(nn.Module):
                         temperature=self._negcos_temperature,
                     )
                 )
+        kind = self.task_kind(task)
+        if task in self.z_linear_probes and kind in ("classification", "emitter"):
+            z_feat = out.get("z_general", out["z"])
+            z_feat = F.normalize(z_feat.float(), dim=-1).to(dtype=z_feat.dtype)
+            out["z_probe_logits"] = self.z_linear_probes[task](z_feat)
         return out
 
     def forward(

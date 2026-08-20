@@ -729,6 +729,10 @@ def downstream_task_loss(
         ce = safe_cross_entropy(logits, labels)
         parts["task_ce"] = ce
         loss = loss + ce
+        if "z_probe_logits" in outputs and outputs["z_probe_logits"] is not None:
+            probe_ce = safe_cross_entropy(outputs["z_probe_logits"], labels)
+            parts["z_probe_ce"] = probe_ce
+            loss = loss + probe_ce
         if modulation_contrastive_weight > 0:
             contrastive = modulation_hierarchical_metric_loss(
                 feat,
@@ -747,6 +751,10 @@ def downstream_task_loss(
         ce = safe_cross_entropy(logits, labels)
         parts["task_ce"] = ce
         loss = loss + ce
+        if "z_probe_logits" in outputs and outputs["z_probe_logits"] is not None:
+            probe_ce = safe_cross_entropy(outputs["z_probe_logits"], labels)
+            parts["z_probe_ce"] = probe_ce
+            loss = loss + probe_ce
         if emitter_contrastive_weight > 0:
             contrastive = supervised_contrastive_loss(feat, labels)
             parts["emitter_contrastive"] = contrastive
