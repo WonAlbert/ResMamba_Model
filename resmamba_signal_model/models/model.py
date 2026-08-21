@@ -1196,16 +1196,25 @@ class SignalFoundationModel(nn.Module):
         if self.task_interface is not None and patch_h is not None:
             if patch_h.dim() == 3 and patch_h.shape[1] == out["patch_mask"].shape[1] + 1:
                 patch_h = patch_h[:, 1:]
-            view_pairs: dict[str, tuple[torch.Tensor, torch.Tensor]] = {
-                "general": (
-                    out.get("z_general", out["z"]),
-                    out.get("h_general", patch_h),
-                )
-            }
-            for view_name in ("semantic", "source", "context"):
-                z_key, h_key = f"z_{view_name}", f"h_{view_name}"
-                if z_key in out and h_key in out:
-                    view_pairs[view_name] = (out[z_key], out[h_key])
+            z_general = out.get("z_general", out["z"])
+            h_general = out.get("h_general", patch_h)
+            # truncate_backward 会在 no_grad 骨干里预先算并 detach specialist views；
+            # 任务路径必须用 UTI.build_views 重算，否则 view_adapters 无梯度（stage2 解冻了也训不动）。
+            if bool(getattr(self, "truncate_backward", False)):
+                view_pairs = self.task_interface.build_views(z_general, h_general)
+                for view_name, (view_z, view_h) in view_pairs.items():
+                    if view_name == "general":
+                        continue
+                    out[f"z_{view_name}"] = view_z
+                    out[f"h_{view_name}"] = view_h
+            else:
+                view_pairs = {"general": (z_general, h_general)}
+                for view_name in ("semantic", "source", "context"):
+                    z_key, h_key = f"z_{view_name}", f"h_{view_name}"
+                    if z_key in out and h_key in out:
+                        view_pairs[view_name] = (out[z_key], out[h_key])
+                if getattr(self.task_interface, "use_specialist_views", False) and len(view_pairs) == 1:
+                    view_pairs = self.task_interface.build_views(z_general, h_general)
             n_tokens = out["patch_mask"].shape[1]
             pos = torch.linspace(0.0, 1.0, n_tokens, device=patch_h.device, dtype=patch_h.dtype)
             pos = pos.view(1, n_tokens, 1).expand(patch_h.shape[0], -1, -1)

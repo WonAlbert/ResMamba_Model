@@ -66,3 +66,27 @@ def test_truncate_backward_blocks_encoder_grads() -> None:
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.modulation_head.parameters())
     assert any(p.grad is not None for p in model.task_interface.parameters())
     assert not out["z"].requires_grad
+
+
+def test_truncate_backward_trains_view_adapters() -> None:
+    """stage2 截断反传时，UTI specialist view adapters 仍必须收到梯度。"""
+    model = SignalFoundationModel(_ci_cfg())
+    model.truncate_backward = True
+    model.skip_recon = True
+    model.train()
+    for param in model.parameters():
+        param.requires_grad = False
+    for param in model.task_interface.parameters():
+        param.requires_grad = True
+    for param in model.modulation_head.parameters():
+        param.requires_grad = True
+    out = model(make_batch(), mode="task", task="modulation")
+    out["modulation_logits"].sum().backward()
+    adapter_grads = [
+        param.grad
+        for param in model.task_interface.view_adapters.parameters()
+        if param.requires_grad
+    ]
+    assert adapter_grads
+    assert any(grad is not None and float(grad.abs().sum()) > 0.0 for grad in adapter_grads)
+    assert out["z_semantic"].requires_grad
