@@ -14,6 +14,7 @@ from resmamba_signal_model.training.losses import (
     sinkhorn_balanced_assignment,
     structure_preserving_loss,
     unsupervised_clustering_loss,
+    vicreg_loss,
     weighted_pretrain_loss,
 )
 
@@ -379,3 +380,23 @@ def test_weighted_pretrain_omits_zero_weight_parts() -> None:
     assert "mae" in parts and "vicreg" in parts and "readout" in parts
     assert "domain" not in parts
     assert "latent" not in parts
+
+
+def test_vicreg_not_hard_clamped_and_has_grad() -> None:
+    torch.manual_seed(0)
+    # 近常数表征：旧实现会被 clamp 到 10 且梯度为 0
+    base = torch.ones(32, 640)
+    noise = 0.01 * torch.randn(32, 640)
+    z = (base + noise).detach().requires_grad_(True)
+    loss = vicreg_loss(z)
+    assert torch.isfinite(loss)
+    assert float(loss.detach()) > 10.0
+    loss.backward()
+    assert z.grad is not None and float(z.grad.norm()) > 0.0
+    # 宽表征协方差经 /d^2 后尺度可控
+    z2 = torch.randn(16, 640, requires_grad=True)
+    loss2 = vicreg_loss(z2)
+    assert torch.isfinite(loss2)
+    assert float(loss2.detach()) < 100.0
+    loss2.backward()
+    assert z2.grad is not None and float(z2.grad.norm()) > 0.0

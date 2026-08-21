@@ -558,23 +558,32 @@ def vicreg_loss(
 ) -> torch.Tensor:
     """VICReg 抗塌缩：方差下界 + 协方差去相关；若有 teacher 则加不变性。
 
-    默认作用在 encoder 池化 ``z_enc``，避免 EMA 余弦把表征压成一条线。
+    默认作用在 encoder 池化 ``z_enc``。不经 ``MAX_SINGLE_LOSS`` 硬截断，
+    否则原值常 >10、clamp 后梯度为 0、TensorBoard 会卡在常数。
     """
     if z is None or not torch.is_tensor(z) or z.ndim != 2 or z.shape[0] < 2:
         ref = z if torch.is_tensor(z) else torch.zeros(())
         return ref.new_tensor(0.0)
-    zf = z.float()
+    zf = torch.nan_to_num(z.float(), nan=0.0, posinf=0.0, neginf=0.0)
     std = torch.sqrt(zf.var(dim=0, unbiased=False) + eps)
     var_loss = torch.mean(F.relu(float(gamma) - std))
     zc = zf - zf.mean(dim=0, keepdim=True)
-    cov = (zc.T @ zc) / float(max(zf.shape[0] - 1, 1))
+    n = float(max(zf.shape[0] - 1, 1))
+    d = float(max(zf.shape[1], 1))
+    cov = (zc.T @ zc) / n
+    # 论文形式：off-diag 平方和 / d；再除以 d 使宽表征尺度与 d 近似无关
     off = cov.pow(2).sum() - cov.diagonal().pow(2).sum()
-    cov_loss = off / float(max(zf.shape[1], 1))
+    cov_loss = off / (d * d)
     total = float(var_weight) * var_loss + float(cov_weight) * cov_loss
-    if teacher_z is not None and torch.is_tensor(teacher_z) and teacher_z.shape == zf.shape:
+    if (
+        teacher_z is not None
+        and torch.is_tensor(teacher_z)
+        and teacher_z.shape == zf.shape
+        and float(inv_weight) > 0.0
+    ):
         inv = 1.0 - F.cosine_similarity(zf, teacher_z.detach().float(), dim=-1).mean()
         total = total + float(inv_weight) * inv
-    return _clamp_loss(total)
+    return torch.nan_to_num(total, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def uti_readout_consistency_loss(
