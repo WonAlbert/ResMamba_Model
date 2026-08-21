@@ -502,7 +502,9 @@ class SignalFoundationModel(nn.Module):
             h_enc = h_enc[:, 1:]
         z_enc = out.get("z_enc", out.get("z_general", out["z"]))
         patch_mask = out["patch_mask"]
-        view_pairs = self.task_interface.build_views(z_enc, h_enc, patch_mask=patch_mask)
+        visible = out.get("visible")
+        enc_mask = (visible & patch_mask) if visible is not None else patch_mask
+        view_pairs = self.task_interface.build_views(z_enc, h_enc, patch_mask=enc_mask)
         n_tokens = patch_mask.shape[1]
         pos = torch.linspace(0.0, 1.0, n_tokens, device=h_enc.device, dtype=h_enc.dtype)
         pos = pos.view(1, n_tokens, 1).expand(h_enc.shape[0], -1, -1)
@@ -515,7 +517,7 @@ class SignalFoundationModel(nn.Module):
         features = self.task_interface(
             z_enc,
             h_enc,
-            patch_mask,
+            enc_mask,
             spec,
             recon_norm=out.get("recon_norm"),
             views=view_pairs,
@@ -761,24 +763,20 @@ class SignalFoundationModel(nn.Module):
         packed_enc: bool | None = None,
         visible: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """全序列 encoder 读出 ``(z_enc, h_enc)``，供分类 / VICReg / UTI。
+        """Encoder 读出 ``(z_enc, h_enc)``，供分类 / VICReg / UTI。
 
-        MAE 可见子集编码可复用：当 ``visible`` 覆盖全部有效 patch 时不再二次 encode。
+        有 MAE 可见编码 ``h_vis`` 时直接 scatter 后只在 ``visible`` 上池化，
+        避免二次全序列 encode；无 ``h_vis`` 时才全序列 encode。
         """
-        reuse = (
-            h_vis is not None
-            and packed_enc is not None
-            and visible is not None
-            and bool((visible == patch_mask).all().item())
-        )
-        if reuse:
-            assert h_vis is not None and packed_enc is not None and visible is not None
+        if h_vis is not None and packed_enc is not None and visible is not None:
             h_enc = self.decoder.scatter_encoder(h_vis, visible, patch_mask, packed=packed_enc)
+            pool_mask = visible & patch_mask
         else:
             h_all, packed_all = self._encode_tokens(tokens, patch_mask, patch_mask)
             h_enc = self.decoder.scatter_encoder(h_all, patch_mask, patch_mask, packed=packed_all)
-        h_enc = h_enc.masked_fill(~patch_mask.unsqueeze(-1), 0.0)
-        z_enc = self.encoder_pool(h_enc, key_padding_mask=~patch_mask)
+            pool_mask = patch_mask
+        h_enc = h_enc.masked_fill(~pool_mask.unsqueeze(-1), 0.0)
+        z_enc = self.encoder_pool(h_enc, key_padding_mask=~pool_mask)
         z_enc = self.encoder_repr_norm(z_enc.float()).to(dtype=h_enc.dtype)
         return z_enc, h_enc
 
@@ -788,7 +786,9 @@ class SignalFoundationModel(nn.Module):
         patch_mask = out.get("patch_mask")
         if h_enc is None or patch_mask is None:
             return out
-        z_enc = self.encoder_pool(h_enc, key_padding_mask=~patch_mask)
+        visible = out.get("visible")
+        pool_mask = (visible & patch_mask) if visible is not None else patch_mask
+        z_enc = self.encoder_pool(h_enc, key_padding_mask=~pool_mask)
         z_enc = self.encoder_repr_norm(z_enc.float()).to(dtype=h_enc.dtype)
         out["z_enc"] = z_enc
         out["z_general"] = z_enc
@@ -930,9 +930,11 @@ class SignalFoundationModel(nn.Module):
             "z_recon": z_recon,
             "h_recon": patch_h,
         }
+        # MAE 时 h_enc 仅 visible 有有效状态；UTI 视图池化与之对齐。
+        enc_pool_mask = (visible & patch_mask)[:, :n]
         if self.task_interface is not None:
             for view_name, (view_z, view_h) in self.task_interface.build_views(
-                z_enc, h_enc, patch_mask=patch_mask[:, :n]
+                z_enc, h_enc, patch_mask=enc_pool_mask
             ).items():
                 if view_name == "general":
                     continue
@@ -1270,8 +1272,13 @@ class SignalFoundationModel(nn.Module):
             if patch_h is not None and patch_h.dim() == 3 and patch_h.shape[1] == out["patch_mask"].shape[1] + 1:
                 patch_h = patch_h[:, 1:]
             # truncate_backward：在 detach 的 h_enc 上重算视图，view_adapters / encoder_pool 可训。
+            view_mask = out.get("visible", out["patch_mask"])
+            if view_mask is not None:
+                view_mask = view_mask & out["patch_mask"]
+            else:
+                view_mask = out["patch_mask"]
             view_pairs = self.task_interface.build_views(
-                z_enc, h_enc, patch_mask=out["patch_mask"]
+                z_enc, h_enc, patch_mask=view_mask
             )
             for view_name, (view_z, view_h) in view_pairs.items():
                 if view_name == "general":
@@ -1294,7 +1301,7 @@ class SignalFoundationModel(nn.Module):
             features = self.task_interface(
                 z_enc,
                 h_enc,
-                out["patch_mask"],
+                view_mask,
                 task,
                 recon_norm=out.get("recon_norm"),
                 views=view_pairs,

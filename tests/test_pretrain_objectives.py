@@ -78,6 +78,32 @@ def test_latent_prediction_stops_teacher_grad() -> None:
     assert teacher.grad is None
 
 
+def test_pretrain_mae_reuses_visible_encode_for_z_enc() -> None:
+    """MAE 有 mask 时 z_enc 复用可见 encode，不二次全序列前向。"""
+    torch.manual_seed(0)
+    model = _tiny()
+    model.train()
+    calls: list[tuple[bool, bool]] = []
+    orig = model._encode_tokens
+
+    def _count(tokens, visible, patch_mask):
+        calls.append(
+            (
+                bool((visible == patch_mask).all().item()),
+                int(visible.sum().item()),
+            )
+        )
+        return orig(tokens, visible, patch_mask)
+
+    model._encode_tokens = _count  # type: ignore[method-assign]
+    out = model(_batch(n=2, length=64), mode="pretrain")
+    assert out["target_mask"].any(), "expected MAE targets so visible != full"
+    assert len(calls) == 1
+    full_seq, _ = calls[0]
+    assert full_seq is False
+    assert out["z_enc"].shape[0] == 2
+
+
 def test_grl_does_not_flow_into_z_general() -> None:
     torch.manual_seed(0)
     model = _tiny()

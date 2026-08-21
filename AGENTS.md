@@ -4,7 +4,7 @@
 
 ## 项目一句话
 
-任务无关的射频 I/Q 基础模型：RevIN → 时频 Tokenizer → Encoder（5×BiMamba2 + 1×RoPE MemoryTransformer；MAE 可见 token + 全序列 `z_enc`）→ SharedDecoder（1×Mamba-2 + skip / 物理 FiLM；`z_recon`）→ UTI 多视图。主类：`SignalFoundationModel` / `SignalModelConfig`（包名 `resmamba_signal_model`）。
+任务无关的射频 I/Q 基础模型：RevIN → 时频 Tokenizer → Encoder（5×BiMamba2 + 1×RoPE MemoryTransformer；MAE 可见 token 池化 `z_enc`，不二次全序列 encode）→ SharedDecoder（1×Mamba-2 + skip / 物理 FiLM；`z_recon`）→ UTI 多视图。主类：`SignalFoundationModel` / `SignalModelConfig`（包名 `resmamba_signal_model`）。
 
 ## Agent 工作约定
 
@@ -84,7 +84,7 @@ python scripts/infer.py --task modulation --checkpoint runs/experiments/<run>/ck
 
 ## 架构要点（改模型时勿破坏）
 
-- **Encoder**：`M-M-M-M-M-T`；预训练 `encode_visible_only`（MAE）；全序列 AttnPool → **`z_enc` / `h_enc`**（分类身份；`z_general`/`z` 别名指向此处）；超长序列 chunk 均值记忆 + RoPE。
+- **Encoder**：`M-M-M-M-M-T`；预训练 `encode_visible_only`（MAE）；可见 token AttnPool → **`z_enc` / `h_enc`**（分类身份；`z_general`/`z` 别名指向此处；复用 MAE encode，不二次全序列）；无 mask / 下游 encode 时对全有效 patch 池化；超长序列 chunk 均值记忆 + RoPE。
 - **Decoder**：恰好 1 层 `DecoderBlock`；token 通路重建；`[DEC]` + AttnPool → **`z_recon`**（重建/物理 readout，不作分类身份）。
 - **UTI**：semantic = 低秩残差(`z_enc`)；source = 去均值 token 池化；context = 慢衰减池化（非三份 `adapter(decoder_z)`）。
 - **Tokenizer**：共享 stem + 多尺度时域 + 复数双侧频谱分带（`fft` + `fftshift` 后再均分）；无 dataset/task token。
