@@ -2,6 +2,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from resmamba_signal_model.training.logging_utils import should_log_loss_part
 from resmamba_signal_model.training.losses import (
     PREDICTION_MAE_LOSS_SCALE,
     _clamp_loss,
@@ -13,6 +14,7 @@ from resmamba_signal_model.training.losses import (
     sinkhorn_balanced_assignment,
     structure_preserving_loss,
     unsupervised_clustering_loss,
+    weighted_pretrain_loss,
 )
 
 
@@ -334,3 +336,46 @@ def test_unsupervised_clustering_balance_mix_softens_sinkhorn() -> None:
     # 纯 softmax 目标不应强制接近均匀占用
     usage_soft = F.softmax(logits, dim=-1).mean(dim=0)
     assert float(usage_soft.max() / usage_soft.clamp_min(1e-8).min()) > 1.5
+
+
+def test_should_log_loss_part_skips_nonpositive_weights() -> None:
+    weights = {"mae": 1.0, "domain": 0.0, "latent": -0.1, "vicreg": 0.25}
+    assert should_log_loss_part("mae", weights)
+    assert should_log_loss_part("loss/mae", weights)
+    assert should_log_loss_part("modulation/total", weights)
+    assert not should_log_loss_part("domain", weights)
+    assert not should_log_loss_part("val/domain", weights)
+    assert not should_log_loss_part("latent", weights)
+    assert should_log_loss_part("vicreg", weights)
+    # 未配置权重的诊断子项仍记录
+    assert should_log_loss_part("structure_time", weights)
+    assert not should_log_loss_part("modulation/_tokens", weights)
+
+
+def test_weighted_pretrain_omits_zero_weight_parts() -> None:
+    pred = torch.zeros(2, 4, 2, 8)
+    target = torch.randn_like(pred)
+    mask = torch.ones(2, 4, dtype=torch.bool)
+    outputs = {
+        "mae_pred": pred,
+        "recon_norm": pred,
+        "patch_targets": target,
+        "patch_targets_norm": target,
+        "mae_mask": mask,
+        "target_mask": mask,
+        "recon_mask": mask,
+        "global_phys_pred": torch.zeros(2, 4),
+        "global_phys_target": torch.zeros(2, 4),
+        "domain_logits": torch.randn(2, 3),
+        "z_enc": torch.randn(2, 8),
+        "dataset_id": torch.tensor([0, 1]),
+    }
+    batch = {"dataset_id": outputs["dataset_id"]}
+    _, parts = weighted_pretrain_loss(
+        outputs,
+        batch,
+        {"mae": 1.0, "domain": 0.0, "latent": 0.0, "vicreg": 0.25, "readout": 0.1},
+    )
+    assert "mae" in parts and "vicreg" in parts and "readout" in parts
+    assert "domain" not in parts
+    assert "latent" not in parts

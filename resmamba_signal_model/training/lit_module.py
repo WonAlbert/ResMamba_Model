@@ -20,7 +20,7 @@ from resmamba_signal_model.training.checkpointing import (
 )
 from resmamba_signal_model.training.clustering_labels import load_dataset_id_names
 from resmamba_signal_model.training.freeze import iter_head_param_prefixes
-from resmamba_signal_model.training.logging_utils import format_val_epoch_metrics
+from resmamba_signal_model.training.logging_utils import format_val_epoch_metrics, should_log_loss_part
 from resmamba_signal_model.training.losses import (
     _first_present,
     downstream_task_loss,
@@ -608,6 +608,8 @@ class SignalLitModule(_Base):
         batch_size = max(1, int(packed["n_tokens"].shape[0]))
         self.log("loss/total", total, prog_bar=True, on_step=True, batch_size=batch_size)
         for name, value in parts.items():
+            if not should_log_loss_part(name, self.loss_weights):
+                continue
             log_name = name if name.startswith("loss/") else f"loss/{name}"
             self.log(log_name, value, on_step=True, prog_bar=(name == "mae"), batch_size=batch_size)
         self.log("grl/lambda", float(getattr(self.model.grl, "lambd", 1.0)), on_step=True, batch_size=batch_size)
@@ -907,6 +909,8 @@ class SignalLitModule(_Base):
             if task:
                 self.log(f"val/{task}/loss", total, on_epoch=True, batch_size=batch_size)
         for name, value in parts.items():
+            if not should_log_loss_part(name, self.loss_weights):
+                continue
             if self._is_finite_metric(value):
                 self.log(f"val/{name}", value, on_epoch=True, add_dataloader_idx=True, batch_size=batch_size)
         if self.stage == "pretrain":

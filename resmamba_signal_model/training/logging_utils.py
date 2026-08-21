@@ -165,6 +165,21 @@ def format_val_epoch_metrics(
     return "\n".join(lines)
 
 
+def should_log_loss_part(name: str, loss_weights: dict[str, Any] | None) -> bool:
+    """TensorBoard / 指标日志：跳过配置权重 ≤0 的 loss 分项。
+
+    未出现在 ``loss_weights`` 中的诊断项（如 ``structure_time``）仍记录。
+    """
+    key = str(name).rsplit("/", 1)[-1]
+    if not key or key.startswith("_"):
+        return False
+    if key == "total":
+        return True
+    if not loss_weights or key not in loss_weights:
+        return True
+    return float(loss_weights.get(key, 0.0) or 0.0) > 0.0
+
+
 def link_autodl_tensorboard(log_dir: Path) -> None:
     """AutoDL 默认监控 /root/tf-logs；将当前 run 链到该目录便于面板读取。"""
     autodl_root = Path("/root/tf-logs")

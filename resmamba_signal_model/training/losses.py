@@ -730,16 +730,21 @@ def weighted_pretrain_loss(
     batch: dict[str, torch.Tensor],
     weights: dict[str, float],
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    active = {k: float(v) for k, v in weights.items()}
-    if not any(v > 0.0 for v in active.values()):
+    active = {k: float(v) for k, v in weights.items() if float(v) > 0.0}
+    if not active:
         active = {"mae": 1.0}
     losses = foundation_pretrain_losses(outputs, batch, include=set(active))
     total = outputs["mae_pred"].new_tensor(0.0)
+    logged: dict[str, torch.Tensor] = {}
     for name, value in losses.items():
         weight = float(active.get(name, 0.0))
         if weight > 0.0:
             total = total + weight * value
-    return total, losses
+            logged[name] = value
+        elif name not in weights:
+            # structure_time 等诊断子项：父项在 active 时一并返回供监控
+            logged[name] = value
+    return total, logged
 
 
 def downstream_task_loss(
