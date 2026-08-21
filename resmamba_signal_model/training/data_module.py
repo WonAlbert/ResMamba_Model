@@ -597,10 +597,38 @@ class SignalDataModule(LightningDataModule):
         self._train_lengths: dict[str, list[int]] = {}
         self._val_batch_plan: dict[str, list[list[int]]] = {}
         self._cached_val_loader = None
+        self._active_train_sources: list[str] | None = None
 
     @property
     def val_source_names(self) -> list[str]:
-        return list(self._val_sets) if self._val_sets else list(self.source_names)
+        return list(self._filtered_val_sets()) or list(self.source_names)
+
+    def set_active_train_filter(self, sources: list[str] | None) -> None:
+        """限制本轮 train/val dataloader 只用这些源；``None`` 表示全部。
+
+        单任务 / ``task_schedule`` 阶段：训练与验证都只跑当前任务，避免无关任务稀释指标。
+        """
+        prev = tuple(self._active_train_sources or ())
+        if sources is None:
+            self._active_train_sources = None
+        else:
+            pool = set(self._train_sets) | set(self._val_sets)
+            allowed = [str(name) for name in sources if str(name) in pool]
+            if not allowed and pool:
+                raise ValueError(f"active_train_sources={sources!r} 与已加载源 {sorted(pool)} 无交集")
+            self._active_train_sources = allowed
+        if tuple(self._active_train_sources or ()) != prev:
+            self._cached_val_loader = None
+
+    def _filtered_train_sets(self) -> dict[str, Dataset]:
+        if not self._active_train_sources:
+            return dict(self._train_sets)
+        return {name: self._train_sets[name] for name in self._active_train_sources if name in self._train_sets}
+
+    def _filtered_val_sets(self) -> dict[str, Dataset]:
+        if not self._active_train_sources:
+            return dict(self._val_sets)
+        return {name: self._val_sets[name] for name in self._active_train_sources if name in self._val_sets}
 
     def train_sampler_seed(self, source_index: int = 0) -> int:
         base = int(self.train_cfg.get("seed", 0))
@@ -709,13 +737,18 @@ class SignalDataModule(LightningDataModule):
                 "prediction": ("downstream_prediction_train", "downstream_prediction_val"),
                 "imputation": ("downstream_prediction_train", "downstream_prediction_val"),
             }
+            catalog = resolve_task_catalog(self.train_cfg)
             if self.stage == "stage3":
                 task = str(self.train_cfg.get("task") or "")
-                catalog = resolve_task_catalog(self.train_cfg)
                 spec = catalog.get(task)
                 keep = spec.source if spec is not None else TASK_TO_SOURCE.get(task, task)
                 if keep and keep in task_pools:
                     task_pools = {keep: task_pools[keep]}
+            elif self.stage in ("stage2", "downstream", "joint") and not self.train_cfg.get("task_schedule"):
+                # 无 task_schedule 时，``tasks:`` / ``--tasks`` 只加载对应源，避免名存实亡的混训。
+                keep_sources = {spec.source for spec in catalog.specs}
+                if keep_sources:
+                    task_pools = {name: pair for name, pair in task_pools.items() if name in keep_sources}
             for name, pair in task_pools.items():
                 train_name, val_name = pair[0], pair[1]
                 try:
@@ -809,7 +842,18 @@ class SignalDataModule(LightningDataModule):
     def train_dataloader(self):
         if CombinedLoader is None:
             raise ImportError("需要 lightning>=2.4 以使用 CombinedLoader")
-        loaders = self._loaders(self._train_sets, train=True)
+        train_sets = self._filtered_train_sets()
+        if not train_sets:
+            raise RuntimeError("没有可训练数据源（检查 task_schedule / active_train_sources）")
+        # 单任务阶段重建 mix，避免仍按五源份额拆 token_budget。
+        if self._active_train_sources is not None:
+            self.mix = DynamicRatioScheduler(
+                list(train_sets),
+                min_ratio=float(self.train_cfg.get("min_ratio", 0.05)),
+                value_clip=float(self.train_cfg.get("mix_value_clip", 2.0)),
+            )
+            self.source_names = list(train_sets)
+        loaders = self._loaders(train_sets, train=True)
         if SizedCombinedLoader is None:
             raise ImportError("需要 lightning>=2.4 以使用 CombinedLoader")
         return SizedCombinedLoader(loaders, mode="max_size_cycle", length=self.steps_per_epoch)
@@ -817,10 +861,16 @@ class SignalDataModule(LightningDataModule):
     def val_dataloader(self):
         if CombinedLoader is None or SizedCombinedLoader is None:
             raise ImportError("需要 lightning>=2.4 以使用 CombinedLoader")
-        if self._cached_val_loader is None:
-            loaders = self._loaders(self._val_sets, train=False)
+        val_sets = self._filtered_val_sets()
+        if not val_sets:
+            raise RuntimeError("没有可验证数据源（检查 task_schedule / active_train_sources）")
+        # 单任务阶段必须重建，否则会缓存「全任务」val loader。
+        cache_key = tuple(val_sets.keys())
+        if self._cached_val_loader is None or getattr(self, "_cached_val_key", None) != cache_key:
+            loaders = self._loaders(val_sets, train=False)
             val_steps = max(1, self.val_batches) * max(1, len(loaders))
             self._cached_val_loader = SizedCombinedLoader(loaders, mode="sequential", length=val_steps)
+            self._cached_val_key = cache_key
         return self._cached_val_loader
 
 

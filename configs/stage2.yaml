@@ -1,6 +1,7 @@
-# 阶段二：冻结骨干 + 截断反传，训 UTI + 五头，并训 z_general 线性探针
-# 主验收看 UTI 头；通用表征另报 val/acc_modulation_z / val/acc_emitter_z
+# 阶段二：冻结骨干 + 截断反传，训 UTI + 五头，并训 z_enc（encoder 池化）线性探针
+# 主验收看 UTI 头；通用表征另报 val/acc_modulation_z / val/acc_emitter_z（encoder）
 # 生成任务走 Prediction/ImputationHead，不解冻 decoder / adapters
+# 默认按任务顺序训（每阶段独占 token_budget）；该阶段 train/val 都只跑当前任务
 model_config: configs/model.yaml
 rfdata_root: /root/autodl-tmp/ResMamba_Signal_Model/dataset
 iq_normalize: none
@@ -22,7 +23,8 @@ amp_dtype: bfloat16
 epochs: 20
 checkpoint_monitor: val/multitask_geomean
 checkpoint_mode: max
-early_stopping_patience: 3
+# 顺序训时关闭 early stop，避免前序任务阶段误杀后续 emitter/聚类
+early_stopping_patience: 0
 num_workers: 20
 prefetch_factor: 4
 cache_iq_in_memory: auto
@@ -37,8 +39,9 @@ distill_weight: 0.0
 prototype_anchor_weight: 0.0
 absorb_unknown: false
 lambda_recon: 0.0
-modulation_contrastive_weight: 0.25
-emitter_contrastive_weight: 0.25
+modulation_contrastive_weight: 0.05
+emitter_contrastive_weight: 0.05
+z_probe_weight: 0.2
 supervised_clustering: false
 # 抑制无监督过分割：少用强制均摊，降低 utilization
 cluster_utilization_weight: 0.02
@@ -60,6 +63,18 @@ tasks:
   - clustering
   - prediction
   - imputation
+# 按任务顺序：调制 → 个体（加长）→ 聚类 → 预测 → 插补；总 epochs 由各段相加覆盖上方 epochs
+task_schedule:
+  - task: modulation
+    epochs: 20
+  - task: emitter
+    epochs: 30
+  - task: clustering
+    epochs: 10
+  - task: prediction
+    epochs: 10
+  - task: imputation
+    epochs: 10
 # 增加任务示例：
 # - name: sonar
 #   kind: classification
@@ -87,3 +102,8 @@ profiles:
     warmup_steps: 1
     learning_rate: 1.0e-3
     require_mamba_kernel: false
+    task_schedule:
+      - task: modulation
+        epochs: 1
+      - task: emitter
+        epochs: 1

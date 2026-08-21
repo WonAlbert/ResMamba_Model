@@ -33,6 +33,7 @@ __all__ = [
     "downstream_task_loss",
     "foundation_pretrain_losses",
     "latent_prediction_loss",
+    "vicreg_loss",
     "mae_reconstruction_loss",
     "modulation_hierarchical_metric_loss",
     "negcos_temperature",
@@ -545,6 +546,37 @@ def latent_prediction_loss(
     return _clamp_loss(pooled + token)
 
 
+def vicreg_loss(
+    z: torch.Tensor,
+    teacher_z: torch.Tensor | None = None,
+    *,
+    var_weight: float = 25.0,
+    cov_weight: float = 1.0,
+    inv_weight: float = 1.0,
+    gamma: float = 1.0,
+    eps: float = 1.0e-4,
+) -> torch.Tensor:
+    """VICReg 抗塌缩：方差下界 + 协方差去相关；若有 teacher 则加不变性。
+
+    默认作用在 encoder 池化 ``z_enc``，避免 EMA 余弦把表征压成一条线。
+    """
+    if z is None or not torch.is_tensor(z) or z.ndim != 2 or z.shape[0] < 2:
+        ref = z if torch.is_tensor(z) else torch.zeros(())
+        return ref.new_tensor(0.0)
+    zf = z.float()
+    std = torch.sqrt(zf.var(dim=0, unbiased=False) + eps)
+    var_loss = torch.mean(F.relu(float(gamma) - std))
+    zc = zf - zf.mean(dim=0, keepdim=True)
+    cov = (zc.T @ zc) / float(max(zf.shape[0] - 1, 1))
+    off = cov.pow(2).sum() - cov.diagonal().pow(2).sum()
+    cov_loss = off / float(max(zf.shape[1], 1))
+    total = float(var_weight) * var_loss + float(cov_weight) * cov_loss
+    if teacher_z is not None and torch.is_tensor(teacher_z) and teacher_z.shape == zf.shape:
+        inv = 1.0 - F.cosine_similarity(zf, teacher_z.detach().float(), dim=-1).mean()
+        total = total + float(inv_weight) * inv
+    return _clamp_loss(total)
+
+
 def uti_readout_consistency_loss(
     student: torch.Tensor,
     teacher: torch.Tensor | None = None,
@@ -616,16 +648,29 @@ def foundation_pretrain_losses(
         losses.update(struct_parts)
     if _need("latent"):
         teacher_z = outputs.get("teacher_z")
-        student_z = outputs.get("z_general", outputs.get("z"))
+        # 旧 EMA 余弦默认打在 decoder z 上易塌缩；仅当显式提供 teacher 时保留。
+        student_z = outputs.get("z_recon", outputs.get("z_general", outputs.get("z")))
         if teacher_z is None or student_z is None:
             losses["latent"] = pred.new_tensor(0.0)
         else:
             losses["latent"] = latent_prediction_loss(
                 student_z,
                 teacher_z,
-                outputs.get("h_general", outputs.get("patch_h")),
+                outputs.get("h_recon", outputs.get("h_general", outputs.get("patch_h"))),
                 outputs.get("teacher_h", outputs.get("teacher_tokens")),
                 outputs.get("target_mask"),
+            )
+    if _need("vicreg"):
+        student = outputs.get("z_enc", outputs.get("z_general", outputs.get("z")))
+        if student is None:
+            losses["vicreg"] = pred.new_tensor(0.0)
+        else:
+            losses["vicreg"] = vicreg_loss(
+                student,
+                outputs.get("teacher_z_enc", outputs.get("teacher_z")),
+                var_weight=float(outputs.get("vicreg_var_weight", 25.0) or 25.0),
+                cov_weight=float(outputs.get("vicreg_cov_weight", 1.0) or 1.0),
+                inv_weight=float(outputs.get("vicreg_inv_weight", 0.0) or 0.0),
             )
     if _need("uti_pooled"):
         student_p = outputs.get("uti_pooled")
@@ -716,6 +761,7 @@ def downstream_task_loss(
     distill_temperature: float = 2.0,
     distill_confidence: float = 0.5,
     prototype_anchor_weight: float = 0.0,
+    z_probe_weight: float = 1.0,
     cluster_utilization_weight: float = 0.02,
     cluster_consistency_weight: float = 1.0,
     cluster_balance_mix: float = 0.35,
@@ -756,7 +802,7 @@ def downstream_task_loss(
         if "z_probe_logits" in outputs and outputs["z_probe_logits"] is not None:
             probe_ce = safe_cross_entropy(outputs["z_probe_logits"], labels)
             parts["z_probe_ce"] = probe_ce
-            loss = loss + probe_ce
+            loss = loss + float(z_probe_weight) * probe_ce
         if modulation_contrastive_weight > 0:
             contrastive = modulation_hierarchical_metric_loss(
                 feat,
@@ -778,7 +824,7 @@ def downstream_task_loss(
         if "z_probe_logits" in outputs and outputs["z_probe_logits"] is not None:
             probe_ce = safe_cross_entropy(outputs["z_probe_logits"], labels)
             parts["z_probe_ce"] = probe_ce
-            loss = loss + probe_ce
+            loss = loss + float(z_probe_weight) * probe_ce
         if emitter_contrastive_weight > 0:
             contrastive = supervised_contrastive_loss(feat, labels)
             parts["emitter_contrastive"] = contrastive

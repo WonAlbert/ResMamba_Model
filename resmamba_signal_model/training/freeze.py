@@ -70,6 +70,9 @@ def apply_stage_freeze(
         _set_module_grad(getattr(model, "task_interface", None), True)
         _set_module_grad(getattr(model, "prototype_registry", None), True)
         _set_module_grad(getattr(model, "z_linear_probes", None), True)
+        # encoder 读出在 truncate 后重算，需可训
+        _set_module_grad(getattr(model, "encoder_pool", None), True)
+        _set_module_grad(getattr(model, "encoder_repr_norm", None), True)
         for _name, head in _iter_task_heads(model):
             _set_module_grad(head, True)
         return

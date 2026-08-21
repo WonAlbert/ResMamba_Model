@@ -149,10 +149,13 @@ def test_uti_v2_exposes_general_views_and_three_readouts() -> None:
     z = torch.randn(3, 24)
     tokens = torch.randn(3, 7, 24)
     mask = torch.ones(3, 7, dtype=torch.bool)
-    views = uti.build_views(z, tokens)
+    views = uti.build_views(z, tokens, patch_mask=mask)
 
     assert set(views) == {"general", "semantic", "source", "context"}
     assert torch.equal(views["general"][0], z)
+    # source/context 来自 token 聚合，与 semantic=adapter(z) 不同
+    assert not torch.allclose(views["semantic"][0], views["source"][0], atol=1.0e-5)
+    assert not torch.allclose(views["source"][0], views["context"][0], atol=1.0e-5)
     for task, readout in (("pooled", "pooled"), ("token", "token"), ("query", "query")):
         features = uti(z, tokens, mask, task, views=views)
         assert features.readout == readout

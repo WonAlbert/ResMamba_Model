@@ -4,7 +4,7 @@
 
 ## 项目一句话
 
-任务无关的射频 I/Q 基础模型：RevIN → 时频 Tokenizer → Encoder（5×BiMamba2 + 1×RoPE MemoryTransformer，预训练只看可见 token）→ SharedDecoder（1×Mamba-2 + skip / 物理 FiLM / 双通路）。主类：`SignalFoundationModel` / `SignalModelConfig`（包名 `resmamba_signal_model`）。
+任务无关的射频 I/Q 基础模型：RevIN → 时频 Tokenizer → Encoder（5×BiMamba2 + 1×RoPE MemoryTransformer；MAE 可见 token + 全序列 `z_enc`）→ SharedDecoder（1×Mamba-2 + skip / 物理 FiLM；`z_recon`）→ UTI 多视图。主类：`SignalFoundationModel` / `SignalModelConfig`（包名 `resmamba_signal_model`）。
 
 ## Agent 工作约定
 
@@ -84,14 +84,15 @@ python scripts/infer.py --task modulation --checkpoint runs/experiments/<run>/ck
 
 ## 架构要点（改模型时勿破坏）
 
-- **Encoder**：`M-M-M-M-M-T`；预训练 `encode_visible_only`；超长序列 chunk 均值记忆 + RoPE。
-- **Decoder**：恰好 1 层 `DecoderBlock`；token 通路重建，readout 通路 `[DEC]` + AttnPool → `z`。
+- **Encoder**：`M-M-M-M-M-T`；预训练 `encode_visible_only`（MAE）；全序列 AttnPool → **`z_enc` / `h_enc`**（分类身份；`z_general`/`z` 别名指向此处）；超长序列 chunk 均值记忆 + RoPE。
+- **Decoder**：恰好 1 层 `DecoderBlock`；token 通路重建；`[DEC]` + AttnPool → **`z_recon`**（重建/物理 readout，不作分类身份）。
+- **UTI**：semantic = 低秩残差(`z_enc`)；source = 去均值 token 池化；context = 慢衰减池化（非三份 `adapter(decoder_z)`）。
 - **Tokenizer**：共享 stem + 多尺度时域 + 复数双侧频谱分带（`fft` + `fftshift` 后再均分）；无 dataset/task token。
 - **物理约束**：patch 级 log_power / PAPR / IQ 相关 / 方差比 / 谱质心（`fftfreq`）；软约束 SmoothL1 + 硬约束能量投影。分类在归一化表征空间，重建在 RevIN denorm 后。
 - **变长**：`sequence_packing=true`；`TokenBudgetSampler`；`L < 16` 报错；`L > 8192` 重叠切块。
-- **多域**：Domain GRL **只**约束 UTI 声明不变的低秩视图（默认 `semantic`），梯度不进入 `z_general`；预训练默认关闭 domain 损失。跨域对比学习仅在下游标签可对齐时启用（如调制 contrastive），预训练无 InfoNCE。
+- **多域**：Domain GRL **只**约束 UTI 声明不变的低秩视图（默认 `semantic`），梯度不进入 `z_enc`；预训练默认关闭 domain 损失。跨域对比学习仅在下游标签可对齐时启用（如调制 contrastive），预训练无 InfoNCE。
 
-预训练损失（默认权重见 `configs/pretrain.yaml`）：`L_mae + λ_phys L_phys + λ_impute L_span + λ_struct L_structure + λ_phase L_structure_phase + λ_readout L_global_phys + λ_latent L_EMA(z)`。`domain` / `uti_*` 默认关闭，避免预训练偏离任务无关骨干学习。默认 `iq_normalize: none`（幅度由 RevIN 处理）。预训练不向 Decoder/UTI 注入 `dataset_id`。
+预训练损失（默认权重见 `configs/pretrain.yaml`）：`L_mae + λ_phys L_phys + λ_impute L_span + λ_struct L_structure + λ_phase L_structure_phase + λ_readout L_global_phys + λ_vicreg L_VICReg(z_enc)`。`latent`（EMA 余弦）默认关闭以防塌缩；`domain` / `uti_*` 默认关闭。默认 `iq_normalize: none`（幅度由 RevIN 处理）。预训练不向 Decoder/UTI 注入 `dataset_id`。
 
 ## 配置索引
 

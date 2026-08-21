@@ -421,10 +421,30 @@ class SignalLitModule(_Base):
         total, parts = weighted_pretrain_loss(outputs, merged, weights)
         return total, parts, {**outputs, "_batch": merged}
 
+    def _active_source_allowlist(self) -> set[str] | None:
+        """``task_schedule`` / 单任务过滤：返回允许的 source 名；``None`` 表示不限制。"""
+        sources = self.train_cfg.get("active_train_sources")
+        if isinstance(sources, (list, tuple)) and sources:
+            return {str(x) for x in sources}
+        tasks = self.train_cfg.get("active_train_tasks")
+        if isinstance(tasks, (list, tuple)) and tasks:
+            from resmamba_signal_model.training.task_schedule import sources_for_tasks
+
+            return set(sources_for_tasks(self.train_cfg, [str(t) for t in tasks]))
+        return None
+
     def _downstream_forward(
         self, batch: Any, *, default_source: str | None = None
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, Any]]:
         sources = _as_source_map(batch, default_name=default_source)
+        allow = self._active_source_allowlist()
+        if allow is not None:
+            sources = {name: sub for name, sub in sources.items() if str(name) in allow}
+        if not sources:
+            raise RuntimeError(
+                f"下游 batch 无可用源：allow={sorted(allow) if allow is not None else None} "
+                f"got={list(_as_source_map(batch, default_name=default_source))}"
+            )
         total = None
         parts: dict[str, torch.Tensor] = {}
         last: dict[str, Any] | None = None
@@ -432,6 +452,8 @@ class SignalLitModule(_Base):
         src_tokens: dict[str, float] = {}
         packed_all: list[dict[str, Any]] = []
         token_mass = None
+        # 分任务：每个 source/task 独立算 loss，再按需汇总；单任务时 total 即该任务 loss。
+        per_task_totals: dict[str, torch.Tensor] = {}
         for name, sub in sources.items():
             task = self._task_for_source(name, sub)
             if hasattr(self.model, "set_active_task"):
@@ -502,6 +524,7 @@ class SignalLitModule(_Base):
                 distill_temperature=float(self.train_cfg.get("distill_temperature", 2.0)),
                 distill_confidence=float(self.train_cfg.get("distill_confidence", 0.5)),
                 prototype_anchor_weight=float(self.train_cfg.get("prototype_anchor_weight", 0.0)),
+                z_probe_weight=float(self.train_cfg.get("z_probe_weight", 1.0)),
                 cluster_utilization_weight=float(self.train_cfg.get("cluster_utilization_weight", 0.02)),
                 cluster_consistency_weight=float(self.train_cfg.get("cluster_consistency_weight", 1.0)),
                 cluster_balance_mix=float(self.train_cfg.get("cluster_balance_mix", 0.35)),
@@ -511,20 +534,38 @@ class SignalLitModule(_Base):
             n_tokens = outputs["n_tokens"].sum().clamp_min(1).to(dtype=loss.dtype)
             src_losses[name] = float(loss.detach())
             src_tokens[name] = float(n_tokens.detach())
+            # 分量与任务总 loss 都挂在任务名下，避免多源混写同一条曲线。
+            if task in per_task_totals:
+                # 同任务多源：按 token 加权合成该任务 total（仍与其它任务隔离）
+                prev = per_task_totals[task]
+                prev_tok = parts[f"{task}/_tokens"]
+                merged_tok = prev_tok + n_tokens
+                per_task_totals[task] = (prev * prev_tok + loss * n_tokens) / merged_tok.clamp_min(1)
+                parts[f"{task}/_tokens"] = merged_tok.detach()
+            else:
+                per_task_totals[task] = loss
+                parts[f"{task}/_tokens"] = n_tokens.detach()
+            parts[f"{task}/total"] = per_task_totals[task].detach()
+            for key, value in sub_parts.items():
+                # 同名分量后写覆盖前写；同任务多源时保留最后一次（监控用），total 已按 token 合成
+                parts[f"{task}/{key}"] = value
             if bool(self.train_cfg.get("token_normalized_loss", True)):
                 weighted = loss * n_tokens
                 total = weighted if total is None else total + weighted
             else:
                 total = loss if total is None else total + loss
             token_mass = n_tokens if token_mass is None else token_mass + n_tokens
-            for key, value in sub_parts.items():
-                parts[f"{name}/{key}"] = value
             last = {**outputs, "_batch": sub, "_task": task, "_source": name}
             packed_all.append(last)
         assert total is not None and last is not None
         if bool(self.train_cfg.get("token_normalized_loss", True)) and token_mass is not None:
             total = total / token_mass.clamp_min(1)
-        last = {**last, "_src_losses": src_losses, "_src_tokens": src_tokens, "_all": packed_all}
+        # 单任务阶段：反传目标就是该任务 loss，不掺其它任务。
+        if len(per_task_totals) == 1:
+            total = next(iter(per_task_totals.values()))
+        # 去掉内部辅助键，避免写入日志
+        parts = {k: v for k, v in parts.items() if not k.endswith("/_tokens")}
+        last = {**last, "_src_losses": src_losses, "_src_tokens": src_tokens, "_all": packed_all, "_task_losses": dict(per_task_totals)}
         return total, parts, last
 
     def _forward_and_loss(
@@ -860,8 +901,11 @@ class SignalLitModule(_Base):
         hint = self._val_source_hint(dataloader_idx)
         total, parts, packed = self._forward_and_loss(batch, train=False, default_source=hint)
         batch_size = max(1, int(packed["n_tokens"].shape[0]))
+        task = str(packed.get("_task") or "")
         if self._is_finite_metric(total):
             self.log("val/loss", total, on_epoch=True, prog_bar=True, add_dataloader_idx=True, batch_size=batch_size)
+            if task:
+                self.log(f"val/{task}/loss", total, on_epoch=True, batch_size=batch_size)
         for name, value in parts.items():
             if self._is_finite_metric(value):
                 self.log(f"val/{name}", value, on_epoch=True, add_dataloader_idx=True, batch_size=batch_size)

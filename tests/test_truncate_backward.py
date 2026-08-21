@@ -59,13 +59,17 @@ def test_truncate_backward_blocks_encoder_grads() -> None:
     model.train()
     for param in model.encoder.parameters():
         param.requires_grad = True
+    for param in model.encoder_pool.parameters():
+        param.requires_grad = True
     out = model(make_batch(), mode="task", task="modulation")
     out["modulation_logits"].sum().backward()
     for param in model.encoder.parameters():
         assert param.grad is None
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.modulation_head.parameters())
     assert any(p.grad is not None for p in model.task_interface.parameters())
-    assert not out["z"].requires_grad
+    # encoder 权重无梯度；encoder_pool 在 detach(h_enc) 上重算，可读出可训
+    assert not out["h_enc"].requires_grad
+    assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in model.encoder_pool.parameters())
 
 
 def test_truncate_backward_trains_view_adapters() -> None:
@@ -79,6 +83,8 @@ def test_truncate_backward_trains_view_adapters() -> None:
     for param in model.task_interface.parameters():
         param.requires_grad = True
     for param in model.modulation_head.parameters():
+        param.requires_grad = True
+    for param in model.encoder_pool.parameters():
         param.requires_grad = True
     out = model(make_batch(), mode="task", task="modulation")
     out["modulation_logits"].sum().backward()

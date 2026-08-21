@@ -373,6 +373,12 @@ def main() -> None:
         resolve_continual_sessions,
         total_continual_epochs,
     )
+    from resmamba_signal_model.training.task_schedule import (
+        TaskScheduleCallback,
+        resolve_task_schedule,
+        sources_for_tasks,
+        total_schedule_epochs,
+    )
 
     sessions = resolve_continual_sessions(train_cfg, stage=args.stage)
     if args.stage == "continual" or sessions:
@@ -385,6 +391,18 @@ def main() -> None:
             train_cfg.setdefault("shared_lora", True)
         if train_cfg.get("continual_sessions"):
             train_cfg["epochs"] = total_continual_epochs(sessions, default_epochs=int(train_cfg.get("epochs", 1)))
+
+    task_sessions = resolve_task_schedule(train_cfg)
+    if task_sessions:
+        train_cfg["epochs"] = total_schedule_epochs(
+            task_sessions, default_epochs=int(train_cfg.get("epochs", 1))
+        )
+        # 顺序训时 multitask geomean 早期停止会误杀后续任务阶段
+        if train_cfg.get("early_stopping_patience") is None:
+            train_cfg["early_stopping_patience"] = 0
+        first = task_sessions[0]
+        train_cfg["active_train_tasks"] = list(first.get("tasks") or [])
+        train_cfg["active_train_sources"] = sources_for_tasks(train_cfg, train_cfg["active_train_tasks"])
 
     run_name = args.run_name
     if run_name is None and args.stage == "stage3" and args.task:
@@ -410,6 +428,19 @@ def main() -> None:
 
     data = SignalDataModule(train_cfg, stage=args.stage)
     data.setup()
+    if task_sessions:
+        data.set_active_train_filter(train_cfg.get("active_train_sources"))
+        logger.info(
+            "task_schedule sessions=%s total_epochs=%s first_tasks=%s",
+            len(task_sessions),
+            train_cfg.get("epochs"),
+            train_cfg.get("active_train_tasks"),
+        )
+        print(
+            f"task_schedule sessions={len(task_sessions)} epochs={train_cfg.get('epochs')} "
+            f"first={train_cfg.get('active_train_tasks')}",
+            flush=True,
+        )
     logger.info("sources=%s", data.source_names)
     cache_msg = format_iq_ram_cache()
     logger.info("%s", cache_msg)
@@ -495,6 +526,9 @@ def main() -> None:
     if sessions and (args.stage == "continual" or bool(train_cfg.get("continual")) or bool(train_cfg.get("absorb_unknown"))):
         callbacks.append(ContinualSessionCallback(sessions, train_cfg))
         logger.info("continual sessions=%s distill_weight=%s prototype_anchor_weight=%s", len(sessions), train_cfg.get("distill_weight"), train_cfg.get("prototype_anchor_weight"))
+    if task_sessions:
+        callbacks.append(TaskScheduleCallback(task_sessions, train_cfg))
+        logger.info("task_schedule=%s", [(s.get("name"), s.get("epochs"), s.get("tasks")) for s in task_sessions])
 
     trainer_kwargs: dict[str, Any] = dict(
         default_root_dir=str(run_dir),

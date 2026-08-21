@@ -220,6 +220,9 @@ class SignalFoundationModel(nn.Module):
         self.domain_disc = DomainDiscriminator(cfg.d_model, num_datasets=max(2, cfg.num_datasets))
         self.grl = GradientReversal()
         self.chunk_pool = AttentionPooling(cfg.d_model, num_heads=min(4, heads))
+        # 分类身份：encoder token AttnPool（与 decoder ReprHead 的重建 z 分离）
+        self.encoder_pool = AttentionPooling(cfg.d_model, num_heads=min(4, heads))
+        self.encoder_repr_norm = nn.LayerNorm(cfg.d_model)
         self.task_interface: UniversalTaskInterface | None = None
         self.task_adapters: nn.ModuleDict | None = None
         self.shared_adapter: SharedTaskAdapter | None = None
@@ -282,6 +285,9 @@ class SignalFoundationModel(nn.Module):
 
     def apply_train_flags(self, train_encoder: bool, train_decoder: bool, train_heads: bool) -> None:
         for module in (self.input_adapters, self.revin, self.tokenizer, self.encoder):
+            for param in module.parameters():
+                param.requires_grad = train_encoder
+        for module in (self.encoder_pool, self.encoder_repr_norm):
             for param in module.parameters():
                 param.requires_grad = train_encoder
         for param in self.decoder.parameters():
@@ -489,31 +495,27 @@ class SignalFoundationModel(nn.Module):
     ) -> dict[str, Any]:
         if self.task_interface is None:
             return out
-        patch_h = out.get("h_general", out.get("patch_h"))
-        if patch_h is None:
+        h_enc = out.get("h_enc", out.get("h_general", out.get("patch_h")))
+        if h_enc is None:
             return out
-        if patch_h.dim() == 3 and patch_h.shape[1] == out["patch_mask"].shape[1] + 1:
-            patch_h = patch_h[:, 1:]
-        view_pairs: dict[str, tuple[torch.Tensor, torch.Tensor]] = {
-            "general": (out.get("z_general", out["z"]), out.get("h_general", patch_h))
-        }
-        for view_name in ("semantic", "source", "context"):
-            z_key, h_key = f"z_{view_name}", f"h_{view_name}"
-            if z_key in out and h_key in out:
-                view_pairs[view_name] = (out[z_key], out[h_key])
-        n_tokens = out["patch_mask"].shape[1]
-        pos = torch.linspace(0.0, 1.0, n_tokens, device=patch_h.device, dtype=patch_h.dtype)
-        pos = pos.view(1, n_tokens, 1).expand(patch_h.shape[0], -1, -1)
-        target_coord = out.get("target_mask", torch.zeros_like(out["patch_mask"]))
-        query_coords = torch.cat([pos, target_coord.to(dtype=patch_h.dtype).unsqueeze(-1)], dim=-1)
+        if h_enc.dim() == 3 and h_enc.shape[1] == out["patch_mask"].shape[1] + 1:
+            h_enc = h_enc[:, 1:]
+        z_enc = out.get("z_enc", out.get("z_general", out["z"]))
+        patch_mask = out["patch_mask"]
+        view_pairs = self.task_interface.build_views(z_enc, h_enc, patch_mask=patch_mask)
+        n_tokens = patch_mask.shape[1]
+        pos = torch.linspace(0.0, 1.0, n_tokens, device=h_enc.device, dtype=h_enc.dtype)
+        pos = pos.view(1, n_tokens, 1).expand(h_enc.shape[0], -1, -1)
+        target_coord = out.get("target_mask", torch.zeros_like(patch_mask))
+        query_coords = torch.cat([pos, target_coord.to(dtype=h_enc.dtype).unsqueeze(-1)], dim=-1)
         spec = default_task_spec(task)
         metadata = out.get("task_metadata")
         if not allow_dataset_condition and isinstance(metadata, dict):
             metadata = {k: v for k, v in metadata.items() if k != "dataset_id"}
         features = self.task_interface(
-            out.get("z_general", out["z"]),
-            patch_h,
-            out["patch_mask"],
+            z_enc,
+            h_enc,
+            patch_mask,
             spec,
             recon_norm=out.get("recon_norm"),
             views=view_pairs,
@@ -750,6 +752,49 @@ class SignalFoundationModel(nn.Module):
             return self.encoder(packed, seq_idx=seq_idx, cu_seqlens=cu_seqlens), True
         return self.encoder(tokens, key_padding_mask=~patch_mask), False
 
+    def _pool_encoder_identity(
+        self,
+        tokens: torch.Tensor,
+        patch_mask: torch.Tensor,
+        *,
+        h_vis: torch.Tensor | None = None,
+        packed_enc: bool | None = None,
+        visible: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """全序列 encoder 读出 ``(z_enc, h_enc)``，供分类 / VICReg / UTI。
+
+        MAE 可见子集编码可复用：当 ``visible`` 覆盖全部有效 patch 时不再二次 encode。
+        """
+        reuse = (
+            h_vis is not None
+            and packed_enc is not None
+            and visible is not None
+            and bool((visible == patch_mask).all().item())
+        )
+        if reuse:
+            assert h_vis is not None and packed_enc is not None and visible is not None
+            h_enc = self.decoder.scatter_encoder(h_vis, visible, patch_mask, packed=packed_enc)
+        else:
+            h_all, packed_all = self._encode_tokens(tokens, patch_mask, patch_mask)
+            h_enc = self.decoder.scatter_encoder(h_all, patch_mask, patch_mask, packed=packed_all)
+        h_enc = h_enc.masked_fill(~patch_mask.unsqueeze(-1), 0.0)
+        z_enc = self.encoder_pool(h_enc, key_padding_mask=~patch_mask)
+        z_enc = self.encoder_repr_norm(z_enc.float()).to(dtype=h_enc.dtype)
+        return z_enc, h_enc
+
+    def _refresh_encoder_identity(self, out: dict[str, Any]) -> dict[str, Any]:
+        """truncate_backward 后在可微路径上重算 encoder 读出，使 ``encoder_pool`` 可训。"""
+        h_enc = out.get("h_enc")
+        patch_mask = out.get("patch_mask")
+        if h_enc is None or patch_mask is None:
+            return out
+        z_enc = self.encoder_pool(h_enc, key_padding_mask=~patch_mask)
+        z_enc = self.encoder_repr_norm(z_enc.float()).to(dtype=h_enc.dtype)
+        out["z_enc"] = z_enc
+        out["z_general"] = z_enc
+        out["z"] = z_enc
+        return out
+
     def _denorm_recon(
         self,
         recon_norm: torch.Tensor,
@@ -839,6 +884,13 @@ class SignalFoundationModel(nn.Module):
         target_mask = (mae_mask | suffix_mask | span_mask) & patch_mask
         visible = _ensure_min_visible(patch_mask & ~target_mask, patch_mask)
         h_vis, packed_enc = self._encode_tokens(tokens, visible, patch_mask)
+        z_enc, h_enc = self._pool_encoder_identity(
+            tokens,
+            patch_mask,
+            h_vis=h_vis,
+            packed_enc=packed_enc,
+            visible=visible,
+        )
         dec = self.decoder(
             h_vis,
             tokens,
@@ -866,22 +918,29 @@ class SignalFoundationModel(nn.Module):
             recon = self._denorm_recon(
                 recon_norm, orig_patches, stats, int(iq.shape[-1]), project_mask, sample_mask=sample_mask
             )
-        n = min(n, recon.shape[1], recon_norm.shape[1], dec["patch_h"].shape[1])
+        n = min(n, recon.shape[1], recon_norm.shape[1], dec["patch_h"].shape[1], h_enc.shape[1])
         patch_h = dec["patch_h"][:, :n]
+        h_enc = h_enc[:, :n]
+        z_recon = dec["z"]
         representations: dict[str, torch.Tensor] = {
-            "z_general": dec["z"],
-            "h_general": patch_h,
+            "z_general": z_enc,
+            "h_general": h_enc,
+            "z_enc": z_enc,
+            "h_enc": h_enc,
+            "z_recon": z_recon,
+            "h_recon": patch_h,
         }
         if self.task_interface is not None:
-            for view_name, (view_z, view_h) in self.task_interface.build_views(dec["z"], patch_h).items():
+            for view_name, (view_z, view_h) in self.task_interface.build_views(
+                z_enc, h_enc, patch_mask=patch_mask[:, :n]
+            ).items():
                 if view_name == "general":
                     continue
                 representations[f"z_{view_name}"] = view_z
                 representations[f"h_{view_name}"] = view_h
-        domain_logits = self._domain_logits(dec["z"], representations)
+        domain_logits = self._domain_logits(z_enc, representations)
         out: dict[str, Any] = {
             **tok,
-            **representations,
             "tokens": tokens,
             "patch_mask": patch_mask,
             "mae_mask": mae_mask[:, :n],
@@ -895,7 +954,13 @@ class SignalFoundationModel(nn.Module):
             "patch_targets_norm": norm_patches[:, :n],
             "mae_pred": recon[:, :n],
             "patch_targets": orig_patches[:, :n],
-            "z": dec["z"],
+            "z": z_enc,
+            "z_enc": z_enc,
+            "z_general": z_enc,
+            "z_recon": z_recon,
+            "h_enc": h_enc,
+            "h_general": h_enc,
+            "h_recon": patch_h,
             "h_dec": dec["h_dec"],
             "h_full": dec["h_full"],
             "patch_h": patch_h,
@@ -910,6 +975,8 @@ class SignalFoundationModel(nn.Module):
         }
         if dataset_id is not None:
             out["dataset_id"] = dataset_id
+        for key, value in representations.items():
+            out.setdefault(key, value)
         return out
 
     def _forward_chunked(
@@ -1192,34 +1259,32 @@ class SignalFoundationModel(nn.Module):
         if dataset_id is None:
             dataset_id = out.get("dataset_id")
         self.set_active_task(task)
+        if bool(getattr(self, "truncate_backward", False)):
+            out = self._refresh_encoder_identity(out)
         patch_h = out.get("patch_h", out.get("h_dec"))
-        if self.task_interface is not None and patch_h is not None:
-            if patch_h.dim() == 3 and patch_h.shape[1] == out["patch_mask"].shape[1] + 1:
+        h_enc = out.get("h_enc", out.get("h_general", patch_h))
+        z_enc = out.get("z_enc", out.get("z_general", out.get("z")))
+        if self.task_interface is not None and h_enc is not None:
+            if h_enc.dim() == 3 and h_enc.shape[1] == out["patch_mask"].shape[1] + 1:
+                h_enc = h_enc[:, 1:]
+            if patch_h is not None and patch_h.dim() == 3 and patch_h.shape[1] == out["patch_mask"].shape[1] + 1:
                 patch_h = patch_h[:, 1:]
-            z_general = out.get("z_general", out["z"])
-            h_general = out.get("h_general", patch_h)
-            # truncate_backward 会在 no_grad 骨干里预先算并 detach specialist views；
-            # 任务路径必须用 UTI.build_views 重算，否则 view_adapters 无梯度（stage2 解冻了也训不动）。
-            if bool(getattr(self, "truncate_backward", False)):
-                view_pairs = self.task_interface.build_views(z_general, h_general)
-                for view_name, (view_z, view_h) in view_pairs.items():
-                    if view_name == "general":
-                        continue
-                    out[f"z_{view_name}"] = view_z
-                    out[f"h_{view_name}"] = view_h
-            else:
-                view_pairs = {"general": (z_general, h_general)}
-                for view_name in ("semantic", "source", "context"):
-                    z_key, h_key = f"z_{view_name}", f"h_{view_name}"
-                    if z_key in out and h_key in out:
-                        view_pairs[view_name] = (out[z_key], out[h_key])
-                if getattr(self.task_interface, "use_specialist_views", False) and len(view_pairs) == 1:
-                    view_pairs = self.task_interface.build_views(z_general, h_general)
+            # truncate_backward：在 detach 的 h_enc 上重算视图，view_adapters / encoder_pool 可训。
+            view_pairs = self.task_interface.build_views(
+                z_enc, h_enc, patch_mask=out["patch_mask"]
+            )
+            for view_name, (view_z, view_h) in view_pairs.items():
+                if view_name == "general":
+                    continue
+                out[f"z_{view_name}"] = view_z
+                out[f"h_{view_name}"] = view_h
             n_tokens = out["patch_mask"].shape[1]
-            pos = torch.linspace(0.0, 1.0, n_tokens, device=patch_h.device, dtype=patch_h.dtype)
-            pos = pos.view(1, n_tokens, 1).expand(patch_h.shape[0], -1, -1)
+            pos_dev = h_enc.device
+            pos_dtype = h_enc.dtype
+            pos = torch.linspace(0.0, 1.0, n_tokens, device=pos_dev, dtype=pos_dtype)
+            pos = pos.view(1, n_tokens, 1).expand(h_enc.shape[0], -1, -1)
             target_coord = out.get("target_mask", torch.zeros_like(out["patch_mask"]))
-            query_coords = torch.cat([pos, target_coord.to(dtype=patch_h.dtype).unsqueeze(-1)], dim=-1)
+            query_coords = torch.cat([pos, target_coord.to(dtype=pos_dtype).unsqueeze(-1)], dim=-1)
             task_metadata = out.get("task_metadata")
             if dataset_id is not None:
                 if isinstance(task_metadata, dict):
@@ -1227,8 +1292,8 @@ class SignalFoundationModel(nn.Module):
                 elif task_metadata is None:
                     task_metadata = {"dataset_id": dataset_id}
             features = self.task_interface(
-                out["z"],
-                patch_h,
+                z_enc,
+                h_enc,
                 out["patch_mask"],
                 task,
                 recon_norm=out.get("recon_norm"),
@@ -1323,7 +1388,7 @@ class SignalFoundationModel(nn.Module):
                 )
         kind = self.task_kind(task)
         if task in self.z_linear_probes and kind in ("classification", "emitter"):
-            z_feat = out.get("z_general", out["z"])
+            z_feat = out.get("z_enc", out.get("z_general", out["z"]))
             z_feat = F.normalize(z_feat.float(), dim=-1).to(dtype=z_feat.dtype)
             out["z_probe_logits"] = self.z_linear_probes[task](z_feat)
         return out

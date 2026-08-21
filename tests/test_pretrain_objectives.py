@@ -45,24 +45,25 @@ def test_pretrain_three_objectives_and_uti_readouts() -> None:
     batch = _batch()
     out = model(batch, mode="pretrain")
     assert "uti_pooled" in out and "uti_tokens" in out and "uti_query" in out
+    assert "z_enc" in out and "z_recon" in out
     assert out["uti_pooled"].shape[0] == 4
-    teacher_z = out["z"].detach() + 0.01
-    teacher_h = out["h_general"].detach()
-    out["teacher_z"] = teacher_z
-    out["teacher_h"] = teacher_h
+    # latent 对齐 decoder 重建读出；vicreg 作用在 encoder 池化
+    out["teacher_z"] = out["z_recon"].detach() + 0.01
+    out["teacher_h"] = out.get("h_recon", out["h_general"]).detach()
     out["teacher_pooled"] = out["uti_pooled"].detach()
     out["teacher_tokens"] = out["uti_tokens"].detach()
     out["teacher_query"] = out["uti_query"].detach()
     losses = foundation_pretrain_losses(
         out,
         batch,
-        include={"mae", "structure", "latent", "uti_pooled", "uti_token", "uti_query"},
+        include={"mae", "structure", "latent", "vicreg", "uti_pooled", "uti_token", "uti_query"},
     )
-    for key in ("mae", "structure", "latent", "uti_pooled", "uti_token", "uti_query"):
+    for key in ("mae", "structure", "latent", "vicreg", "uti_pooled", "uti_token", "uti_query"):
         assert key in losses
         assert torch.isfinite(losses[key])
     assert float(losses["structure"].detach()) > 0.0
     assert float(losses["latent"].detach()) >= 0.0
+    assert float(losses["vicreg"].detach()) >= 0.0
     total = sum(losses.values())
     total.backward()
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters() if p.requires_grad)

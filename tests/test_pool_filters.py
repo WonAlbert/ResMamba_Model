@@ -29,7 +29,7 @@ def test_load_pretrain_datasets() -> None:
 
 def test_load_downstream_modulation_datasets() -> None:
     datasets = load_downstream_modulation_datasets()
-    assert datasets == ["rml2016_04c", "rml2016_10a", "rml2016_10b", "rml2018_1a"]
+    assert datasets == ["rml2016_04c", "rml2016_10a", "rml2016_10b"]
 
 
 def test_load_downstream_shared_datasets() -> None:
@@ -39,7 +39,6 @@ def test_load_downstream_shared_datasets() -> None:
         "rml2016_04c",
         "rml2016_10a",
         "rml2016_10b",
-        "rml2018_1a",
         "wisig",
     ]
 

@@ -65,14 +65,16 @@ def test_stage_yaml_profiles() -> None:
     assert s2["train_encoder"] is False
     assert "emitter" in s2["task_pools"]
     assert s2["lambda_recon"] == 0.0
-    assert s2["early_stopping_patience"] == 3
+    assert s2["early_stopping_patience"] == 0
     assert s2["checkpoint_monitor"] == "val/multitask_geomean"
     assert s2["checkpoint_mode"] == "max"
     assert s2["seed"] == 0
     assert s2["amp_dtype"] == "bfloat16"
     assert s2["balanced_sampling"] is False
+    assert isinstance(s2.get("task_schedule"), list) and len(s2["task_schedule"]) >= 2
     tiny = load_yaml_config("configs/stage2.yaml", profile="tiny")
     assert tiny["synthetic"] is True
+    assert isinstance(tiny.get("task_schedule"), list) and len(tiny["task_schedule"]) >= 1
     s3 = load_yaml_config("configs/stage3.yaml", profile="modulation")
     assert s3["task"] == "modulation"
     assert s3["loraplus_lr_ratio"] == 16

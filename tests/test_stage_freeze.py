@@ -47,6 +47,8 @@ def test_stage2_freezes_backbone_trains_uti_heads() -> None:
     assert any(n.startswith("modulation_head.") for n in names)
     assert any(n.startswith("emitter_head.") for n in names)
     assert any(n.startswith("z_linear_probes.") for n in names)
+    assert any(n.startswith("encoder_pool.") for n in names)
+    assert any(n.startswith("encoder_repr_norm.") for n in names)
     assert not any(n.startswith("encoder.") for n in names)
     assert not any(n.startswith("decoder.") for n in names)
     assert not any(n.startswith("tokenizer.") for n in names)

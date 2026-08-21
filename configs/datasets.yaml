@@ -21,11 +21,12 @@ pretrain:
 
 downstream_modulation:
   # 调制识别（非个体识别）下游：*_train.h5 训练，对应 *_val.h5 验证
+  # 阶段二/三暂不用 RML2018（预测/聚类/插补 shared pool 随之去掉）
   datasets:
     - rml2016_04c
     - rml2016_10a
     - rml2016_10b
-    - rml2018_1a
+    # - rml2018_1a
 
 emitter_downstream:
   # 个体识别下游微调；WiSig 为主基准，ADSB2 作跨域补充

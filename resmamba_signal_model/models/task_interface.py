@@ -221,6 +221,8 @@ class UniversalTaskInterfaceV2(nn.Module):
                 for name in SPECIALIST_VIEWS
             }
         )
+        # 慢视图：对 token 做因果指数衰减再均值，与 semantic/source 的聚合不同
+        self.register_buffer("_context_decay", torch.tensor(0.95), persistent=False)
         self.dropout = nn.Dropout(dropout)
 
         # 旧 UTI v1 路径仅在兼容开关下构建，旧 checkpoint 可无损复现。
@@ -445,17 +447,71 @@ class UniversalTaskInterfaceV2(nn.Module):
                 condition = condition + domain
         return self.condition_norm(condition).to(dtype=dtype)
 
+    @staticmethod
+    def _masked_mean(tokens: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        weights = mask.unsqueeze(-1).to(dtype=tokens.dtype)
+        denom = weights.sum(dim=1).clamp_min(1.0)
+        return (tokens * weights).sum(dim=1) / denom
+
+    def _context_pool(self, tokens: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """长时上下文：时间指数衰减加权均值（相对 semantic 的均匀均值更偏慢变量）。"""
+        batch, length, _ = tokens.shape
+        decay = float(self._context_decay.item()) if hasattr(self, "_context_decay") else 0.95
+        idx = torch.arange(length, device=tokens.device, dtype=tokens.dtype)
+        # 近端权重大：w_t ∝ decay^(L-1-t)
+        raw = decay ** (float(length - 1) - idx)
+        weights = raw.view(1, length, 1).expand(batch, -1, -1) * mask.unsqueeze(-1).to(dtype=tokens.dtype)
+        denom = weights.sum(dim=1).clamp_min(1.0e-6)
+        return (tokens * weights).sum(dim=1) / denom
+
     def build_views(
         self,
         z_general: torch.Tensor,
         h_general: torch.Tensor,
+        *,
+        patch_mask: torch.Tensor | None = None,
     ) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+        """构造 specialist 视图。
+
+        不再是 ``adapter(z_general)`` 的三份拷贝：semantic / source / context
+        分别用 encoder token 的均匀池化、去均值残差、慢衰减池化，再经低秩残差。
+        ``general`` 仍对应 encoder 全局读出 ``z_general`` / ``h_general``。
+        """
         views: dict[str, tuple[torch.Tensor, torch.Tensor]] = {
             "general": (z_general, h_general)
         }
-        if self.use_specialist_views:
-            for name, adapter in self.view_adapters.items():
-                views[name] = (adapter(z_general), adapter(h_general))
+        if not self.use_specialist_views:
+            return views
+        if patch_mask is None:
+            patch_mask = torch.ones(
+                h_general.shape[0],
+                h_general.shape[1],
+                dtype=torch.bool,
+                device=h_general.device,
+            )
+        else:
+            patch_mask = patch_mask.to(device=h_general.device, dtype=torch.bool)
+            if patch_mask.shape[:2] != h_general.shape[:2]:
+                n = min(patch_mask.shape[1], h_general.shape[1])
+                patch_mask = patch_mask[:, :n]
+                h_general = h_general[:, :n]
+
+        z_sem = self.view_adapters["semantic"](z_general)
+        h_sem = self.view_adapters["semantic"](h_general)
+
+        z_mean = self._masked_mean(h_general, patch_mask)
+        h_src = h_general - z_mean.unsqueeze(1)
+        z_src = self._masked_mean(h_src, patch_mask)
+        h_src = self.view_adapters["source"](h_src)
+        z_src = self.view_adapters["source"](z_src)
+
+        z_ctx = self._context_pool(h_general, patch_mask)
+        h_ctx = self.view_adapters["context"](h_general)
+        z_ctx = self.view_adapters["context"](z_ctx)
+
+        views["semantic"] = (z_sem, h_sem)
+        views["source"] = (z_src, h_src)
+        views["context"] = (z_ctx, h_ctx)
         return views
 
     def _allowed_views(self, specs: Sequence[TaskSpec], device: torch.device) -> torch.Tensor:
@@ -572,7 +628,7 @@ class UniversalTaskInterfaceV2(nn.Module):
                 else None
             ),
         )
-        all_views = dict(views or self.build_views(z, patch_h))
+        all_views = dict(views or self.build_views(z, patch_h, patch_mask=patch_mask))
         z_views = {name: pair[0] for name, pair in all_views.items()}
         h_views = {name: pair[1] for name, pair in all_views.items()}
         z_mix = self._mix_views(z, z_views, condition, specs)

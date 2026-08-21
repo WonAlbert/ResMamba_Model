@@ -47,11 +47,11 @@ from resmamba_signal_model.training.task_catalog import builtin_spec  # noqa: E4
 
 TASKS = ("modulation", "emitter", "prediction", "clustering", "imputation", "encode")
 TASK_DATASETS: dict[str, list[str]] = {
-    "modulation": ["rml2016_04c", "rml2016_10a", "rml2016_10b", "rml2018_1a"],
+    "modulation": ["rml2016_04c", "rml2016_10a", "rml2016_10b"],  # 暂不用 rml2018_1a
     "emitter": ["wisig", "adsb2"],
-    "prediction": ["adsb2", "rml2016_04c", "rml2016_10a", "rml2016_10b", "rml2018_1a", "wifi150"],
-    "imputation": ["adsb2", "rml2016_04c", "rml2016_10a", "rml2016_10b", "rml2018_1a", "wifi150"],
-    "clustering": ["adsb2", "rml2016_04c", "rml2016_10a", "rml2016_10b", "rml2018_1a", "wifi150"],
+    "prediction": ["adsb2", "rml2016_04c", "rml2016_10a", "rml2016_10b", "wifi150"],
+    "imputation": ["adsb2", "rml2016_04c", "rml2016_10a", "rml2016_10b", "wifi150"],
+    "clustering": ["adsb2", "rml2016_04c", "rml2016_10a", "rml2016_10b", "wifi150"],
     "encode": [],
 }
 
