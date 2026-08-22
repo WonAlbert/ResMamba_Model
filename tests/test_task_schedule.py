@@ -51,15 +51,13 @@ def test_expand_task_schedule_inserts_joint_after_each_solo() -> None:
     }
     base = resolve_task_schedule(cfg)
     expanded = expand_task_schedule_with_joint(base, cfg)
-    assert len(expanded) == 4
+    assert len(expanded) == 3
     assert expanded[0]["tasks"] == ["modulation"] and expanded[0].get("joint") is False
-    assert expanded[1]["joint"] is True and expanded[1]["tasks"] == ["modulation"]
-    assert expanded[1]["epochs"] == 2
-    assert expanded[2]["tasks"] == ["emitter"]
-    assert expanded[3]["joint"] is True and expanded[3]["tasks"] == ["modulation", "emitter"]
-    assert total_schedule_epochs(expanded) == 3 + 2 + 4 + 2
-    assert schedule_session_for_epoch(expanded, 3)["joint"] is True
-    assert schedule_session_for_epoch(expanded, 5)["tasks"] == ["emitter"]
+    assert expanded[1]["tasks"] == ["emitter"] and expanded[1].get("joint") is False
+    assert expanded[2]["joint"] is True and expanded[2]["tasks"] == ["modulation", "emitter"]
+    assert expanded[2]["epochs"] == 2
+    assert total_schedule_epochs(expanded) == 3 + 4 + 2
+    assert schedule_session_for_epoch(expanded, 7)["joint"] is True
 
 
 def test_empty_schedule_keeps_mixed_training() -> None:
@@ -257,8 +255,13 @@ def test_joint_session_trains_all_completed_sources_without_replay() -> None:
     }
     base = [
         {"tasks": ["modulation"], "epochs": 1, "name": "modulation", "joint": False},
-        {"name": "joint_modulation", "tasks": ["modulation"], "epochs": 1, "joint": True},
         {"tasks": ["emitter"], "epochs": 1, "name": "emitter", "joint": False},
+        {
+            "name": "joint_modulation+emitter",
+            "tasks": ["modulation", "emitter"],
+            "epochs": 1,
+            "joint": True,
+        },
     ]
     dm = SignalDataModule(cfg, stage="stage2")
     dm.setup()
@@ -266,14 +269,14 @@ def test_joint_session_trains_all_completed_sources_without_replay() -> None:
     trainer = SimpleNamespace(datamodule=dm, current_epoch=0)
     cb.on_fit_start(trainer, None)
     assert cfg["active_joint_session"] is False
-    trainer.current_epoch = 0
+    trainer.current_epoch = 1
     cb.on_train_epoch_end(trainer, None)
     assert cfg["active_joint_session"] is True
-    assert cfg["active_train_tasks"] == ["modulation"]
-    assert set(cfg["active_train_sources"]) == {"classification"}
+    assert cfg["active_train_tasks"] == ["modulation", "emitter"]
+    assert set(cfg["active_train_sources"]) == {"classification", "emitter"}
     assert cfg["active_replay_sources"] == []
-    assert set(dm._filtered_train_sets()) == {"classification"}
-    assert set(dm._filtered_val_sets()) == {"classification"}
+    assert set(dm._filtered_train_sets()) == {"classification", "emitter"}
+    assert set(dm._filtered_val_sets()) == {"classification", "emitter"}
 
 
 def test_schedule_callback_prepares_next_epoch_before_reload() -> None:

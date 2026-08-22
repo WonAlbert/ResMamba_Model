@@ -77,7 +77,7 @@ def test_stage_yaml_profiles() -> None:
     assert s2.get("replay_strategy") == "class_center"
     assert int(s2.get("replay_samples_per_class", 0)) > 0
     assert int(s2.get("replay_baseline_classes_per_task", 0)) > 0
-    assert int(s2.get("task_joint_epochs", 0)) == 2
+    assert int(s2.get("task_joint_epochs", 0)) == 1
     tiny = load_yaml_config("configs/stage2.yaml", profile="tiny")
     assert tiny["synthetic"] is True
     assert isinstance(tiny.get("task_schedule"), list) and len(tiny["task_schedule"]) >= 1

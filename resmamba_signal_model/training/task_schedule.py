@@ -44,7 +44,10 @@ def expand_task_schedule_with_joint(
     sessions: list[dict[str, Any]],
     train_cfg: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """在每个单任务会话后插入联合训练段（``task_joint_epochs``）。"""
+    """在单任务会话后插入联合训练段（``task_joint_epochs``）。
+
+    仅当已完成任务数 >= 2 时插入；单任务 joint 与 solo 等价，跳过。
+    """
     joint_epochs = int(train_cfg.get("task_joint_epochs", 0) or 0)
     if joint_epochs <= 0 or not sessions:
         return [dict(item) for item in sessions]
@@ -58,7 +61,7 @@ def expand_task_schedule_with_joint(
             name = str(task).strip()
             if name and name not in completed:
                 completed.append(name)
-        if completed:
+        if len(completed) >= 2:
             out.append(
                 {
                     "name": f"joint_{'+'.join(completed)}",

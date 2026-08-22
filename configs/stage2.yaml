@@ -81,15 +81,15 @@ task_schedule:
   - task: modulation
     epochs: 20
   - task: emitter
-    epochs: 30
+    epochs: 15
   - task: clustering
-    epochs: 10
+    epochs: 5
   - task: prediction
-    epochs: 10
+    epochs: 5
   - task: imputation
-    epochs: 10
-# 每个单任务段结束后联合训练已完成任务（train+val 多源混训，不走 replay）
-task_joint_epochs: 2
+    epochs: 5
+# 单任务段结束后联合训练已完成任务（仅当已完成任务>=2；train+val 多源混训，不走 replay）
+task_joint_epochs: 1
 # 增加任务示例：
 # - name: sonar
 #   kind: classification
