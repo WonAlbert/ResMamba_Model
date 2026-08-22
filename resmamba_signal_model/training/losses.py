@@ -775,6 +775,7 @@ def downstream_task_loss(
     distill_temperature: float = 2.0,
     distill_confidence: float = 0.5,
     prototype_anchor_weight: float = 0.0,
+    uti_replay_weight: float = 0.0,
     z_probe_weight: float = 1.0,
     cluster_utilization_weight: float = 0.02,
     cluster_consistency_weight: float = 1.0,
@@ -925,4 +926,11 @@ def downstream_task_loss(
         )
         parts["prototype_anchor"] = anchor
         loss = loss + float(prototype_anchor_weight) * anchor
+    if uti_replay_weight > 0 and outputs.get("replay_uti"):
+        student_pooled = _first_present(outputs, "task_pooled", "uti_pooled")
+        teacher_pooled = outputs.get("teacher_pooled")
+        if student_pooled is not None and teacher_pooled is not None:
+            replay = uti_readout_consistency_loss(student_pooled, teacher_pooled)
+            parts["uti_replay"] = replay
+            loss = loss + float(uti_replay_weight) * replay
     return loss, parts

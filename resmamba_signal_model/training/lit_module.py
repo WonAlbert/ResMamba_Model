@@ -318,7 +318,11 @@ class SignalLitModule(_Base):
         return module
 
     def refresh_continual_teacher(self) -> None:
-        if float(self.train_cfg.get("distill_weight", 0.0) or 0.0) <= 0:
+        need = (
+            float(self.train_cfg.get("distill_weight", 0.0) or 0.0) > 0
+            or float(self.train_cfg.get("uti_replay_weight", 0.0) or 0.0) > 0
+        )
+        if not need:
             return
         from resmamba_signal_model.models.ema import EMATeacher
 
@@ -424,14 +428,21 @@ class SignalLitModule(_Base):
     def _active_source_allowlist(self) -> set[str] | None:
         """``task_schedule`` / 单任务过滤：返回允许的 source 名；``None`` 表示不限制。"""
         sources = self.train_cfg.get("active_train_sources")
+        allow: set[str] | None = None
         if isinstance(sources, (list, tuple)) and sources:
-            return {str(x) for x in sources}
-        tasks = self.train_cfg.get("active_train_tasks")
-        if isinstance(tasks, (list, tuple)) and tasks:
-            from resmamba_signal_model.training.task_schedule import sources_for_tasks
+            allow = {str(x) for x in sources}
+        else:
+            tasks = self.train_cfg.get("active_train_tasks")
+            if isinstance(tasks, (list, tuple)) and tasks:
+                from resmamba_signal_model.training.task_schedule import sources_for_tasks
 
-            return set(sources_for_tasks(self.train_cfg, [str(t) for t in tasks]))
-        return None
+                allow = set(sources_for_tasks(self.train_cfg, [str(t) for t in tasks]))
+        if self.training:
+            replay = self.train_cfg.get("active_replay_sources")
+            if isinstance(replay, (list, tuple)) and replay:
+                replay_set = {str(x) for x in replay}
+                allow = replay_set if allow is None else allow | replay_set
+        return allow
 
     def _downstream_forward(
         self, batch: Any, *, default_source: str | None = None
@@ -454,6 +465,14 @@ class SignalLitModule(_Base):
         token_mass = None
         # 分任务：每个 source/task 独立算 loss，再按需汇总；单任务时 total 即该任务 loss。
         per_task_totals: dict[str, torch.Tensor] = {}
+        replay_sources = {str(x) for x in (self.train_cfg.get("active_replay_sources") or [])}
+        uti_replay_weight = float(self.train_cfg.get("uti_replay_weight", 0.0) or 0.0)
+        distill_weight = float(self.train_cfg.get("distill_weight", 0.0) or 0.0)
+        need_teacher = (
+            self.training
+            and self.distill_teacher is not None
+            and (distill_weight > 0 or uti_replay_weight > 0)
+        )
         for name, sub in sources.items():
             task = self._task_for_source(name, sub)
             if hasattr(self.model, "set_active_task"):
@@ -475,14 +494,21 @@ class SignalLitModule(_Base):
                     outputs["cluster_embedding_view2"] = view_out["cluster_embedding"]
                 if view_out.get("cluster_logits") is not None:
                     outputs["cluster_logits_view2"] = view_out["cluster_logits"]
-            if self.training and self.distill_teacher is not None and float(self.train_cfg.get("distill_weight", 0.0) or 0.0) > 0:
+            is_replay = self.training and str(name) in replay_sources
+            if need_teacher:
                 with torch.no_grad():
                     t_out = self.distill_teacher.model(sub, mode="task", task=task)
-                teacher_logits = _first_present(
-                    t_out, "task_logits", "cluster_logits", "modulation_logits", "emitter_logits"
-                )
-                if teacher_logits is not None:
-                    outputs["teacher_logits"] = teacher_logits.detach()
+                if distill_weight > 0:
+                    teacher_logits = _first_present(
+                        t_out, "task_logits", "cluster_logits", "modulation_logits", "emitter_logits"
+                    )
+                    if teacher_logits is not None:
+                        outputs["teacher_logits"] = teacher_logits.detach()
+                if is_replay and uti_replay_weight > 0:
+                    teacher_pooled = t_out.get("task_pooled", t_out.get("uti_pooled"))
+                    if teacher_pooled is not None:
+                        outputs["teacher_pooled"] = teacher_pooled.detach()
+                        outputs["replay_uti"] = True
             registry = getattr(self.model, "prototype_registry", None)
             embed = outputs.get("task_pooled", outputs.get("cluster_embedding"))
             assign = outputs.get("cluster_probs")
@@ -520,10 +546,11 @@ class SignalLitModule(_Base):
                 task_catalog=self.train_cfg,
                 label_field=label_field,
                 supervised_clustering=supervised,
-                distill_weight=float(self.train_cfg.get("distill_weight", 0.0)),
+                distill_weight=distill_weight,
                 distill_temperature=float(self.train_cfg.get("distill_temperature", 2.0)),
                 distill_confidence=float(self.train_cfg.get("distill_confidence", 0.5)),
                 prototype_anchor_weight=float(self.train_cfg.get("prototype_anchor_weight", 0.0)),
+                uti_replay_weight=uti_replay_weight,
                 z_probe_weight=float(self.train_cfg.get("z_probe_weight", 1.0)),
                 cluster_utilization_weight=float(self.train_cfg.get("cluster_utilization_weight", 0.02)),
                 cluster_consistency_weight=float(self.train_cfg.get("cluster_consistency_weight", 1.0)),

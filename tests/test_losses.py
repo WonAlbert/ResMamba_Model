@@ -90,6 +90,24 @@ def test_prediction_mae_loss_scaled_to_ce_magnitude() -> None:
     assert abs(float(loss2) - float(raw) * PREDICTION_MAE_LOSS_SCALE) < 1e-5
 
 
+def test_uti_replay_loss_aligns_pooled_features() -> None:
+    student = torch.randn(4, 16)
+    teacher = student + 0.25
+    outputs = {
+        "z": student,
+        "task_pooled": student,
+        "teacher_pooled": teacher,
+        "replay_uti": True,
+        "task_logits": torch.randn(4, 3),
+    }
+    batch = {"mod_label_id": torch.tensor([0, 1, 2, 0])}
+    loss_off, parts_off = downstream_task_loss(outputs, batch, "modulation", uti_replay_weight=0.0)
+    loss_on, parts_on = downstream_task_loss(outputs, batch, "modulation", uti_replay_weight=0.5)
+    assert "uti_replay" not in parts_off
+    assert float(parts_on["uti_replay"]) > 0.0
+    assert float(loss_on) > float(loss_off)
+
+
 def test_prediction_uses_suffix_mask_when_mae_mask_empty() -> None:
     pred = torch.zeros(2, 4, 2, 4)
     target = torch.ones_like(pred)

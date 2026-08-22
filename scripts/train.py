@@ -431,10 +431,12 @@ def main() -> None:
     if task_sessions:
         data.set_active_train_filter(train_cfg.get("active_train_sources"))
         logger.info(
-            "task_schedule sessions=%s total_epochs=%s first_tasks=%s",
+            "task_schedule sessions=%s total_epochs=%s first_tasks=%s replay_mix_ratio=%s uti_replay_weight=%s",
             len(task_sessions),
             train_cfg.get("epochs"),
             train_cfg.get("active_train_tasks"),
+            train_cfg.get("replay_mix_ratio"),
+            train_cfg.get("uti_replay_weight"),
         )
         print(
             f"task_schedule sessions={len(task_sessions)} epochs={train_cfg.get('epochs')} "

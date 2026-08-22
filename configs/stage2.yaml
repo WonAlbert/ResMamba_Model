@@ -36,7 +36,12 @@ lr_min_ratio: 0.1
 token_normalized_loss: true
 clustering_view2: true
 distill_weight: 0.0
+distill_temperature: 2.0
+distill_confidence: 0.5
 prototype_anchor_weight: 0.0
+# 顺序训防遗忘：后序阶段混入前序任务样本 + UTI pooled 特征蒸馏（会话切换时刷新 teacher）
+replay_mix_ratio: 0.15
+uti_replay_weight: 0.25
 absorb_unknown: false
 lambda_recon: 0.0
 modulation_contrastive_weight: 0.05

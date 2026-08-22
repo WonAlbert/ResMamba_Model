@@ -66,6 +66,29 @@ def schedule_session_for_epoch(
     return last
 
 
+def replay_tasks_for_epoch(
+    sessions: list[dict[str, Any]],
+    epoch: int,
+    *,
+    default_epochs: int = 1,
+) -> list[str]:
+    """返回 ``epoch`` 所在会话之前已完成会话的任务名（保序去重）。"""
+    if not sessions:
+        return []
+    cursor = 0
+    completed: list[str] = []
+    for session in sessions:
+        span = max(1, int(session.get("epochs", default_epochs) or default_epochs))
+        if int(epoch) < cursor + span:
+            break
+        for task in session.get("tasks") or []:
+            name = str(task).strip()
+            if name and name not in completed:
+                completed.append(name)
+        cursor += span
+    return completed
+
+
 def sources_for_tasks(train_cfg: dict[str, Any], tasks: list[str]) -> list[str]:
     catalog = resolve_task_catalog(train_cfg)
     sources: list[str] = []
@@ -105,33 +128,47 @@ class TaskScheduleCallback(Callback):
         self._last_key: tuple[str, ...] | None = None
 
     def _apply(self, pl_module: Any, trainer: Any, *, epoch: int) -> None:
-        del pl_module
         session = schedule_session_for_epoch(self.sessions, int(epoch))
         if session is None:
             return
         tasks = [str(t) for t in session.get("tasks") or []]
         sources = sources_for_tasks(self.train_cfg, tasks)
         key = tuple(tasks)
+        replay_ratio = float(self.train_cfg.get("replay_mix_ratio", 0.0) or 0.0)
+        replay_tasks = replay_tasks_for_epoch(self.sessions, int(epoch))
+        replay_sources = sources_for_tasks(self.train_cfg, replay_tasks) if replay_ratio > 0 and replay_tasks else []
         self.train_cfg["active_train_tasks"] = list(tasks)
         self.train_cfg["active_train_sources"] = list(sources)
+        self.train_cfg["active_replay_tasks"] = list(replay_tasks)
+        self.train_cfg["active_replay_sources"] = list(replay_sources)
         dm = getattr(trainer, "datamodule", None)
         if dm is not None and hasattr(dm, "set_active_train_filter"):
-            dm.set_active_train_filter(sources)
+            dm.set_active_train_filter(sources, replay_sources=replay_sources or None)
         if key != self._last_key:
             import logging
 
             logging.getLogger("resmamba").info(
-                "task_schedule epoch=%s session=%s tasks=%s sources=%s (train+val)",
+                "task_schedule epoch=%s session=%s tasks=%s sources=%s replay=%s (train+val)",
                 epoch,
                 session.get("name"),
                 tasks,
                 sources,
+                replay_sources,
             )
             print(
                 f"task_schedule epoch={epoch} session={session.get('name')} "
-                f"tasks={tasks} sources={sources} (train+val)",
+                f"tasks={tasks} sources={sources} replay={replay_sources} (train+val)",
                 flush=True,
             )
+            if (
+                self._last_key is not None
+                and replay_ratio > 0
+                and replay_sources
+                and pl_module is not None
+            ):
+                refresh = getattr(pl_module, "refresh_continual_teacher", None)
+                if callable(refresh):
+                    refresh()
             self._last_key = key
 
     def setup(self, trainer: Any, pl_module: Any, stage: str | None = None) -> None:

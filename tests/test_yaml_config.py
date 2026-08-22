@@ -72,6 +72,8 @@ def test_stage_yaml_profiles() -> None:
     assert s2["amp_dtype"] == "bfloat16"
     assert s2["balanced_sampling"] is False
     assert isinstance(s2.get("task_schedule"), list) and len(s2["task_schedule"]) >= 2
+    assert s2.get("replay_mix_ratio", 0.0) > 0.0
+    assert s2.get("uti_replay_weight", 0.0) > 0.0
     tiny = load_yaml_config("configs/stage2.yaml", profile="tiny")
     assert tiny["synthetic"] is True
     assert isinstance(tiny.get("task_schedule"), list) and len(tiny["task_schedule"]) >= 1

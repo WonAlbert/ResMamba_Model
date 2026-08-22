@@ -598,17 +598,23 @@ class SignalDataModule(LightningDataModule):
         self._val_batch_plan: dict[str, list[list[int]]] = {}
         self._cached_val_loader = None
         self._active_train_sources: list[str] | None = None
+        self._active_replay_sources: list[str] | None = None
 
     @property
     def val_source_names(self) -> list[str]:
         return list(self._filtered_val_sets()) or list(self.source_names)
 
-    def set_active_train_filter(self, sources: list[str] | None) -> None:
+    def set_active_train_filter(
+        self,
+        sources: list[str] | None,
+        *,
+        replay_sources: list[str] | None = None,
+    ) -> None:
         """限制本轮 train/val dataloader 只用这些源；``None`` 表示全部。
 
-        单任务 / ``task_schedule`` 阶段：训练与验证都只跑当前任务，避免无关任务稀释指标。
+        单任务 / ``task_schedule`` 阶段：验证只跑当前任务；训练可额外混入 ``replay_sources``。
         """
-        prev = tuple(self._active_train_sources or ())
+        prev = (tuple(self._active_train_sources or ()), tuple(self._active_replay_sources or ()))
         if sources is None:
             self._active_train_sources = None
         else:
@@ -617,13 +623,26 @@ class SignalDataModule(LightningDataModule):
             if not allowed and pool:
                 raise ValueError(f"active_train_sources={sources!r} 与已加载源 {sorted(pool)} 无交集")
             self._active_train_sources = allowed
-        if tuple(self._active_train_sources or ()) != prev:
+        if replay_sources is None:
+            self._active_replay_sources = None
+        else:
+            pool = set(self._train_sets)
+            replay = [str(name) for name in replay_sources if str(name) in pool]
+            self._active_replay_sources = replay or None
+        if (tuple(self._active_train_sources or ()), tuple(self._active_replay_sources or ())) != prev:
             self._cached_val_loader = None
 
     def _filtered_train_sets(self) -> dict[str, Dataset]:
         if not self._active_train_sources:
             return dict(self._train_sets)
-        return {name: self._train_sets[name] for name in self._active_train_sources if name in self._train_sets}
+        out: dict[str, Dataset] = {
+            name: self._train_sets[name] for name in self._active_train_sources if name in self._train_sets
+        }
+        if self._active_replay_sources:
+            for name in self._active_replay_sources:
+                if name in self._train_sets and name not in out:
+                    out[name] = self._train_sets[name]
+        return out
 
     def _filtered_val_sets(self) -> dict[str, Dataset]:
         if not self._active_train_sources:
@@ -640,9 +659,30 @@ class SignalDataModule(LightningDataModule):
             rank = int(getattr(trainer, "global_rank", 0) or 0)
         return int(base) + 1_000_003 * epoch + 97 * rank + int(source_index)
 
+    @staticmethod
+    def _split_token_budget(names: list[str], budget: int) -> dict[str, int]:
+        if not names:
+            return {}
+        n = len(names)
+        base = max(1, int(budget) // n)
+        rem = max(0, int(budget) - base * n)
+        return {name: base + (1 if i < rem else 0) for i, name in enumerate(names)}
+
     def _token_shares(self, names: list[str], *, train: bool) -> dict[str, int]:
         if not train:
             return {name: self.token_budget for name in names}
+        replay_ratio = float(self.train_cfg.get("replay_mix_ratio", 0.0) or 0.0)
+        replay_set = set(self._active_replay_sources or [])
+        if replay_ratio > 0 and replay_set:
+            current = [name for name in names if name not in replay_set]
+            replay = [name for name in names if name in replay_set]
+            if current and replay:
+                replay_budget = max(1, int(round(self.token_budget * replay_ratio)))
+                current_budget = max(1, self.token_budget - replay_budget)
+                return {
+                    **self._split_token_budget(current, current_budget),
+                    **self._split_token_budget(replay, replay_budget),
+                }
         strategy = resolve_mix_strategy(self.train_cfg.get("mix_strategy"))
         if strategy == "equal" or self.mix is None:
             n = max(1, len(names))
