@@ -39,8 +39,16 @@ distill_weight: 0.0
 distill_temperature: 2.0
 distill_confidence: 0.5
 prototype_anchor_weight: 0.0
-# 顺序训防遗忘：后序阶段混入前序任务样本 + UTI pooled 特征蒸馏（会话切换时刷新 teacher）
+# 顺序训防遗忘：后序阶段混入前序任务 exemplar + UTI pooled 特征蒸馏
+replay_strategy: class_center
 replay_mix_ratio: 0.15
+# 单任务基线：每类 exemplar 数；总库容 = replay_samples_per_class * replay_baseline_classes_per_task
+replay_samples_per_class: 20
+replay_baseline_classes_per_task: 11
+# 0=按上式自动；>0 则固定总 exemplar 上限，随 replay 任务数增加而减少每类样本
+replay_memory_total_exemplars: 0
+replay_scan_max_samples: 4096
+replay_scan_token_budget: 2048
 uti_replay_weight: 0.25
 absorb_unknown: false
 lambda_recon: 0.0

@@ -169,6 +169,17 @@ class TaskScheduleCallback(Callback):
                 refresh = getattr(pl_module, "refresh_continual_teacher", None)
                 if callable(refresh):
                     refresh()
+                build = getattr(pl_module, "build_class_center_replay_memory", None)
+                if callable(build) and replay_tasks:
+                    counts = build(list(replay_tasks), datamodule=getattr(trainer, "datamodule", None))
+                    if counts:
+                        import logging
+
+                        logging.getLogger("resmamba").info(
+                            "replay class_center memory=%s tasks=%s",
+                            counts,
+                            replay_tasks,
+                        )
             self._last_key = key
 
     def setup(self, trainer: Any, pl_module: Any, stage: str | None = None) -> None:

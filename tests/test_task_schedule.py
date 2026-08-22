@@ -175,6 +175,11 @@ def test_schedule_callback_sets_replay_and_refreshes_teacher() -> None:
         pl_module.refreshed = True
 
     pl_module.refresh_continual_teacher = _refresh
+    pl_module.build_class_center_replay_memory = lambda tasks, datamodule=None: (
+        datamodule.update_replay_memory({"classification": [0, 1, 2]}) or {"classification": 3}
+        if tasks == ["modulation"]
+        else {}
+    )
     cb.on_fit_start(trainer, pl_module)
     assert cfg["active_train_sources"] == ["classification"]
     assert cfg["active_replay_sources"] == []
@@ -193,6 +198,15 @@ def test_schedule_callback_sets_replay_and_refreshes_teacher() -> None:
     assert set(dm._filtered_train_sets()) == {"emitter", "classification"}
     assert list(dm._filtered_val_sets()) == ["emitter"]
     assert pl_module.refreshed is True
+    assert dm._replay_memory.get("classification") == [0, 1, 2]
+    dataset, _ = dm._train_dataset_and_lengths(
+        "classification",
+        dm._train_sets["classification"],
+        train=True,
+    )
+    from torch.utils.data import Subset
+
+    assert isinstance(dataset, Subset)
     _ = dm.train_dataloader()  # reload 后应能按新 filter 建 loader
 
 

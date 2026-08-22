@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.utils.data import DataLoader, Dataset, Sampler, Subset
 
 from resmamba_signal_model.data.contracts import CAPTURE_METADATA_KEYS, MISSING_METADATA
 from resmamba_signal_model.data.rfdata import (
@@ -599,6 +599,7 @@ class SignalDataModule(LightningDataModule):
         self._cached_val_loader = None
         self._active_train_sources: list[str] | None = None
         self._active_replay_sources: list[str] | None = None
+        self._replay_memory: dict[str, list[int]] = {}
 
     @property
     def val_source_names(self) -> list[str]:
@@ -631,6 +632,42 @@ class SignalDataModule(LightningDataModule):
             self._active_replay_sources = replay or None
         if (tuple(self._active_train_sources or ()), tuple(self._active_replay_sources or ())) != prev:
             self._cached_val_loader = None
+
+    def set_replay_memory(self, source: str, indices: list[int] | None) -> None:
+        key = str(source)
+        if indices:
+            self._replay_memory[key] = [int(i) for i in indices]
+        elif key in self._replay_memory:
+            del self._replay_memory[key]
+
+    def update_replay_memory(self, memory: dict[str, list[int]] | None) -> None:
+        """批量更新 exemplar 索引；仅影响 replay 源训练采样。"""
+        for source, indices in dict(memory or {}).items():
+            self.set_replay_memory(source, list(indices))
+
+    def _train_dataset_and_lengths(
+        self,
+        name: str,
+        dataset: Dataset,
+        *,
+        train: bool,
+    ) -> tuple[Dataset, list[int]]:
+        lengths = list(self._train_lengths[name])
+        if not train:
+            return dataset, lengths
+        from resmamba_signal_model.training.replay_memory import resolve_replay_strategy
+
+        if resolve_replay_strategy(self.train_cfg) != "class_center":
+            return dataset, lengths
+        replay_set = set(self._active_replay_sources or [])
+        if str(name) not in replay_set:
+            return dataset, lengths
+        mem = self._replay_memory.get(str(name))
+        if not mem:
+            return dataset, lengths
+        base = self._train_sets.get(str(name), dataset)
+        subset = Subset(base, mem)
+        return subset, [lengths[int(i)] for i in mem]
 
     def _filtered_train_sets(self) -> dict[str, Dataset]:
         if not self._active_train_sources:
@@ -827,7 +864,7 @@ class SignalDataModule(LightningDataModule):
         loaders: dict[str, DataLoader] = {}
         for source_index, (name, dataset) in enumerate(sets.items()):
             if train:
-                lengths = self._train_lengths[name]
+                dataset, lengths = self._train_dataset_and_lengths(name, dataset, train=True)
                 num_batches = self.steps_per_epoch
                 workers = self.num_workers
                 plan = None

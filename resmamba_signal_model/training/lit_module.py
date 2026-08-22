@@ -321,6 +321,7 @@ class SignalLitModule(_Base):
         need = (
             float(self.train_cfg.get("distill_weight", 0.0) or 0.0) > 0
             or float(self.train_cfg.get("uti_replay_weight", 0.0) or 0.0) > 0
+            or str(self.train_cfg.get("replay_strategy", "class_center")).lower() in ("class_center", "center", "exemplar", "icarl")
         )
         if not need:
             return
@@ -334,6 +335,43 @@ class SignalLitModule(_Base):
             self._frozen_prototypes = {
                 str(name): bank.mean.detach().clone() for name, bank in registry.banks.items()
             }
+
+    def build_class_center_replay_memory(
+        self,
+        replay_tasks: list[str],
+        *,
+        datamodule: Any | None = None,
+    ) -> dict[str, int]:
+        """会话切换后为前序任务构建最近类中心 exemplar replay 索引。"""
+        from resmamba_signal_model.training.replay_memory import (
+            build_replay_memories_for_tasks,
+            resolve_replay_strategy,
+        )
+
+        if resolve_replay_strategy(self.train_cfg) != "class_center" or not replay_tasks:
+            return {}
+        if self.distill_teacher is None:
+            self.refresh_continual_teacher()
+        teacher = self.distill_teacher
+        if teacher is None:
+            return {}
+        dm = datamodule
+        if dm is None:
+            trainer = getattr(self, "trainer", None)
+            dm = getattr(trainer, "datamodule", None) if trainer is not None else None
+        if dm is None:
+            return {}
+        memory = build_replay_memories_for_tasks(
+            teacher.model,
+            dm,
+            replay_tasks,
+            train_cfg=self.train_cfg,
+            catalog=self.catalog,
+            device=getattr(self, "device", None) or next(self.model.parameters()).device,
+        )
+        if hasattr(dm, "update_replay_memory"):
+            dm.update_replay_memory(memory)
+        return {str(k): len(v) for k, v in memory.items()}
 
     def _ema_enabled(self) -> bool:
         explicit = self.train_cfg.get("ema_teacher")
