@@ -152,7 +152,32 @@ def _unfreeze_dt_bias(model: nn.Module) -> None:
 
 
 def iter_head_param_prefixes() -> tuple[str, ...]:
-    return tuple(HEAD_MODULE_NAMES.values()) + ("extra_task_heads", "recognition_heads", "prototype_registry")
+    return tuple(HEAD_MODULE_NAMES.values()) + (
+        "extra_task_heads",
+        "recognition_heads",
+        "prototype_registry",
+        "emitter_fingerprint",
+    )
+
+
+def specialist_state_prefixes(task: str) -> tuple[str, ...]:
+    """阶段三专家 ckpt 要带回的模块前缀（含 emitter 指纹支路）。"""
+    head = HEAD_MODULE_NAMES.get(task, f"{task}_head")
+    prefixes = (f"{head}.", f"extra_task_heads.{task}.", f"task_adapters.{task}.")
+    if task == "emitter":
+        prefixes = prefixes + ("emitter_fingerprint.",)
+    return prefixes
+
+
+def filter_specialist_state(state: dict[str, Any], task: str) -> dict[str, Any]:
+    prefixes = specialist_state_prefixes(task)
+    filtered: dict[str, Any] = {}
+    for key, value in state.items():
+        if f"lora_A.{task}" in key or f"lora_B.{task}" in key:
+            filtered[key] = value
+        elif any(key.startswith(prefix) for prefix in prefixes):
+            filtered[key] = value
+    return filtered
 
 
 def default_stage3_tasks(train_cfg: dict[str, Any] | None = None) -> tuple[str, ...]:

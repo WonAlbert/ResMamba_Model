@@ -17,6 +17,7 @@ from resmamba_signal_model.models.heads import EmitterHead
 from resmamba_signal_model.models.model import SignalFoundationModel, SignalModelConfig
 from resmamba_signal_model.models.revin import RevIN
 from resmamba_signal_model.models.task_interface import TaskFeatures
+from resmamba_signal_model.training.freeze import filter_specialist_state
 
 
 def test_raw_emitter_stats_use_unnormalized_moments() -> None:
@@ -101,3 +102,26 @@ def test_fingerprint_branch_shapes() -> None:
     assert torch.isfinite(out).all()
     # 样本间可分
     assert float((out - out.mean(dim=0)).detach().norm(dim=-1).mean()) > 1e-4
+
+
+def test_filter_specialist_state_keeps_emitter_fingerprint() -> None:
+    state = {
+        "emitter_fingerprint.conv.0.weight": torch.ones(1),
+        "emitter_head.classifier.weight": torch.ones(1),
+        "task_adapters.emitter.down.weight": torch.ones(1),
+        "lora_A.emitter.weight": torch.ones(1),
+        "modulation_head.classifier.weight": torch.ones(1),
+        "encoder.mamba_layers.0.fwd.in_proj.weight": torch.ones(1),
+        "emitter_fingerprint_channels": torch.ones(1),
+    }
+    filtered = filter_specialist_state(state, "emitter")
+    assert "emitter_fingerprint.conv.0.weight" in filtered
+    assert "emitter_head.classifier.weight" in filtered
+    assert "task_adapters.emitter.down.weight" in filtered
+    assert "lora_A.emitter.weight" in filtered
+    assert "modulation_head.classifier.weight" not in filtered
+    assert "encoder.mamba_layers.0.fwd.in_proj.weight" not in filtered
+    assert "emitter_fingerprint_channels" not in filtered
+    mod_only = filter_specialist_state(state, "modulation")
+    assert "emitter_fingerprint.conv.0.weight" not in mod_only
+    assert "modulation_head.classifier.weight" in mod_only

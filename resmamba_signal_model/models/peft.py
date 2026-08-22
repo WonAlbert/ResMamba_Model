@@ -27,6 +27,7 @@ PEFT_STATE_MARKERS: tuple[str, ...] = (
     "imputation_head.",
     "recognition_heads.",
     "extra_task_heads.",
+    "emitter_fingerprint.",
 )
 
 
@@ -235,7 +236,7 @@ def inject_hybrid_lora(
 
 
 def peft_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
-    """只持久化 LoRA / 适配器 / 头 / UTI / tokenizer 尾部。"""
+    """只持久化 LoRA / 适配器 / 头 / UTI / 指纹支路 / tokenizer 尾部。"""
     out: dict[str, torch.Tensor] = {}
     for name, tensor in model.state_dict().items():
         if any(marker in name or name.startswith(marker.rstrip(".")) for marker in PEFT_STATE_MARKERS):

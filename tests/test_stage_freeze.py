@@ -10,7 +10,8 @@ sys.path.insert(0, str(ROOT))
 
 from resmamba_signal_model.models.model import SignalFoundationModel, SignalModelConfig
 from resmamba_signal_model.models.peft import PeftConfig, inject_hybrid_lora
-from resmamba_signal_model.training.freeze import apply_stage_freeze
+from resmamba_signal_model.training.freeze import apply_stage_freeze, iter_head_param_prefixes
+from resmamba_signal_model.training.lit_module import SignalLitModule
 
 
 def _tiny(**kwargs) -> SignalFoundationModel:
@@ -84,7 +85,61 @@ def test_stage3_only_current_task() -> None:
     assert not any(n.startswith("task_adapters.emitter.") for n in names)
     assert any(n.startswith("modulation_head.") for n in names)
     assert not any(n.startswith("emitter_head.") for n in names)
+    assert not any(n.startswith("emitter_fingerprint.") for n in names)
     assert not any(n.startswith("task_interface.") for n in names)
+
+
+def test_stage3_emitter_trains_fingerprint_and_head() -> None:
+    model = _tiny()
+    inject_hybrid_lora(
+        model,
+        ["modulation", "emitter"],
+        PeftConfig(r_attn=2, r_mamba=2, lora_alpha_attn=2, lora_alpha_mamba=2),
+    )
+    apply_stage_freeze(model, "stage3", task="emitter", train_cfg={})
+    names = _trainable_names(model)
+    assert any("lora_A.emitter" in n or "lora_B.emitter" in n for n in names)
+    assert not any("lora_A.modulation" in n or "lora_B.modulation" in n for n in names)
+    assert any(n.startswith("task_adapters.emitter.") for n in names)
+    assert any(n.startswith("emitter_head.") for n in names)
+    assert any(n.startswith("emitter_fingerprint.") for n in names)
+    assert not any(n.startswith("modulation_head.") for n in names)
+    assert not any(n.startswith("encoder.") and "lora_" not in n for n in names)
+    model.train()
+    out = model(
+        {"iq": torch.randn(2, 2, 32), "sample_mask": torch.ones(2, 32, dtype=torch.bool)},
+        mode="task",
+        task="emitter",
+    )
+    assert "emitter_fingerprint" in out
+    assert out["emitter_fingerprint"].shape == (2, model.cfg.d_model)
+    assert out["emitter_fingerprint"].requires_grad
+    assert "emitter_logits" in out
+    out["emitter_logits"].sum().backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.emitter_fingerprint.parameters())
+
+
+def test_stage3_emitter_fingerprint_uses_heads_lr() -> None:
+    assert "emitter_fingerprint" in iter_head_param_prefixes()
+    model = _tiny()
+    inject_hybrid_lora(
+        model,
+        ["modulation", "emitter"],
+        PeftConfig(r_attn=2, r_mamba=2, lora_alpha_attn=2, lora_alpha_mamba=2),
+    )
+    apply_stage_freeze(model, "stage3", task="emitter", train_cfg={})
+    lit = SignalLitModule(
+        model,
+        {"learning_rate": 2.0e-4, "heads_lr": 5.0e-5, "loraplus_lr_ratio": 16},
+        stage="stage3",
+    )
+    groups = {g["name"]: g for g in lit._optimizer_param_groups(2.0e-4) if "name" in g}
+    assert "heads" in groups
+    fp_ids = {id(p) for p in model.emitter_fingerprint.parameters() if p.requires_grad}
+    head_ids = {id(p) for p in groups["heads"]["params"]}
+    assert fp_ids
+    assert fp_ids <= head_ids
+    assert groups["heads"]["lr"] == 5.0e-5
 
 
 def test_joint_unfreezes_tokenizer_last_not_stem() -> None:
@@ -101,6 +156,7 @@ def test_joint_unfreezes_tokenizer_last_not_stem() -> None:
     assert not any(n.startswith("tokenizer.stem") for n in names)
     assert not any(n.startswith("tokenizer.time_branches") for n in names)
     assert any(n.startswith("shared_adapter.") for n in names)
+    assert any(n.startswith("emitter_fingerprint.") for n in names)
     assert any("lora_A.shared" in n or "lora_B.shared" in n for n in names)
     assert any(n.startswith("encoder.") is False or "lora_" in n for n in names)
     assert not any(n.startswith("encoder.") and "lora_" not in n for n in names)

@@ -48,6 +48,7 @@ def test_classify_whitelist() -> None:
     assert classify_lora_target("encoder.mamba_layers.0.fwd.A_log") is None
     assert classify_lora_target("tokenizer.freq_proj") is None
     assert classify_lora_target("decoder.repr_head.attn.out_proj") is None
+    assert classify_lora_target("emitter_fingerprint.stat_mlp.1") is None
 
 
 def test_inject_wraps_projections_and_freezes_w0() -> None:
@@ -80,6 +81,7 @@ def test_active_task_delta_and_shared() -> None:
     assert not torch.allclose(y0, y1)
     peft = peft_state_dict(_tiny_model())
     assert any("task_interface" in k or "modulation_head" in k for k in peft)
+    assert any(k.startswith("emitter_fingerprint.") for k in peft)
 
 
 def test_save_best_bundle(tmp_path: Path) -> None:

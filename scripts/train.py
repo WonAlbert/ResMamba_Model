@@ -43,7 +43,7 @@ from resmamba_signal_model.data.rfdata import format_iq_ram_cache
 from resmamba_signal_model.training.data_module import SignalDataModule
 from resmamba_signal_model.training.early_stopping import make_early_stopping_callback
 from resmamba_signal_model.training.emitter_labels import load_emitter_namespace_num_emitters
-from resmamba_signal_model.training.freeze import HEAD_MODULE_NAMES, apply_stage_freeze
+from resmamba_signal_model.training.freeze import apply_stage_freeze, filter_specialist_state
 from resmamba_signal_model.training.lit_module import SignalLitModule
 from resmamba_signal_model.training.logging_utils import link_autodl_tensorboard, setup_run_file_logger, silence_third_party_warnings
 from resmamba_signal_model.training.param_stats import format_param_stats
@@ -116,15 +116,7 @@ def resolve_specialist_ckpt(path: Path, root: Path) -> Path:
 def load_specialist_weights(model: SignalFoundationModel, ckpt_path: Path, task: str) -> None:
     blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     state = remap_task_head_checkpoints(extract_model_state_dict(blob))
-    prefixes = [HEAD_MODULE_NAMES.get(task, f"{task}_head") + ".", f"extra_task_heads.{task}."]
-    filtered: dict[str, Any] = {}
-    for key, value in state.items():
-        if f"lora_A.{task}" in key or f"lora_B.{task}" in key:
-            filtered[key] = value
-        elif key.startswith(f"task_adapters.{task}."):
-            filtered[key] = value
-        elif any(key.startswith(prefix) for prefix in prefixes):
-            filtered[key] = value
+    filtered = filter_specialist_state(state, task)
     if filtered:
         model.load_state_dict(filtered, strict=False)
 
@@ -175,6 +167,8 @@ _MODEL_OVERLAY_KEYS = (
     "share_bidirectional_weights",
     "phase_plugin",
     "legacy_decoder_reconstruction",
+    "emitter_fingerprint",
+    "emitter_fingerprint_channels",
 )
 
 

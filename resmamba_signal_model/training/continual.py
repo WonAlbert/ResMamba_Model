@@ -90,6 +90,10 @@ def apply_continual_freeze(model: nn.Module) -> None:
     for head in heads:
         for param in head.parameters():
             param.requires_grad = True
+    fingerprint = getattr(model, "emitter_fingerprint", None)
+    if isinstance(fingerprint, nn.Module):
+        for param in fingerprint.parameters():
+            param.requires_grad = True
 
 
 def continual_parameter_budget(model: nn.Module) -> dict[str, Any]:
