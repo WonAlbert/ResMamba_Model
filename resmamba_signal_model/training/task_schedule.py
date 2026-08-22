@@ -99,6 +99,36 @@ def schedule_session_for_epoch(
     return last
 
 
+def slice_task_schedule_from(
+    sessions: list[dict[str, Any]],
+    start_task: str,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """从 ``start_task`` 起截断 schedule，并返回此前已完成任务（供 replay）。"""
+    key = str(start_task).strip()
+    if not key:
+        raise ValueError("start_task 不能为空")
+    completed: list[str] = []
+    sliced: list[dict[str, Any]] = []
+    found = False
+    for session in sessions:
+        names = [str(t).strip() for t in session.get("tasks") or [] if str(t).strip()]
+        if not found:
+            if key in names:
+                found = True
+                sliced.append(dict(session))
+            else:
+                for name in names:
+                    if name not in completed:
+                        completed.append(name)
+            continue
+        sliced.append(dict(session))
+    if not found:
+        raise ValueError(f"start_task={key!r} 不在 task_schedule 中")
+    if not sliced:
+        raise ValueError(f"start_task={key!r} 截断后 schedule 为空")
+    return sliced, completed
+
+
 def replay_tasks_for_epoch(
     sessions: list[dict[str, Any]],
     epoch: int,
@@ -173,7 +203,10 @@ class TaskScheduleCallback(Callback):
             replay_tasks: list[str] = []
             replay_sources: list[str] = []
         else:
-            replay_tasks = replay_tasks_for_epoch(self.sessions, int(epoch))
+            replay_tasks = list(self.train_cfg.get("replay_completed_tasks") or [])
+            for name in replay_tasks_for_epoch(self.sessions, int(epoch)):
+                if name not in replay_tasks:
+                    replay_tasks.append(name)
             replay_sources = (
                 sources_for_tasks(self.train_cfg, replay_tasks) if replay_ratio > 0 and replay_tasks else []
             )
@@ -232,6 +265,23 @@ class TaskScheduleCallback(Callback):
 
     def on_fit_start(self, trainer: Any, pl_module: Any) -> None:
         self._apply(pl_module, trainer, epoch=int(getattr(trainer, "current_epoch", 0) or 0))
+        completed = [str(t) for t in (self.train_cfg.get("replay_completed_tasks") or [])]
+        replay_ratio = float(self.train_cfg.get("replay_mix_ratio", 0.0) or 0.0)
+        if completed and replay_ratio > 0 and pl_module is not None:
+            refresh = getattr(pl_module, "refresh_continual_teacher", None)
+            if callable(refresh):
+                refresh()
+            build = getattr(pl_module, "build_class_center_replay_memory", None)
+            if callable(build):
+                counts = build(completed, datamodule=getattr(trainer, "datamodule", None))
+                if counts:
+                    import logging
+
+                    logging.getLogger("resmamba").info(
+                        "replay bootstrap from completed_tasks=%s memory=%s",
+                        completed,
+                        counts,
+                    )
 
     def on_train_epoch_start(self, trainer: Any, pl_module: Any) -> None:
         # 与当前 epoch 对齐（resume / 首轮）；正常跨 epoch 切任务靠 epoch_end 预切。

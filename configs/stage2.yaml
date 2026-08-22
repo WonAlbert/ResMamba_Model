@@ -81,7 +81,7 @@ task_schedule:
   - task: modulation
     epochs: 20
   - task: emitter
-    epochs: 15
+    epochs: 10
   - task: clustering
     epochs: 5
   - task: prediction

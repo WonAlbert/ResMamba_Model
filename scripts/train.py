@@ -266,6 +266,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--task-kind", default=None, help="新任务的 kind：classification|emitter|clustering|prediction|imputation")
     parser.add_argument("--tasks", default=None, help="覆盖任务目录，逗号分隔，如 modulation,emitter,sonar")
+    parser.add_argument(
+        "--start-task",
+        default=None,
+        help="stage2/task_schedule：从该任务段开始训（此前任务写入 replay_completed_tasks）",
+    )
     parser.add_argument("--init-from", default=None, help="只加载权重，不恢复优化器")
     parser.add_argument(
         "--adapter-dir",
@@ -377,9 +382,17 @@ def main() -> None:
         TaskScheduleCallback,
         expand_task_schedule_with_joint,
         resolve_task_schedule,
+        slice_task_schedule_from,
         sources_for_tasks,
         total_schedule_epochs,
     )
+
+    if args.start_task:
+        raw_sessions = resolve_task_schedule(train_cfg)
+        sliced, completed = slice_task_schedule_from(raw_sessions, str(args.start_task))
+        train_cfg["task_schedule"] = sliced
+        if completed:
+            train_cfg["replay_completed_tasks"] = completed
 
     sessions = resolve_continual_sessions(train_cfg, stage=args.stage)
     if args.stage == "continual" or sessions:
@@ -419,7 +432,7 @@ def main() -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "config.yaml").write_text(yaml.safe_dump(train_cfg, sort_keys=False, allow_unicode=True), encoding="utf-8")
     logger = setup_run_file_logger(run_dir)
-    logger.info("stage=%s config=%s task=%s", args.stage, config_path, args.task)
+    logger.info("stage=%s config=%s task=%s start_task=%s", args.stage, config_path, args.task, args.start_task)
     if resume_ckpt is not None:
         logger.info("resume ckpt=%s", resume_ckpt)
         print(f"resume from {resume_ckpt}", flush=True)
