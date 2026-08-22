@@ -7,7 +7,7 @@ excluded:
     - communication_emitters
 
 pretrain:
-  # MAE 预训练：仅使用下列数据集的 *_train.h5
+  # MAE 预训练：各阶段训练数据的并集 → *_train.h5（无标签）
   datasets:
     - electromagnetic_0926
     - open_real_data
@@ -18,10 +18,14 @@ pretrain:
     - radcom_dynamic
     - radcom_ota
     - cjr_mix
+    - rml2016_04c
+    - rml2016_10a
+    - rml2016_10b
+    - wisig
+    - adsb2
 
 downstream_modulation:
-  # 调制识别（非个体识别）下游：*_train.h5 训练，对应 *_val.h5 验证
-  # 阶段二/三暂不用 RML2018（预测/聚类/插补 shared pool 随之去掉）
+  # 调制识别（非个体识别）下游：*_test.h5 训练，*_val.h5 验证
   datasets:
     - rml2016_04c
     - rml2016_10a

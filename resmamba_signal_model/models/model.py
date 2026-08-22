@@ -12,7 +12,6 @@ from resmamba_signal_model.models.adapters import SharedTaskAdapter, TaskAdapter
 from resmamba_signal_model.models.backbone import HybridEncoder
 from resmamba_signal_model.models.decoder import AttentionPooling, SharedDecoder
 from resmamba_signal_model.models.domain import DomainDiscriminator, GradientReversal
-from resmamba_signal_model.models.emitter_fingerprint import EmitterFingerprintBranch
 from resmamba_signal_model.models.heads import (
     EmitterHead,
     ImputationHead,
@@ -21,10 +20,11 @@ from resmamba_signal_model.models.heads import (
     PrototypeClusteringHead,
     RecognitionHeads,
     TASK_HEAD_REGISTRY,
+    apply_emitter_dataset_mask,
     remap_task_head_checkpoints,
     register_task as register_task_head,
 )
-from resmamba_signal_model.models.physics import project_patch_energy, sequence_physics
+from resmamba_signal_model.models.physics import project_patch_energy, restore_absolute_log_power, sequence_physics
 from resmamba_signal_model.models.prototypes import DEVICE_NAMESPACE, CONTENT_NAMESPACE, PrototypeRegistry
 from resmamba_signal_model.models.revin import RevIN, RevINStats, clip_normalized
 from resmamba_signal_model.models.signal_adapter import SignalAdapterRegistry, SignalSpec
@@ -93,6 +93,14 @@ class SignalModelConfig:
     physics_project: bool = True
     revin_std_min: float = 1.0e-2
     revin_clip: float = 8.0
+    revin_scale_mode: str = "joint_energy"
+    revin_winsorize_top_frac: float = 0.01
+    revin_peak_papr_clip: float = 16.0
+    revin_affine: bool = False
+    revin_shared_affine: bool = True
+    mae_mask_probs: dict[str, float] = field(
+        default_factory=lambda: {"random": 1.0 / 3.0, "contiguous": 1.0 / 3.0, "mixed": 1.0 / 3.0}
+    )
     phase_plugin: bool = False
     encode_visible_only: bool = True
     sequence_packing: bool = True
@@ -121,8 +129,6 @@ class SignalModelConfig:
     uti_legacy_mode: bool = False
     use_specialist_views: bool = True
     domain_prompt_size: int = 6
-    emitter_fingerprint: bool = True
-    emitter_fingerprint_channels: int = 64
     adapter_down_dim: int = 64
     num_task_types: int = 8
     build_adapters: bool = False
@@ -165,6 +171,13 @@ class SignalModelConfig:
             payload["grl_invariant_views"] = tuple(str(x) for x in payload["grl_invariant_views"])
         if "chunk_overlap_ratio" in data and "chunk_overlap" not in payload:
             payload["chunk_overlap"] = float(data["chunk_overlap_ratio"])
+        if "mae_mask_probs" in payload:
+            raw_probs = payload["mae_mask_probs"]
+            names = ("random", "contiguous", "mixed")
+            if isinstance(raw_probs, (list, tuple)) and len(raw_probs) == 3:
+                payload["mae_mask_probs"] = {name: float(val) for name, val in zip(names, raw_probs)}
+            elif isinstance(raw_probs, dict):
+                payload["mae_mask_probs"] = {str(k): float(v) for k, v in raw_probs.items()}
         tok = data.get("tokenizer") or {}
         if isinstance(tok, dict):
             tok_names = {item.name for item in fields(TimeFreqTokenizerConfig)}
@@ -182,7 +195,16 @@ class SignalFoundationModel(nn.Module):
         self.cfg = cfg
         heads = int(cfg.attn_num_heads or 8)
         self.input_adapters = SignalAdapterRegistry()
-        self.revin = RevIN(num_channels=2, std_min=float(cfg.revin_std_min), clip=float(cfg.revin_clip))
+        self.revin = RevIN(
+            num_channels=2,
+            std_min=float(cfg.revin_std_min),
+            clip=float(cfg.revin_clip),
+            affine=bool(cfg.revin_affine),
+            scale_mode=str(cfg.revin_scale_mode),
+            winsorize_top_frac=float(cfg.revin_winsorize_top_frac),
+            peak_papr_clip=float(cfg.revin_peak_papr_clip),
+            shared_affine=bool(cfg.revin_shared_affine),
+        )
         self.tokenizer = TimeFreqTokenizer(cfg.tokenizer)
         mamba_kwargs = dict(
             d_state=cfg.mamba_d_state,
@@ -244,7 +266,6 @@ class SignalFoundationModel(nn.Module):
         self._skip_recon = False
         self._active_task: str | None = None
         self._negcos_temperature: float | None = None
-        self.emitter_fingerprint: EmitterFingerprintBranch | None = None
         task_names = tuple(cfg.task_names) or DEFAULT_TASKS
         need_uti = bool(cfg.build_task_heads or cfg.build_task_interface)
         if need_uti:
@@ -274,14 +295,6 @@ class SignalFoundationModel(nn.Module):
                     if kind in ("classification", "emitter"):
                         n_cls = int(cfg.num_emitters if kind == "emitter" else cfg.num_mod_classes)
                         self.z_linear_probes[name] = nn.Linear(cfg.d_model, n_cls)
-                if bool(getattr(cfg, "emitter_fingerprint", True)) and (
-                    "emitter" in task_names or self.emitter_head is not None
-                ):
-                    self.emitter_fingerprint = EmitterFingerprintBranch(
-                        cfg.d_model,
-                        conv_channels=int(getattr(cfg, "emitter_fingerprint_channels", 64) or 64),
-                        dropout=cfg.dropout,
-                    )
         if cfg.build_adapters:
             self.task_adapters = nn.ModuleDict(
                 {name: TaskAdapter(cfg.d_model, down_dim=cfg.adapter_down_dim) for name in task_names}
@@ -328,9 +341,17 @@ class SignalFoundationModel(nn.Module):
         if self.recognition_heads is not None:
             for param in self.recognition_heads.parameters():
                 param.requires_grad = train_heads
-        if self.emitter_fingerprint is not None:
-            for param in self.emitter_fingerprint.parameters():
-                param.requires_grad = train_heads
+
+    def sample_mae_mask_strategy(self) -> str:
+        probs = dict(getattr(self.cfg, "mae_mask_probs", None) or {})
+        if not probs:
+            choices = ("random", "contiguous", "mixed")
+            return choices[int(torch.randint(0, len(choices), (1,)).item())]
+        names = list(probs.keys())
+        weights = torch.tensor([float(probs[n]) for n in names], dtype=torch.float32)
+        weights = weights / weights.sum().clamp_min(1.0e-8)
+        idx = int(torch.multinomial(weights, 1).item())
+        return str(names[idx])
 
     def task_kind(self, name: str) -> str:
         kinds = getattr(self.cfg, "task_kinds", None) or {}
@@ -549,7 +570,40 @@ class SignalFoundationModel(nn.Module):
 
     def load_weights(self, state: dict[str, Any], *, strict: bool = False) -> Any:
         state = remap_task_head_checkpoints(dict(state))
+        if not strict:
+            own = self.state_dict()
+            filtered: dict[str, Any] = {}
+            for key, value in state.items():
+                current = own.get(key)
+                if (
+                    current is not None
+                    and torch.is_tensor(value)
+                    and torch.is_tensor(current)
+                    and tuple(current.shape) != tuple(value.shape)
+                ):
+                    continue
+                filtered[key] = value
+            state = filtered
         return self.load_state_dict(state, strict=strict)
+
+    def load_emitter_dataset_class_mask(
+        self,
+        rfdata_root: str | Any = None,
+        mask: torch.Tensor | None = None,
+    ) -> None:
+        """个体头按数据集掩码分类，避免 ADSB 类干扰 WiSig。"""
+        head = getattr(self, "emitter_head", None)
+        if head is None or not hasattr(head, "set_dataset_class_mask"):
+            return
+        if mask is None:
+            from resmamba_signal_model.training.emitter_labels import build_emitter_dataset_class_mask
+
+            mask = build_emitter_dataset_class_mask(
+                rfdata_root,
+                num_emitters=int(self.cfg.num_emitters),
+                num_datasets=int(self.cfg.num_datasets),
+            )
+        head.set_dataset_class_mask(mask)
 
     def register_signal_adapter(
         self,
@@ -711,17 +765,39 @@ class SignalFoundationModel(nn.Module):
         self,
         patch_mask: torch.Tensor,
         mask_mode: str | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        *,
+        mae_strategy: str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]:
         zeros = torch.zeros_like(patch_mask)
         if mask_mode in (None, "none"):
-            return zeros, zeros, zeros
+            return zeros, zeros, zeros, "none"
         if mask_mode == "suffix":
-            return zeros, self.make_suffix_mask(patch_mask), zeros
+            return zeros, self.make_suffix_mask(patch_mask), zeros, "suffix"
         if mask_mode == "span":
-            return zeros, zeros, self.make_span_mask(patch_mask)
+            return zeros, zeros, self.make_span_mask(patch_mask), "span"
+        if mae_strategy is not None:
+            strategy = str(mae_strategy).strip().lower()
+        elif mask_mode in ("random", "contiguous", "mixed"):
+            strategy = mask_mode
+        else:
+            strategy = "mixed"
+        if strategy == "random":
+            mae = self.make_mae_mask(patch_mask)
+            return mae, zeros, zeros, "random"
+        if strategy == "contiguous":
+            span = self.make_span_mask(patch_mask)
+            return span, zeros, span, "contiguous"
         mae = self.make_mae_mask(patch_mask)
-        span = self.make_span_mask(patch_mask, mask_ratio=min(0.25, self.cfg.mask_ratio))
-        return mae, zeros, span
+        span = self.make_span_mask(patch_mask)
+        mixed = (mae | span) & patch_mask
+        visible = patch_mask & ~mixed
+        if (visible.sum(dim=1) == 0).any():
+            first = patch_mask.to(dtype=torch.long).argmax(dim=1)
+            for b in range(patch_mask.shape[0]):
+                if visible[b].sum() == 0:
+                    mixed[b, first[b]] = False
+        mixed = mixed & patch_mask
+        return mae & mixed, zeros, span & mixed, "mixed"
 
     def _observed_sample_mask(
         self,
@@ -841,9 +917,14 @@ class SignalFoundationModel(nn.Module):
         task_context: torch.Tensor | None = None,
         modality_id: torch.Tensor | None = None,
         complex_pair: torch.Tensor | bool | None = True,
+        mae_strategy: str | None = None,
     ) -> dict[str, Any]:
         orig_patches, orig_patch_mask = patchify_iq(iq, sample_mask, self.cfg.patch_size)
-        mae_mask, suffix_mask, span_mask = self._mask_for_mode(orig_patch_mask, mask_mode)
+        mae_mask, suffix_mask, span_mask, mask_strategy = self._mask_for_mode(
+            orig_patch_mask,
+            mask_mode,
+            mae_strategy=mae_strategy,
+        )
         target_mask = (mae_mask | suffix_mask | span_mask) & orig_patch_mask
         observed_sample_mask = self._observed_sample_mask(sample_mask, target_mask)
         iq_observed = iq.masked_fill(~observed_sample_mask.unsqueeze(1), 0.0)
@@ -852,6 +933,8 @@ class SignalFoundationModel(nn.Module):
             sample_mask,
             observed_mask=observed_sample_mask,
         )
+        log_scale = None if stats.amp_aux is None else stats.amp_aux.log_scale
+        amp_aux_vec = self.revin.amp_aux_vector(stats)
         # observed-only std 在静默背景上会塌缩；clip 只限制幅度，不把目标写进 stats。
         target_norm_wave = clip_normalized(
             self.revin.apply_stats(iq, stats, sample_mask),
@@ -875,6 +958,7 @@ class SignalFoundationModel(nn.Module):
             sample_mask,
             modality_id=modality_id,
             complex_pair=complex_pair,
+            log_scale=log_scale,
         )
         tok = self.tokenizer(
             iq_norm,
@@ -893,11 +977,18 @@ class SignalFoundationModel(nn.Module):
         phys_mask = tok.get("physics_mask")
         if phys_mask is not None:
             phys_mask = phys_mask[:, :n]
+        # Tokenizer physics_proj 用相对量；Decoder FiLM / query 读出还原绝对 log_power。
+        phys_dec = restore_absolute_log_power(phys, log_scale)
+        context_phys = restore_absolute_log_power(context_phys, log_scale)
         mae_mask = mae_mask[:, :n] & patch_mask
         suffix_mask = suffix_mask[:, :n] & patch_mask
         span_mask = span_mask[:, :n] & patch_mask
         target_mask = (mae_mask | suffix_mask | span_mask) & patch_mask
         visible = _ensure_min_visible(patch_mask & ~target_mask, patch_mask)
+        target_mask = patch_mask & ~visible
+        mae_mask = mae_mask & target_mask
+        suffix_mask = suffix_mask & target_mask
+        span_mask = span_mask & target_mask
         h_vis, packed_enc = self._encode_tokens(tokens, visible, patch_mask)
         z_enc, h_enc = self._pool_encoder_identity(
             tokens,
@@ -911,7 +1002,7 @@ class SignalFoundationModel(nn.Module):
             tokens,
             patch_mask,
             visible,
-            phys,
+            phys_dec,
             packed_encoder=packed_enc,
             sequence_packing=self.cfg.sequence_packing,
             skip_recon=bool(getattr(self, "_skip_recon", False)),
@@ -919,6 +1010,7 @@ class SignalFoundationModel(nn.Module):
             context_physics=context_phys,
             task_context=task_context,
             physics_mask=phys_mask,
+            amp_aux=amp_aux_vec,
         )
         skip_recon = dec["recon_norm"] is None
         if skip_recon:
@@ -988,6 +1080,8 @@ class SignalFoundationModel(nn.Module):
             "domain_logits": domain_logits,
             "n_tokens": patch_mask.sum(dim=1),
             "revin_stats": stats,
+            "amp_aux": amp_aux_vec,
+            "mask_strategy": mask_strategy,
             "iq_length": int(iq.shape[-1]),
         }
         if dataset_id is not None:
@@ -1006,6 +1100,7 @@ class SignalFoundationModel(nn.Module):
         task_context: torch.Tensor | None = None,
         modality_id: torch.Tensor | None = None,
         complex_pair: torch.Tensor | bool | None = True,
+        mae_strategy: str | None = None,
     ) -> dict[str, Any]:
         length = int(iq.shape[-1])
         overlap = self.cfg.chunk_overlap_samples
@@ -1028,6 +1123,7 @@ class SignalFoundationModel(nn.Module):
                 task_context=task_context,
                 modality_id=modality_id,
                 complex_pair=complex_pair,
+                mae_strategy=mae_strategy,
             )
             if not out["patch_mask"].any():
                 continue
@@ -1047,6 +1143,7 @@ class SignalFoundationModel(nn.Module):
                 task_context=task_context,
                 modality_id=modality_id,
                 complex_pair=complex_pair,
+                mae_strategy=mae_strategy,
             )
         assert last is not None
         stacked = torch.stack(zs, dim=1)
@@ -1087,6 +1184,7 @@ class SignalFoundationModel(nn.Module):
         task_context: torch.Tensor | None = None,
         modality_id: torch.Tensor | None = None,
         complex_pair: torch.Tensor | bool | None = True,
+        mae_strategy: str | None = None,
     ) -> dict[str, Any]:
         length = int(sample_mask.sum().item())
         if (not is_train) and length > self.cfg.chunk_len:
@@ -1098,6 +1196,7 @@ class SignalFoundationModel(nn.Module):
                 task_context=task_context,
                 modality_id=modality_id,
                 complex_pair=complex_pair,
+                mae_strategy=mae_strategy,
             )
         return self._core_forward(
             iq,
@@ -1107,6 +1206,7 @@ class SignalFoundationModel(nn.Module):
             task_context=task_context,
             modality_id=modality_id,
             complex_pair=complex_pair,
+            mae_strategy=mae_strategy,
         )
 
     def _forward_heterogeneous_batch(
@@ -1117,6 +1217,7 @@ class SignalFoundationModel(nn.Module):
         *,
         mask_mode: str | None,
         is_train: bool,
+        mae_strategy: str | None = None,
     ) -> dict[str, Any]:
         batch_size = iq.shape[0]
         outs: list[dict[str, Any]] = []
@@ -1129,6 +1230,7 @@ class SignalFoundationModel(nn.Module):
                     ds,
                     mask_mode=mask_mode,
                     is_train=is_train,
+                    mae_strategy=mae_strategy,
                 )
             )
         merged: dict[str, Any] = {}
@@ -1163,6 +1265,7 @@ class SignalFoundationModel(nn.Module):
         task_context: torch.Tensor | None = None,
         modality_id: torch.Tensor | None = None,
         complex_pair: torch.Tensor | bool | None = True,
+        mae_strategy: str | None = None,
     ) -> dict[str, Any]:
         if (not is_train) and int(mask_t.sum(dim=1).max().item()) > self.cfg.chunk_len:
             return self._forward_chunked(
@@ -1173,6 +1276,7 @@ class SignalFoundationModel(nn.Module):
                 task_context=task_context,
                 modality_id=modality_id,
                 complex_pair=complex_pair,
+                mae_strategy=mae_strategy,
             )
         return self._core_forward(
             iq_t,
@@ -1182,6 +1286,7 @@ class SignalFoundationModel(nn.Module):
             task_context=task_context,
             modality_id=modality_id,
             complex_pair=complex_pair,
+            mae_strategy=mae_strategy,
         )
 
     @staticmethod
@@ -1191,7 +1296,20 @@ class SignalFoundationModel(nn.Module):
             if torch.is_tensor(value):
                 detached[key] = value.detach()
             elif isinstance(value, RevINStats):
-                detached[key] = RevINStats(mean=value.mean.detach(), std=value.std.detach())
+                amp = value.amp_aux
+                detached_amp = None
+                if amp is not None:
+                    detached_amp = type(amp)(
+                        log_scale=amp.log_scale.detach(),
+                        log_peak=amp.log_peak.detach(),
+                        papr_preclip=amp.papr_preclip.detach(),
+                        scale_gap=amp.scale_gap.detach(),
+                    )
+                detached[key] = RevINStats(
+                    mean=value.mean.detach(),
+                    std=value.std.detach(),
+                    amp_aux=detached_amp,
+                )
             else:
                 detached[key] = value
         return detached
@@ -1349,13 +1467,7 @@ class SignalFoundationModel(nn.Module):
                 if kind == "classification" or task == "modulation":
                     out.update(head(features, dataset_id=dataset_id))
                 elif kind == "emitter" or task == "emitter":
-                    out.update(
-                        head(
-                            features,
-                            dataset_id=dataset_id,
-                            fingerprint=out.get("emitter_fingerprint"),
-                        )
-                    )
+                    out.update(head(features, dataset_id=dataset_id))
                 elif kind == "clustering":
                     ns = DEVICE_NAMESPACE if task == "emitter" else CONTENT_NAMESPACE
                     out.update(
@@ -1420,7 +1532,11 @@ class SignalFoundationModel(nn.Module):
         if task in self.z_linear_probes and kind in ("classification", "emitter"):
             z_feat = out.get("z_enc", out.get("z_general", out["z"]))
             z_feat = F.normalize(z_feat.float(), dim=-1).to(dtype=z_feat.dtype)
-            out["z_probe_logits"] = self.z_linear_probes[task](z_feat)
+            probe = self.z_linear_probes[task](z_feat)
+            if kind == "emitter" or task == "emitter":
+                mask = getattr(self.emitter_head, "dataset_class_mask", None) if self.emitter_head is not None else None
+                probe = apply_emitter_dataset_mask(probe, dataset_id, mask)
+            out["z_probe_logits"] = probe
         return out
 
     def forward(
@@ -1464,6 +1580,11 @@ class SignalFoundationModel(nn.Module):
         is_train = self.training if training is None else training
         apply_aug = bool(is_train) and mode in ("pretrain", "mae", "task", "downstream")
         task_mode = mode in ("task", "downstream")
+        mae_strategy = None
+        if mask_mode in ("random", "contiguous", "mixed"):
+            mae_strategy = mask_mode
+        elif mask_mode == "mae":
+            mae_strategy = self.sample_mae_mask_strategy()
         generation_task = bool(task and self.task_kind(task) in ("prediction", "imputation"))
         skip_recon = bool(
             getattr(self, "skip_recon", False)
@@ -1525,6 +1646,7 @@ class SignalFoundationModel(nn.Module):
                     task_context=task_context,
                     modality_id=modality_id,
                     complex_pair=complex_pair,
+                    mae_strategy=mae_strategy,
                 )
             out = self._detach_output(out)
         else:
@@ -1537,24 +1659,10 @@ class SignalFoundationModel(nn.Module):
                 task_context=task_context,
                 modality_id=modality_id,
                 complex_pair=complex_pair,
+                mae_strategy=mae_strategy,
             )
         if task_metadata is not None:
             out["task_metadata"] = task_metadata
-
-        if (
-            task_mode
-            and task
-            and (task == "emitter" or self.task_kind(task) == "emitter")
-            and self.emitter_fingerprint is not None
-        ):
-            # 必须在 truncate/no_grad 之外算：raw IQ 指纹支路要完整反传，encoder 仍截断。
-            out["emitter_fingerprint"] = self.emitter_fingerprint(
-                iq_t,
-                mask_t,
-                revin_stats=out.get("revin_stats"),
-                modality_id=out.get("modality_id", modality_id),
-                complex_pair=complex_pair,
-            )
 
         if mode in ("pretrain", "mae") and self.task_interface is not None:
             out = self._attach_uti_readouts(out, task="pretrain", allow_dataset_condition=False)

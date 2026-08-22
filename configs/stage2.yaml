@@ -53,7 +53,8 @@ uti_replay_weight: 0.25
 absorb_unknown: false
 lambda_recon: 0.0
 modulation_contrastive_weight: 0.05
-emitter_contrastive_weight: 0.05
+emitter_contrastive_weight: 0.2
+emitter_label_smoothing: 0.05
 z_probe_weight: 0.2
 supervised_clustering: false
 # 抑制无监督过分割：少用强制均摊，降低 utilization

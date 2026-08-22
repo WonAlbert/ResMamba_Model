@@ -891,6 +891,77 @@ def plan_fixed_token_budget_batches(
     return _pack_order_into_token_batches(order, tokens, token_budget, num_batches)
 
 
+class HomogeneousTokenBudgetSampler(Sampler[list[int]]):
+    """每个 batch 仅来自同一 H5 子数据集：先均匀抽一个 segment，再按 token_budget 组 batch。
+
+    文件身份只用于采样，不得进入模型 batch。
+    """
+
+    def __init__(
+        self,
+        pool: RFDataPoolDataset,
+        *,
+        token_budget: int,
+        patch_size: int,
+        num_batches: int | None = None,
+        seed: int | None = None,
+        lengths: list[int] | None = None,
+    ) -> None:
+        if token_budget < 1:
+            raise ValueError(f"token_budget 必须 >= 1，当前 {token_budget}")
+        self.token_budget = int(token_budget)
+        self.patch_size = int(patch_size)
+        self._segments = [seg for seg in pool_segments(pool) if seg.size > 0]
+        if not self._segments:
+            raise ValueError(f"pool {pool.pool_name!r} 无有效 segment")
+        self._lengths = list(lengths) if lengths is not None else pool_sample_lengths(pool)
+        self._tokens = [n_tokens_for_length(length, patch_size) for length in self._lengths]
+        total_tokens = sum(self._tokens)
+        self._num_batches = (
+            num_batches if num_batches is not None else max(1, (total_tokens + token_budget - 1) // token_budget)
+        )
+        self._seed = seed
+
+    def __len__(self) -> int:
+        return self._num_batches
+
+    def __iter__(self) -> Iterator[list[int]]:
+        rng = random.Random(self._seed)
+        orders: list[list[int]] = []
+        for seg in self._segments:
+            order = list(range(seg.offset, seg.offset + seg.size))
+            rng.shuffle(order)
+            orders.append(order)
+        pos = [0] * len(self._segments)
+        for _ in range(self._num_batches):
+            seg_i = rng.randrange(len(self._segments))
+            order = orders[seg_i]
+            n = len(order)
+            batch: list[int] = []
+            used = 0
+            while True:
+                if pos[seg_i] >= n:
+                    rng.shuffle(order)
+                    pos[seg_i] = 0
+                idx = order[pos[seg_i]]
+                cost = self._tokens[idx]
+                if not batch:
+                    batch.append(idx)
+                    used += cost
+                    pos[seg_i] += 1
+                    if used >= self.token_budget:
+                        break
+                    continue
+                if used + cost > self.token_budget:
+                    break
+                batch.append(idx)
+                used += cost
+                pos[seg_i] += 1
+                if used >= self.token_budget:
+                    break
+            yield batch
+
+
 class FixedBatchSampler(Sampler[list[int]]):
     """重复产出预先算好的 batch 下标，用于固定验证子集。"""
 

@@ -8,7 +8,8 @@ iq_normalize: none
 sequence_packing: true
 mix_strategy: token_share
 mix_value_clip: 2.0
-combine_then_pack: true
+combine_then_pack: false
+homogeneous_batch: true
 balanced_sampling: false
 balanced_sampling_strategy: length_bucket
 token_budget: 12288
@@ -19,13 +20,13 @@ seed: 0
 check_val_every_n_epoch: 1
 checkpoint_monitor: val/monitor
 checkpoint_mode: min
-early_stopping_patience: 8
+early_stopping_patience: 3
 early_stopping_min_delta: 0.001
 min_ratio: 0.05
 synthetic: false
 amp: true
 amp_dtype: bfloat16
-epochs: 12
+epochs: 25
 num_workers: 4
 prefetch_factor: 8
 max_grad_norm: 0.5
@@ -48,10 +49,12 @@ loss_weights:
   # 任务无关骨干：domain 不进 z_enc；关闭易塌缩的 EMA 余弦 latent
   domain: 0.0
   structure: 0.2
-  structure_phase: 0.1
+  structure_phase: 0.15
   latent: 0.0
-  # encoder 池化 VICReg：方差 + 去相关（抗塌缩）
-  vicreg: 0.25
+  vicreg: 0.3
+  # 可见 token VICReg；UTI semantic/source/context 去相关（无分类 / InfoNCE）
+  vicreg_token: 0.15
+  view_div: 0.1
   uti_pooled: 0.0
   uti_token: 0.0
   uti_query: 0.0

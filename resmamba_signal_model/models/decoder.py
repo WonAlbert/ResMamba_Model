@@ -10,6 +10,7 @@ from resmamba_signal_model.data.packing import pack_valid_tokens, scatter_packed
 from resmamba_signal_model.models.mamba_backbone import build_mamba_block
 from resmamba_signal_model.models.norms import DropPath, RMSNorm, build_norm
 from resmamba_signal_model.models.physics import PHYS_DIM
+from resmamba_signal_model.models.revin import AMP_AUX_DIM
 
 
 class SwiGLU(nn.Module):
@@ -82,14 +83,34 @@ class DecoderBlock(nn.Module):
 
 
 class PhysicsFiLM(nn.Module):
-    def __init__(self, d_model: int, phys_dim: int = PHYS_DIM) -> None:
+    def __init__(self, d_model: int, phys_dim: int = PHYS_DIM, amp_aux_dim: int = AMP_AUX_DIM) -> None:
         super().__init__()
-        self.net = nn.Sequential(nn.Linear(phys_dim, d_model), nn.SiLU(), nn.Linear(d_model, d_model * 2))
+        in_dim = int(phys_dim) + int(amp_aux_dim)
+        self.net = nn.Sequential(nn.Linear(in_dim, d_model), nn.SiLU(), nn.Linear(d_model, d_model * 2))
 
-    def forward(self, h: torch.Tensor, physics: torch.Tensor, physics_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        h: torch.Tensor,
+        physics: torch.Tensor,
+        physics_mask: torch.Tensor | None = None,
+        amp_aux: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         feats = physics.float()
         if physics_mask is not None:
             feats = feats * physics_mask.to(device=feats.device, dtype=feats.dtype)
+        if amp_aux is not None:
+            aux = amp_aux.to(device=feats.device, dtype=feats.dtype)
+            if aux.ndim == 2:
+                aux = aux.unsqueeze(1).expand(-1, feats.shape[1], -1)
+            feats = torch.cat([feats, aux], dim=-1)
+        else:
+            pad = torch.zeros(
+                *feats.shape[:-1],
+                AMP_AUX_DIM,
+                device=feats.device,
+                dtype=feats.dtype,
+            )
+            feats = torch.cat([feats, pad], dim=-1)
         gamma, beta = self.net(feats).to(dtype=h.dtype).chunk(2, dim=-1)
         return (gamma.tanh() + 1.0) * h + beta
 
@@ -347,6 +368,7 @@ class SharedDecoder(nn.Module):
         task_context: torch.Tensor | None = None,
         legacy_reconstruction: bool | None = None,
         physics_mask: torch.Tensor | None = None,
+        amp_aux: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         packing = self.sequence_packing if sequence_packing is None else sequence_packing
         if target_mask is None:
@@ -356,7 +378,7 @@ class SharedDecoder(nn.Module):
         h0 = self._gated_skip(h_full, x_tok, visible)
         h0 = self.pre_norm(h0)
         safe_physics = patch_physics.masked_fill(~visible.unsqueeze(-1), 0.0)
-        film_h = self.film(h0, safe_physics, physics_mask=physics_mask)
+        film_h = self.film(h0, safe_physics, physics_mask=physics_mask, amp_aux=amp_aux)
         h0 = torch.where(visible.unsqueeze(-1), film_h, h0)
         h0 = h0.masked_fill(~patch_mask.unsqueeze(-1), 0.0)
 

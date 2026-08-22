@@ -93,7 +93,8 @@ def test_aggregate_specialist_geomean() -> None:
         "val/f1_modulation": torch.tensor(0.8),
         "val/acc_emitter": 0.5,
         "val/nmi": 0.6,
-        "val/ssim": 0.9,
+        "val/mse_prediction": 0.1,
+        "val/mse_imputation": 0.1,
     }
     score = aggregate_specialist_geomean(metrics, {"modulation": 1.0, "emitter": 1.0, "clustering": 1.0, "prediction": 1.0})
     assert score is not None

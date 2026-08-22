@@ -24,7 +24,15 @@ def test_load_pretrain_datasets() -> None:
         "radcom_dynamic",
         "radcom_ota",
         "cjr_mix",
+        "rml2016_04c",
+        "rml2016_10a",
+        "rml2016_10b",
+        "wisig",
+        "adsb2",
     ]
+    assert "communication_emitters" not in datasets
+    assert "rml2018_1a" not in datasets
+    assert "wifi150" not in datasets
 
 
 def test_load_downstream_modulation_datasets() -> None:

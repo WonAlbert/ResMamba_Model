@@ -22,6 +22,22 @@ MODALITY_SONAR = 2
 MODALITY_IMU = 3
 
 
+LOG_POWER_INDEX = 0
+
+
+def restore_absolute_log_power(
+    phys: torch.Tensor,
+    log_scale: torch.Tensor | None,
+) -> torch.Tensor:
+    """归一化波形上的相对 log_power 加回 ``log_scale``（RSSI / 增益代理）。"""
+    if log_scale is None:
+        return phys
+    scale = log_scale.reshape(-1, *([1] * (phys.ndim - 1))).to(device=phys.device, dtype=phys.dtype)
+    out = phys.clone()
+    out[..., LOG_POWER_INDEX] = out[..., LOG_POWER_INDEX] + scale.squeeze(-1)
+    return out
+
+
 def safe_sqrt(x: torch.Tensor, eps: float = 1.0e-8) -> torch.Tensor:
     """``sqrt(0)`` 反传是 ``Inf``，再乘 RevIN 仿射的 0 通道就是 ``0*Inf=NaN``。"""
     return x.clamp_min(eps).sqrt()
@@ -183,6 +199,7 @@ def patch_physics(
     *,
     modality_id: torch.Tensor | None = None,
     complex_pair: torch.Tensor | bool | None = True,
+    log_scale: torch.Tensor | None = None,
     return_mask: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """向量化计算每 patch 物理量。
@@ -209,6 +226,7 @@ def patch_physics(
         phys_dim=stats.shape[-1],
     ).to(device=stats.device, dtype=stats.dtype)
     masked = stats * mask
+    masked = restore_absolute_log_power(masked, log_scale)
     if return_mask:
         return masked, mask
     return masked
@@ -220,6 +238,7 @@ def sequence_physics(
     *,
     modality_id: torch.Tensor | None = None,
     complex_pair: torch.Tensor | bool | None = True,
+    log_scale: torch.Tensor | None = None,
     return_mask: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """整段波形物理量 ``[B, PHYS_DIM]``，统计只用有效采样点。"""
@@ -293,6 +312,7 @@ def sequence_physics(
         phys_dim=stats.shape[-1],
     ).to(device=stats.device, dtype=stats.dtype)
     masked = stats * feat_mask
+    masked = restore_absolute_log_power(masked, log_scale)
     if return_mask:
         return masked, feat_mask
     return masked

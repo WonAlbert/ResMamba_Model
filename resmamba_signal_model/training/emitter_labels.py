@@ -31,6 +31,39 @@ class GlobalEmitterLabelMap:
         return self.dataset_names.get(int(dataset_id), f"dataset_{int(dataset_id)}")
 
 
+def build_emitter_dataset_class_mask(
+    rfdata_root: str | Path | None,
+    *,
+    num_emitters: int,
+    num_datasets: int,
+) -> torch.Tensor | None:
+    """``[num_datasets, num_emitters]``：每行是该 dataset_id 允许的全局个体类。"""
+    if rfdata_root is None or int(num_emitters) <= 0 or int(num_datasets) <= 0:
+        return None
+    path = Path(rfdata_root) / "label_maps.json"
+    if not path.is_file():
+        return None
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    datasets = payload.get("datasets") or {}
+    local_to_global = (payload.get("emitter_namespace") or {}).get("dataset_local_to_global") or {}
+    if not datasets or not local_to_global:
+        return None
+    mask = torch.zeros(int(num_datasets), int(num_emitters), dtype=torch.bool)
+    for raw_id, name in datasets.items():
+        dataset_id = int(raw_id)
+        if dataset_id < 0 or dataset_id >= mask.shape[0]:
+            continue
+        mapping = local_to_global.get(str(name)) or {}
+        for raw_global in mapping.values():
+            class_id = int(raw_global)
+            if 0 <= class_id < mask.shape[1]:
+                mask[dataset_id, class_id] = True
+    if not bool(mask.any()):
+        return None
+    return mask
+
+
 def load_emitter_namespace_num_emitters(rfdata_root: str | Path | None) -> int | None:
     """读取 ``label_maps.json`` 里 ``emitter_namespace.num_emitters``。"""
     if rfdata_root is None:

@@ -167,8 +167,6 @@ _MODEL_OVERLAY_KEYS = (
     "share_bidirectional_weights",
     "phase_plugin",
     "legacy_decoder_reconstruction",
-    "emitter_fingerprint",
-    "emitter_fingerprint_channels",
 )
 
 
@@ -457,6 +455,7 @@ def main() -> None:
     print(cache_msg, flush=True)
 
     model = SignalFoundationModel(model_cfg)
+    model.load_emitter_dataset_class_mask(train_cfg.get("rfdata_root"))
     if args.init_from:
         init_path = Path(args.init_from)
         if not init_path.is_absolute():

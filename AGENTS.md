@@ -4,7 +4,7 @@
 
 ## 项目一句话
 
-任务无关的射频 I/Q 基础模型：RevIN → 时频 Tokenizer → Encoder（5×BiMamba2 + 1×RoPE MemoryTransformer；MAE 可见 token 池化 `z_enc`，不二次全序列 encode）→ SharedDecoder（1×Mamba-2 + skip / 物理 FiLM；`z_recon`）→ UTI 多视图。主类：`SignalFoundationModel` / `SignalModelConfig`（包名 `resmamba_signal_model`）。
+任务无关的射频 I/Q 基础模型：联合能量 RevIN（`joint_energy`）→ 时频 Tokenizer → Encoder（5×BiMamba2 + 1×RoPE MemoryTransformer；MAE 可见 token 池化 `z_enc`）→ SharedDecoder（1×Mamba-2 + skip / 物理 FiLM + `amp_aux`；`z_recon`）→ UTI 多视图。主类：`SignalFoundationModel` / `SignalModelConfig`（包名 `resmamba_signal_model`）。
 
 ## Agent 工作约定
 
@@ -88,11 +88,12 @@ python scripts/infer.py --task modulation --checkpoint runs/experiments/<run>/ck
 - **Decoder**：恰好 1 层 `DecoderBlock`；token 通路重建；`[DEC]` + AttnPool → **`z_recon`**（重建/物理 readout，不作分类身份）。
 - **UTI**：semantic = 低秩残差(`z_enc`)；source = 去均值 token 池化；context = 慢衰减池化（非三份 `adapter(decoder_z)`）。
 - **Tokenizer**：共享 stem + 多尺度时域 + 复数双侧频谱分带（`fft` + `fftshift` 后再均分）；无 dataset/task token。
-- **物理约束**：patch 级 log_power / PAPR / IQ 相关 / 方差比 / 谱质心（`fftfreq`）；软约束 SmoothL1 + 硬约束能量投影。分类在归一化表征空间，重建在 RevIN denorm 后。
-- **变长**：`sequence_packing=true`；`TokenBudgetSampler`；`L < 16` 报错；`L > 8192` 重叠切块。
+- **归一化**：模型内 `revin_scale_mode: joint_energy`（I/Q 共享 Winsorized RMS；`amp_aux` 旁路绝对功率进 Decoder FiLM / 物理读出，不进 `z_enc`）。Loader 保持 `iq_normalize: none`。
+- **物理约束**：patch 级 log_power / PAPR / IQ 相关 / 方差比 / 谱质心（`fftfreq`）；绝对 `log_power` 由 `log_power_rel + log_scale` 还原。软约束 SmoothL1 + 硬约束能量投影。分类在归一化表征空间，重建在 RevIN denorm 后。
+- **变长**：`sequence_packing=true`；预训练 `HomogeneousTokenBudgetSampler`（每 batch 单一 H5）+ `combine_then_pack: false`；`TokenBudgetSampler` 用于其它阶段；`L < 16` 报错；`L > 8192` 重叠切块。
 - **多域**：Domain GRL **只**约束 UTI 声明不变的低秩视图（默认 `semantic`），梯度不进入 `z_enc`；预训练默认关闭 domain 损失。跨域对比学习仅在下游标签可对齐时启用（如调制 contrastive），预训练无 InfoNCE。
 
-预训练损失（默认权重见 `configs/pretrain.yaml`）：`L_mae + λ_phys L_phys + λ_impute L_span + λ_struct L_structure + λ_phase L_structure_phase + λ_readout L_global_phys + λ_vicreg L_VICReg(z_enc)`。`latent`（EMA 余弦）默认关闭以防塌缩；`domain` / `uti_*` 默认关闭。默认 `iq_normalize: none`（幅度由 RevIN 处理）。预训练不向 Decoder/UTI 注入 `dataset_id`。
+预训练损失（默认权重见 `configs/pretrain.yaml`）：`L_mae + λ_phys L_phys + λ_impute L_span + λ_struct L_structure + λ_phase L_structure_phase + λ_readout L_global_phys + λ_vicreg L_VICReg(z_enc) + λ_token L_VICReg(h_enc) + λ_view L_view_div`。MAE 每 batch 从 `{random, contiguous, mixed}` 抽样（`mae_mask_probs`）。`latent` / `domain` / `uti_*` 默认关闭。预训练 `use_labels=False` + collate 防火墙（无 `dataset_id`/标签/采集元数据进 forward）。
 
 ## 配置索引
 
@@ -193,7 +194,7 @@ ResMamba_Signal_Model/
 └── tests/                    # pytest：模型、数据、阶段冻结、门控等
 ```
 
-数据根目录 `dataset/`（H5、外部源、split manifest）与 `runs/` 为运行产物，默认不入库；I/O 契约见 `resmamba_signal_model/data/` 与 `configs/datasets.yaml`。
+数据根目录 `dataset/`（H5、外部源、split manifest）与 `runs/` 为运行产物，默认不入库。协议：`*_train.h5` 无标签预训练；`*_test.h5` 阶段二/三有标签训练；`*_val.h5` 全阶段验证。缺 test 时 `prepare_datasets.py --rebuild-pools-only` 从 train 分层切 20%。评估默认 `*_val.h5`（`infer.py --split val`）。I/O 契约见 `resmamba_signal_model/data/` 与 `configs/datasets.yaml`。
 
 ## 改代码时的优先落点
 

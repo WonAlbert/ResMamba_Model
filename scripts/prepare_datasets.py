@@ -18,6 +18,7 @@ import csv
 import json
 import os
 import pickle
+from typing import Any
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import h5py
@@ -91,6 +92,15 @@ EVAL_QUALITY_SPLITS = ("val", "test")
 VAL_TEST_ONLY_DATASETS = frozenset()
 VAL_TEST_SPLIT_RATIO = 0.8
 RML2018_EVAL_MIN_SNR = 6.0
+MISSING_TEST_SPLIT_SEED = 20260822
+MISSING_TEST_FRACTION = 0.2
+_MISSING_TEST_LABEL_FIELDS = (
+    "emitter_id",
+    "mod_label_id",
+    "source_label_id",
+    "canonical_mod_label_id",
+    "global_label_id",
+)
 
 
 def as_iq(x: np.ndarray) -> np.ndarray:
@@ -1677,17 +1687,165 @@ def pool_files_with_global_labels(ctx: Context, split_files: list[tuple[str, int
     return sorted(out)
 
 
+def _holdout_indices(
+    n: int,
+    labels: np.ndarray | None,
+    frac: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """从 n 条样本中切 ``frac`` 到 test；有类别则分层，且每类至少留 1 条在 train。"""
+    if n < 2:
+        return np.array([], dtype=np.int64)
+    frac = float(frac)
+
+    def _random_holdout() -> np.ndarray:
+        n_test = int(round(frac * n))
+        n_test = min(max(n_test, 1), n - 1)
+        return np.sort(rng.choice(n, size=n_test, replace=False).astype(np.int64))
+
+    if labels is None:
+        return _random_holdout()
+    labels = np.asarray(labels).reshape(-1)
+    if labels.shape[0] != n or not np.any(labels >= 0):
+        return _random_holdout()
+    chosen: list[int] = []
+    for cls in np.unique(labels):
+        if int(cls) < 0:
+            continue
+        idx = np.flatnonzero(labels == cls)
+        rng.shuffle(idx)
+        if idx.size < 2:
+            continue
+        k = int(round(frac * int(idx.size)))
+        k = min(max(k, 0), int(idx.size) - 1)
+        if k > 0:
+            chosen.extend(int(x) for x in idx[:k].tolist())
+    unlabeled = np.flatnonzero(labels < 0)
+    if unlabeled.size >= 2:
+        rng.shuffle(unlabeled)
+        k = int(round(frac * int(unlabeled.size)))
+        k = min(max(k, 0), int(unlabeled.size) - 1)
+        if k > 0:
+            chosen.extend(int(x) for x in unlabeled[:k].tolist())
+    if not chosen:
+        return _random_holdout()
+    return np.sort(np.unique(np.asarray(chosen, dtype=np.int64)))
+
+
+def _subset_h5_rows(src: Path, dst: Path, keep: np.ndarray) -> None:
+    """按行号复制 H5 中所有长度为 N 的列，保留 attrs 与额外字段。"""
+    keep = np.asarray(keep, dtype=np.int64)
+    if keep.size <= 0:
+        raise ValueError(f"{src.name} keep 为空")
+    dst = Path(dst)
+    if dst.exists():
+        dst.unlink()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with h5py.File(src, "r") as fin, h5py.File(dst, "w") as fout:
+        n = int(fin["iq"].shape[0])
+        if int(keep.min()) < 0 or int(keep.max()) >= n:
+            raise ValueError(f"{src.name} keep 越界")
+        for attr_key, attr_val in fin.attrs.items():
+            fout.attrs[attr_key] = attr_val
+        fout.attrs["sample_count"] = int(keep.shape[0])
+        for key, obj in fin.items():
+            if not isinstance(obj, h5py.Dataset):
+                continue
+            kwargs: dict[str, Any] = {}
+            if obj.compression:
+                kwargs["compression"] = obj.compression
+                if obj.compression_opts is not None:
+                    kwargs["compression_opts"] = obj.compression_opts
+            if obj.shape and int(obj.shape[0]) == n:
+                fout.create_dataset(key, data=obj[keep], **kwargs)
+            else:
+                fout.create_dataset(key, data=obj[()], **kwargs)
+
+
+def ensure_missing_test_splits(
+    ctx: Context,
+    *,
+    seed: int = MISSING_TEST_SPLIT_SEED,
+    frac: float = MISSING_TEST_FRACTION,
+) -> dict[str, int]:
+    """只处理「有 train、无 test」；不动已有 test/val（WiSig group-held-out 保持原样）。
+
+    按类别从 ``*_train`` 切 ``frac``（默认 20%）写 ``*_test.h5``，并从 train 删除这些行。
+    无可用类别字段则随机切。固定 seed。
+    """
+    stats: dict[str, int] = {}
+    if not ctx.h5.exists():
+        return stats
+    for train_path in sorted(ctx.h5.glob("*_train.h5")):
+        if "__balanced_" in train_path.name:
+            continue
+        base = train_path.name[: -len("_train.h5")]
+        test_path = ctx.h5 / f"{base}_test.h5"
+        val_path = ctx.h5 / f"{base}_val.h5"
+        if test_path.is_file():
+            continue
+        with h5py.File(train_path, "r") as f:
+            n = int(f["iq"].shape[0])
+            if n < 2:
+                continue
+            labels = None
+            for key in _MISSING_TEST_LABEL_FIELDS:
+                if key not in f:
+                    continue
+                col = np.asarray(f[key][:], dtype=np.int64)
+                if np.any(col >= 0):
+                    labels = col
+                    break
+        ds_rng = np.random.default_rng(int(seed) + (sum(base.encode()) & 0xFFFFFFFF))
+        test_idx = _holdout_indices(n, labels, frac, ds_rng)
+        keep_train = np.setdiff1d(np.arange(n, dtype=np.int64), test_idx, assume_unique=False)
+        if test_idx.size <= 0 or keep_train.size <= 0:
+            continue
+        tmp_test = ctx.h5 / f"{base}_test.__tmp.h5"
+        tmp_train = ctx.h5 / f"{base}_train.__tmp.h5"
+        try:
+            _subset_h5_rows(train_path, tmp_test, test_idx)
+            _subset_h5_rows(train_path, tmp_train, keep_train)
+            tmp_test.replace(test_path)
+            tmp_train.replace(train_path)
+        finally:
+            tmp_test.unlink(missing_ok=True)
+            tmp_train.unlink(missing_ok=True)
+        stats[base] = int(test_idx.shape[0])
+        entry = ctx.report.get("datasets", {}).get(base)
+        if isinstance(entry, dict):
+            splits = entry.setdefault("splits", {})
+            splits["test"] = {
+                "kept": int(test_idx.size),
+                "file": test_path.name,
+                "carved_from_train": True,
+            }
+            if isinstance(splits.get("train"), dict):
+                splits["train"]["kept"] = int(keep_train.size)
+            if val_path.is_file() and "val" not in splits:
+                splits["val"] = {"file": val_path.name}
+            entry["missing_test_carve"] = {
+                "fraction": float(frac),
+                "seed": int(seed),
+                "test_count": int(test_idx.size),
+                "train_remaining": int(keep_train.size),
+            }
+    return stats
+
+
 def finalize_task_pools(ctx: Context) -> None:
     """构建 task_pools。
 
     H5 后缀约定：
-    - *_train.h5：MAE 预训练（pretrain_train）或下游训练（downstream_*_train / clustering_train）
+    - *_train.h5：MAE 预训练（pretrain_train）
     - *_val.h5：各阶段验证（早停 / 选模 / 报告指标）
+    - *_test.h5：阶段二/三有标签训练（downstream_*_train / clustering_train）
     白名单见 configs/datasets.yaml（pretrain / downstream_modulation / emitter_downstream）。
     """
     rebuild_pools_from_h5(ctx)
     train = sorted(ctx.pool["train"])
     val = sorted(ctx.pool["val"])
+    test = sorted(ctx.pool["test"])
     fields = ctx.final_label_fields
     pf = lambda split, **kw: pool_files(split, fields, **kw)
     config_path = ROOT / "configs" / "datasets.yaml"
@@ -1708,13 +1866,13 @@ def finalize_task_pools(ctx: Context) -> None:
         return filter_dataset_pool(_pool(split_files, **kwargs), allowed)
 
     modulation_train = _whitelist_pool(
-        train, modulation_datasets, task_id=0, label_field="mod_label_id"
+        test, modulation_datasets, task_id=0, label_field="mod_label_id"
     )
     modulation_val = _whitelist_pool(
         val, modulation_datasets, task_id=0, label_field="mod_label_id"
     )
     emitter_train = filter_emitter_downstream_pool(
-        _whitelist_pool(train, emitter_downstream, task_id=1, label_field="emitter_id"),
+        _whitelist_pool(test, emitter_downstream, task_id=1, label_field="emitter_id"),
         emitter_downstream,
     )
     emitter_val = filter_emitter_downstream_pool(
@@ -1731,14 +1889,14 @@ def finalize_task_pools(ctx: Context) -> None:
         "pretrain_val": _whitelist_pool(val, pretrain_datasets),
         "downstream_modulation_train": modulation_train,
         "downstream_modulation_val": modulation_val,
-        "downstream_source_train": _whitelist_pool(train, modulation_datasets, task_id=0, label_field="source_label_id"),
+        "downstream_source_train": _whitelist_pool(test, modulation_datasets, task_id=0, label_field="source_label_id"),
         "downstream_source_val": _whitelist_pool(val, modulation_datasets, task_id=0, label_field="source_label_id"),
         "downstream_emitter_train": emitter_train,
         "downstream_emitter_val": emitter_val,
         "downstream_prediction_train": shared_train,
         "downstream_prediction_val": shared_val,
         "clustering_train": pool_files_with_global_labels(
-            ctx, [(filename, tid) for filename, tid in train if filename in set(shared_train)]
+            ctx, [(filename, tid) for filename, tid in test if filename in set(shared_train)]
         ),
         "clustering_val": pool_files_with_global_labels(
             ctx, [(filename, tid) for filename, tid in val if filename in set(shared_val)]
@@ -1790,18 +1948,36 @@ def finalize_split_manifest(ctx: Context) -> dict:
     return payload
 
 
+def persist_maps_and_report(ctx: Context) -> None:
+    ctx.output.mkdir(parents=True, exist_ok=True)
+    (ctx.output / "label_maps.json").write_text(
+        json.dumps(ctx.maps, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (ctx.output / "cleaning_report.json").write_text(
+        json.dumps(ctx.report, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def refresh_split_manifest(ctx: Context) -> dict:
+    """carve 之后允许重写 split_manifest（原文件为不可变 444）。"""
+    path = ctx.output / "split_manifest.json"
+    if path.exists():
+        path.chmod(0o644)
+        path.unlink()
+    return finalize_split_manifest(ctx)
+
+
 def finalize(ctx: Context, *, refine_eval: bool = True) -> None:
     rebalance_all(ctx)
     if refine_eval:
         refine_eval_splits(ctx)
+    ensure_missing_test_splits(ctx)
     sync_label_maps_from_balanced(ctx)
     stamp_semantic_namespaces(ctx)
     stamp_global_label_ids(ctx)
     finalize_task_pools(ctx)
     finalize_split_manifest(ctx)
-    ctx.output.mkdir(parents=True, exist_ok=True)
-    (ctx.output / "label_maps.json").write_text(json.dumps(ctx.maps, ensure_ascii=False, indent=2), encoding="utf-8")
-    (ctx.output / "cleaning_report.json").write_text(json.dumps(ctx.report, ensure_ascii=False, indent=2), encoding="utf-8")
+    persist_maps_and_report(ctx)
 
 
 def build_registry() -> dict[str, object]:
@@ -1978,6 +2154,27 @@ def main():
         help="仅构建原始 H5 与 .build_cache，不执行 rebalance / label_maps 收尾",
     )
     parser.add_argument(
+        "--rebuild-task-pools",
+        action="store_true",
+        help="根据现有 H5 重建 task_pools 并写入 label_maps.json；不 rebalance、不改 H5",
+    )
+    parser.add_argument(
+        "--rebuild-pools-only",
+        action="store_true",
+        help="同 --rebuild-task-pools（兼容别名）",
+    )
+    parser.add_argument(
+        "--ensure-missing-test-splits",
+        action="store_true",
+        help="仅为「有 train 无 test」按类切 20% 写 *_test.h5 并从 train 删除；不碰已有 test/val，不 rebalance",
+    )
+    parser.add_argument(
+        "--split-seed",
+        type=int,
+        default=MISSING_TEST_SPLIT_SEED,
+        help="ensure_missing_test_splits 固定种子",
+    )
+    parser.add_argument(
         "--finalize-only",
         action="store_true",
         help="合并 .build_cache 并执行 rebalance、global_label_id、task_pools",
@@ -2006,6 +2203,16 @@ def main():
                 encoding="utf-8",
             )
         print(f"[verify-splits] {manifest_path} sha256={payload['manifest_sha256']}", flush=True)
+        return
+    if args.ensure_missing_test_splits or args.rebuild_task_pools or args.rebuild_pools_only:
+        if args.ensure_missing_test_splits:
+            split_stats = ensure_missing_test_splits(ctx, seed=int(args.split_seed))
+            if split_stats:
+                print(f"[ensure-test-splits] {split_stats}", flush=True)
+                refresh_split_manifest(ctx)
+        finalize_task_pools(ctx)
+        persist_maps_and_report(ctx)
+        print(f"[rebuild-task-pools] {ctx.output}", flush=True)
         return
     if args.finalize_only:
         refuse_manifested_h5_mutation(ctx, "--finalize-only")

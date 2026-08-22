@@ -3,6 +3,7 @@ from pathlib import Path
 import torch
 
 from resmamba_signal_model.training.emitter_labels import (
+    build_emitter_dataset_class_mask,
     build_global_emitter_label_map,
     filter_emitter_downstream_pool,
     global_emitter_labels,
@@ -57,3 +58,15 @@ def test_global_emitter_labels_invalid_dataset() -> None:
     emitter_id = torch.tensor([1], dtype=torch.long)
     labels = global_emitter_labels(dataset_id, emitter_id, lookup)
     assert labels.tolist() == [-1]
+
+
+def test_emitter_dataset_class_mask_wisig_adsb2() -> None:
+    root = Path(__file__).resolve().parents[1] / "dataset"
+    if not (root / "label_maps.json").is_file():
+        return
+    mask = build_emitter_dataset_class_mask(root, num_emitters=440, num_datasets=32)
+    assert mask is not None
+    assert mask.shape == (32, 440)
+    assert int(mask[6].sum()) == 100
+    assert int(mask[11].sum()) == 150
+    assert not bool(torch.equal(mask[6], mask[11]))

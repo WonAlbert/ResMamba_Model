@@ -13,6 +13,7 @@ from resmamba_signal_model.models.heads import (
     EmitterHead,
     MLPHead,
     RecognitionHeads,
+    apply_emitter_dataset_mask,
     remap_legacy_recognition_shared,
     ModulationHead,
     remap_task_head_checkpoints,
@@ -117,8 +118,11 @@ def test_default_heads_use_low_rank_prototype() -> None:
     assert model.modulation_head.classifier.low_rank_prototype
     assert model.emitter_head.classifier.low_rank_prototype
     assert model.modulation_head.classifier.weight.shape[-1] == 64
-    assert model.emitter_fingerprint is not None
-    assert any(n.startswith("fp_head.") for n in model.emitter_head.state_dict())
+    assert getattr(model, "emitter_fingerprint", None) is None
+    assert not any(n.startswith("fp_head.") for n in model.emitter_head.state_dict())
+    feat = torch.randn(2, model.cfg.d_model)
+    logits = model.emitter_head(feat)["emitter_logits"]
+    assert logits.shape == (2, model.cfg.num_emitters)
 
 
 def test_low_rank_prototype_shrinks_cosine_and_mlp_and_stays_opt_in() -> None:
@@ -136,5 +140,26 @@ def test_low_rank_prototype_shrinks_cosine_and_mlp_and_stays_opt_in() -> None:
 
     old = ModulationHead(d_model=8, num_mod_classes=3, dropout=0.0, low_rank_prototype=False)
     assert not old.classifier.low_rank_prototype
+
+
+def test_emitter_head_uses_uti_pooled_not_fingerprint() -> None:
+    torch.manual_seed(0)
+    head = EmitterHead(16, num_emitters=5, dropout=0.0)
+    feat_a = torch.randn(2, 16)
+    feat_b = torch.randn(2, 16)
+    a = head(feat_a)["emitter_logits"]
+    b = head(feat_b)["emitter_logits"]
+    assert a.shape == (2, 5)
+    assert not torch.allclose(a, b)
+
+
+def test_dataset_mask_blocks_out_of_domain_classes() -> None:
+    logits = torch.zeros(2, 6)
+    logits[0, 5] = 9.0
+    logits[0, 1] = 1.0
+    mask = torch.zeros(4, 6, dtype=torch.bool)
+    mask[1, :3] = True
+    masked = apply_emitter_dataset_mask(logits, torch.tensor([1, 1]), mask)
+    assert int(masked[0].argmax()) == 1
 
 

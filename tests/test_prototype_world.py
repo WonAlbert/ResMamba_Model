@@ -138,5 +138,5 @@ def test_continual_freeze_uses_shared_adapter_not_per_task_lora() -> None:
     names = {n for n, p in model.named_parameters() if p.requires_grad}
     assert any(n.startswith("shared_adapter.") for n in names)
     assert any(n.startswith("prototype_registry.") for n in names)
-    assert any(n.startswith("emitter_fingerprint.") for n in names)
+    assert any(n.startswith("emitter_head.") for n in names)
     assert not any("lora_A.modulation" in n for n in names)

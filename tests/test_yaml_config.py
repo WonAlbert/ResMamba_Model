@@ -27,8 +27,11 @@ def test_load_tiny_and_pretrain_profile() -> None:
     assert pre["checkpoint_monitor"] == "val/monitor"
     assert pre["synthetic"] is True
     assert pre["model_config"] == "configs/model_tiny.yaml"
-    assert pre["loss_weights"]["domain"] == 0.05
-    assert pre["loss_weights"]["structure_phase"] == 0.02
+    assert pre["loss_weights"]["domain"] == 0.0
+    assert pre["loss_weights"]["structure_phase"] == 0.15
+    assert pre["loss_weights"]["vicreg_token"] == 0.15
+    assert pre["combine_then_pack"] is False
+    assert pre["homogeneous_batch"] is True
     assert pre["warmup_steps"] == 1
     assert pre["mix_strategy"] == "token_share"
 
@@ -109,6 +112,6 @@ def test_resolve_lr_default() -> None:
 
 def test_pretrain_recipe_allows_longer_training() -> None:
     cfg = load_yaml_config("configs/pretrain.yaml")
-    assert cfg["epochs"] == 30
-    assert cfg["early_stopping_patience"] == 8
+    assert cfg["epochs"] == 25
+    assert cfg["early_stopping_patience"] == 3
     assert float(cfg["early_stopping_min_delta"]) == pytest.approx(0.001)

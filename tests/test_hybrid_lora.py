@@ -81,7 +81,7 @@ def test_active_task_delta_and_shared() -> None:
     assert not torch.allclose(y0, y1)
     peft = peft_state_dict(_tiny_model())
     assert any("task_interface" in k or "modulation_head" in k for k in peft)
-    assert any(k.startswith("emitter_fingerprint.") for k in peft)
+    assert not any(k.startswith("emitter_fingerprint.") for k in peft)
 
 
 def test_save_best_bundle(tmp_path: Path) -> None:

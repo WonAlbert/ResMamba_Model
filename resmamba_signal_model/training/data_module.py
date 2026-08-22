@@ -19,6 +19,7 @@ from resmamba_signal_model.data.rfdata import (
 )
 from resmamba_signal_model.data.sampling import (
     FixedBatchSampler,
+    HomogeneousTokenBudgetSampler,
     LengthBucketBalancedBatchSampler,
     LengthBucketDynamicBatchSampler,
     LengthBucketPKBatchSampler,
@@ -88,6 +89,31 @@ CONTRACT_LIST_KEYS = (
     "coordinate_unit",
     *CAPTURE_METADATA_KEYS,
 )
+
+PRETRAIN_BLOCKED_KEYS = frozenset(
+    {
+        "mod_label_id",
+        "canonical_mod_label_id",
+        "emitter_id",
+        "source_label_id",
+        "global_emitter_id",
+        "global_label_id",
+        "dataset_id",
+        "task_type_id",
+        *CAPTURE_METADATA_KEYS,
+        "h5_path",
+    }
+)
+
+
+def is_pretrain_blocked_key(key: str) -> bool:
+    name = str(key)
+    return name in PRETRAIN_BLOCKED_KEYS or name.startswith("global_")
+
+
+def pretrain_collate_firewall(batch: dict[str, Any]) -> dict[str, Any]:
+    """预训练模型 batch 不得含标签 / dataset_id / 采集元数据 / 文件身份。"""
+    return {key: value for key, value in batch.items() if not is_pretrain_blocked_key(key)}
 
 # 训练 sampler 不得使用 global_label_id（仅 val 聚类指标）。
 TRAIN_SAMPLER_LABEL_FIELDS: dict[str, tuple[str, ...]] = {
@@ -299,8 +325,8 @@ def split_pool_by_groups(
     }
 
 
-def resolve_dataset_h5(rfdata_root: str | Path, dataset: str, split: str = "test") -> Path:
-    """按 split 解析 H5：test 优先 ``*_test.h5``，val 优先 ``*_val.h5``，缺失则回退。"""
+def resolve_dataset_h5(rfdata_root: str | Path, dataset: str, split: str = "val") -> Path:
+    """按 split 解析 H5：默认 val（评估）；test 现为阶段二/三训练集，缺失则回退。"""
     root = Path(rfdata_root)
     split_key = str(split).strip().lower()
     order = {
@@ -322,6 +348,7 @@ def _collate_with_source(
     task: str | None = None,
     *,
     attach_view2: bool = False,
+    stage: str | None = None,
 ):
     def _collate(samples: list[Any]) -> dict[str, Any]:
         batch = variable_length_collate(samples)
@@ -331,6 +358,8 @@ def _collate_with_source(
             batch["task"] = task
         if attach_view2:
             attach_clustering_view2(batch)
+        if stage == "pretrain":
+            batch = pretrain_collate_firewall(batch)
         return batch
 
     return _collate
@@ -393,6 +422,7 @@ def _make_loader(
     task: str | None = None,
     batch_sampler: Sampler[list[int]] | None = None,
     attach_view2: bool = False,
+    stage: str | None = None,
 ) -> DataLoader:
     if batch_sampler is not None:
         sampler: Sampler[list[int]] = batch_sampler
@@ -416,7 +446,7 @@ def _make_loader(
     return DataLoader(
         dataset,
         batch_sampler=sampler,
-        collate_fn=_collate_with_source(source_name, task, attach_view2=attach_view2),
+        collate_fn=_collate_with_source(source_name, task, attach_view2=attach_view2, stage=stage),
         num_workers=num_workers,
         pin_memory=pin_memory,
         **kwargs,
@@ -505,7 +535,19 @@ def build_train_batch_sampler(
     seed: int,
     train_cfg: dict[str, Any],
     task: str | None = None,
+    stage: str | None = None,
 ) -> Sampler[list[int]]:
+    homo_cfg = train_cfg.get("homogeneous_batch")
+    use_homo = stage == "pretrain" if homo_cfg is None else bool(homo_cfg)
+    if use_homo and isinstance(dataset, RFDataPoolDataset):
+        return HomogeneousTokenBudgetSampler(
+            dataset,
+            token_budget=max(1, int(token_budget)),
+            patch_size=int(patch_size),
+            num_batches=int(num_batches),
+            seed=int(seed),
+            lengths=lengths,
+        )
     enabled = bool(train_cfg.get("balanced_sampling", False))
     strategy = resolve_balanced_sampling_strategy(
         enabled=enabled,
@@ -787,26 +829,28 @@ class SignalDataModule(LightningDataModule):
             return
 
         root = self.train_cfg.get("rfdata_root") or "dataset"
-        pool_cache: dict[str, Dataset] = {}
+        pool_cache: dict[tuple[str, bool | None], Dataset] = {}
 
-        def get_pool(pool_name: str) -> Dataset:
-            cached = pool_cache.get(pool_name)
+        def get_pool(pool_name: str, *, use_labels: bool | None = None) -> Dataset:
+            cached = pool_cache.get((pool_name, use_labels))
             if cached is not None:
                 return cached
+            label_flag = use_labels if use_labels is not None else (self.stage != "pretrain")
             pool = build_rfdata_pool(
                 root,
                 pool_name,
+                use_labels=label_flag,
                 iq_normalize=self.train_cfg.get("iq_normalize", "none"),
                 cache_iq_in_memory=self.cache_iq_in_memory,
             )
-            pool_cache[pool_name] = pool
+            pool_cache[(pool_name, use_labels)] = pool
             return pool
 
         if self.stage == "pretrain":
-            pool = get_pool(self.train_cfg.get("pool", "pretrain_train"))
-            val_pool = get_pool(self.train_cfg.get("val_pool", "pretrain_val"))
-            self._train_sets = split_pool_by_groups(pool, self.source_groups)
-            self._val_sets = split_pool_by_groups(val_pool, self.source_groups)
+            pool = get_pool(self.train_cfg.get("pool", "pretrain_train"), use_labels=False)
+            val_pool = get_pool(self.train_cfg.get("val_pool", "pretrain_val"), use_labels=False)
+            self._train_sets = {"pretrain": pool}
+            self._val_sets = {"pretrain": val_pool}
         else:
             task_pools = self.train_cfg.get("task_pools") or {
                 "classification": ("downstream_modulation_train", "downstream_modulation_val"),
@@ -880,6 +924,7 @@ class SignalDataModule(LightningDataModule):
                     seed=seed,
                     train_cfg=self.train_cfg,
                     task=self._task_for_loader_name(name),
+                    stage=self.stage,
                 )
             else:
                 lengths = []
@@ -913,6 +958,7 @@ class SignalDataModule(LightningDataModule):
                 task=task_name,
                 batch_sampler=sampler if train else None,
                 attach_view2=attach_view2,
+                stage=self.stage,
             )
         return loaders
 
@@ -951,7 +997,7 @@ class SignalDataModule(LightningDataModule):
         return self._cached_val_loader
 
 
-def build_infer_pool(rfdata_root: str | Path, datasets: list[str], *, split: str = "test") -> RFDataPoolDataset:
+def build_infer_pool(rfdata_root: str | Path, datasets: list[str], *, split: str = "val") -> RFDataPoolDataset:
     root = Path(rfdata_root)
     parts = [
         RFDataH5Dataset(resolve_dataset_h5(root, name, split), iq_normalize="none")

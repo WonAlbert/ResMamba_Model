@@ -7,7 +7,7 @@ from resmamba_signal_model.models.revin import RevIN
 
 def test_revin_roundtrip_error() -> None:
     torch.manual_seed(0)
-    revin = RevIN(num_channels=2, affine=True)
+    revin = RevIN(num_channels=2, scale_mode="channel", affine=True)
     x = torch.randn(3, 2, 64) * 4 + 1.5
     mask = torch.ones(3, 64, dtype=torch.bool)
     x_hat, stats = revin.normalize(x, mask)
@@ -17,7 +17,7 @@ def test_revin_roundtrip_error() -> None:
 
 def test_revin_pad_does_not_pollute_stats() -> None:
     torch.manual_seed(1)
-    revin = RevIN(num_channels=2, affine=False)
+    revin = RevIN(num_channels=2, scale_mode="channel", affine=False)
     x = torch.zeros(2, 2, 32)
     x[0, :, :10] = 2.0
     x[1, :, :] = 99.0
@@ -31,7 +31,7 @@ def test_revin_pad_does_not_pollute_stats() -> None:
 
 
 def test_revin_observed_mask_hides_targets_but_keeps_target_normalization() -> None:
-    revin = RevIN(num_channels=2, affine=False)
+    revin = RevIN(num_channels=2, scale_mode="channel", affine=False)
     x = torch.arange(32, dtype=torch.float32).view(1, 2, 16)
     sample_mask = torch.ones(1, 16, dtype=torch.bool)
     observed = sample_mask.clone()
@@ -48,7 +48,7 @@ def test_revin_observed_mask_hides_targets_but_keeps_target_normalization() -> N
 
 
 def test_revin_quiet_observed_std_floor_does_not_use_targets() -> None:
-    revin = RevIN(num_channels=2, affine=False, std_min=1.0e-2)
+    revin = RevIN(num_channels=2, scale_mode="channel", affine=False, std_min=1.0e-2)
     x = torch.zeros(1, 2, 16)
     x[..., 10:] = 5.0
     sample_mask = torch.ones(1, 16, dtype=torch.bool)
@@ -62,7 +62,7 @@ def test_revin_quiet_observed_std_floor_does_not_use_targets() -> None:
 def test_clip_normalized_bounds_masked_pulse_without_changing_stats() -> None:
     from resmamba_signal_model.models.revin import clip_normalized
 
-    revin = RevIN(num_channels=2, affine=False, std_min=1.0e-2)
+    revin = RevIN(num_channels=2, scale_mode="channel", affine=False, std_min=1.0e-2)
     x = torch.full((1, 2, 32), 1.0e-4)
     x[..., 24:] = 4.0
     sample_mask = torch.ones(1, 32, dtype=torch.bool)
@@ -81,7 +81,7 @@ def test_clip_normalized_bounds_masked_pulse_without_changing_stats() -> None:
 def test_revin_affine_grads_finite_for_quiet_observed_huge_pulse() -> None:
     from resmamba_signal_model.models.revin import clip_normalized
 
-    revin = RevIN(num_channels=2, affine=True, std_min=1.0e-2, clip=8.0)
+    revin = RevIN(num_channels=2, scale_mode="channel", affine=True, std_min=1.0e-2, clip=8.0)
     x = torch.zeros(2, 2, 64)
     x[..., :8] = 1.0e-4
     x[..., 32:] = 6.0e4
@@ -100,7 +100,7 @@ def test_revin_affine_grads_finite_for_quiet_observed_huge_pulse() -> None:
 
 
 def test_revin_inf_zscore_does_not_nan_affine_grad() -> None:
-    revin = RevIN(num_channels=2, affine=True, std_min=1.0e-2, clip=8.0)
+    revin = RevIN(num_channels=2, scale_mode="channel", affine=True, std_min=1.0e-2, clip=8.0)
     x = torch.zeros(1, 2, 16)
     x[..., 8:] = float("inf")
     mask = torch.ones(1, 16, dtype=torch.bool)

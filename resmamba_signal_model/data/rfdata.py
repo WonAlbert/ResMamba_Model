@@ -531,8 +531,6 @@ class RFDataH5Dataset(Dataset):
             "iq": iq,
             "values": iq,
             "length": length,
-            "dataset_id": max(0, self._int_at(self._dataset_id, idx, 0)),
-            "task_type_id": self._int_at(self._task_type_id, idx, 0),
             "modality_id": "rf",
             "complex_pairs": self.signal_spec.complex_pairs,
             "signal_spec": self.signal_spec,
@@ -543,16 +541,18 @@ class RFDataH5Dataset(Dataset):
             ),
         }
         if self.use_labels:
+            out["dataset_id"] = max(0, self._int_at(self._dataset_id, idx, 0))
+            out["task_type_id"] = self._int_at(self._task_type_id, idx, 0)
             for key in _LABEL_KEYS:
                 out[key] = self._int_at(self._labels.get(key), idx, -1)
-        for key in CAPTURE_METADATA_KEYS:
-            column = self._capture_metadata.get(key)
-            out[key] = self._decode_string(
-                None if column is None else column[idx],
-                MISSING_METADATA,
-            )
-            if not out[key]:
-                out[key] = MISSING_METADATA
+            for key in CAPTURE_METADATA_KEYS:
+                column = self._capture_metadata.get(key)
+                out[key] = self._decode_string(
+                    None if column is None else column[idx],
+                    MISSING_METADATA,
+                )
+                if not out[key]:
+                    out[key] = MISSING_METADATA
         if self.include_extra_metadata:
             out["h5_path"] = str(self.h5_path)
             for key, col in self._extra_float.items():
@@ -640,8 +640,9 @@ def load_task_pool(rfdata_root: str | Path, pool_name: str) -> list[str]:
     """加载 task pool 对应的 H5 文件名列表。
 
     数据划分约定（H5 文件名后缀，白名单见 ``configs/datasets.yaml``）：
-    - ``*_train.h5``：MAE 预训练（``pretrain_train``）或下游训练（``downstream_*_train``、``clustering_train``）
-    - ``*_val.h5``：各阶段唯一验证集（早停 / 选模 / 指标报告）
+    - ``*_train.h5``：无标签 MAE 预训练（``pretrain_train``）
+    - ``*_test.h5``：阶段二/三有标签训练（``downstream_*_train``、``clustering_train``）
+    - ``*_val.h5``：各阶段唯一验证集（早停 / 选模 / 指标报告；``infer`` 默认 ``--split val``）
     """
     root = Path(rfdata_root)
     with (root / "label_maps.json").open("r", encoding="utf-8") as f:

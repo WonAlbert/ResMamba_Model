@@ -34,6 +34,8 @@ __all__ = [
     "foundation_pretrain_losses",
     "latent_prediction_loss",
     "vicreg_loss",
+    "vicreg_token_loss",
+    "view_decorrelation_loss",
     "mae_reconstruction_loss",
     "modulation_hierarchical_metric_loss",
     "negcos_temperature",
@@ -96,7 +98,12 @@ def negcos_temperature(
     return float(tau_min + 0.5 * (tau_max - tau_min) * (1.0 + math.cos(math.pi * p)))
 
 
-def safe_cross_entropy(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+def safe_cross_entropy(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    label_smoothing: float = 0.0,
+) -> torch.Tensor:
     valid = labels >= 0
     if valid.sum() == 0:
         return logits.new_tensor(0.0)
@@ -110,7 +117,8 @@ def safe_cross_entropy(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tens
     if labels.numel() == 0:
         return logits.new_tensor(0.0)
     logits = torch.clamp(logits, -50.0, 50.0)
-    return F.cross_entropy(logits, labels)
+    smoothing = min(max(float(label_smoothing), 0.0), 0.5)
+    return F.cross_entropy(logits, labels, label_smoothing=smoothing)
 
 
 def _masked_per_sample(elem: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
@@ -174,6 +182,8 @@ def resolve_recon_mask(outputs: dict[str, Any], kind: str) -> torch.Tensor | Non
             mask = outputs.get("mae_mask")
     elif kind == "mae":
         mask = outputs.get("mae_mask")
+        if mask is not None and not bool(mask.any()) and outputs.get("span_mask") is not None:
+            mask = outputs["span_mask"]
     elif kind in ("query", "target"):
         mask = outputs.get("target_mask", outputs.get("recon_mask", outputs.get("mae_mask")))
     else:
@@ -586,6 +596,66 @@ def vicreg_loss(
     return torch.nan_to_num(total, nan=0.0, posinf=0.0, neginf=0.0)
 
 
+def vicreg_token_loss(
+    h: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    *,
+    var_weight: float = 25.0,
+    cov_weight: float = 1.0,
+    gamma: float = 1.0,
+    eps: float = 1.0e-4,
+) -> torch.Tensor:
+    """可见 encoder token 上的 VICReg，防止细粒度 token 塌缩。"""
+    if h is None or h.ndim != 3 or h.shape[0] < 1:
+        return h.new_tensor(0.0) if torch.is_tensor(h) else torch.tensor(0.0)
+    if mask is not None:
+        keep = mask.to(dtype=torch.bool)
+        flat = h[keep]
+    else:
+        flat = h.reshape(-1, h.shape[-1])
+    if flat.shape[0] < 2:
+        return flat.new_tensor(0.0)
+    return vicreg_loss(
+        flat,
+        var_weight=var_weight,
+        cov_weight=cov_weight,
+        inv_weight=0.0,
+        gamma=gamma,
+        eps=eps,
+    )
+
+
+def view_decorrelation_loss(views: list[torch.Tensor]) -> torch.Tensor:
+    """UTI 视图 pooled 向量间余弦去相关。"""
+    valid = [F.normalize(v.float(), dim=-1) for v in views if v is not None and v.ndim == 2 and v.shape[0] >= 2]
+    if len(valid) < 2:
+        ref = valid[0] if valid else torch.tensor(0.0)
+        return ref.new_tensor(0.0)
+    total = valid[0].new_tensor(0.0)
+    pairs = 0
+    for i in range(len(valid)):
+        for j in range(i + 1, len(valid)):
+            sim = (valid[i] * valid[j]).sum(dim=-1).square().mean()
+            total = total + sim
+            pairs += 1
+    return total / max(pairs, 1)
+
+
+def view_vicreg_loss(outputs: dict[str, Any], *, var_weight: float = 10.0, cov_weight: float = 0.5) -> torch.Tensor:
+    views = []
+    for name in ("semantic", "source", "context"):
+        z = outputs.get(f"z_{name}")
+        if z is not None:
+            views.append(z)
+    if not views:
+        ref = outputs.get("z_enc")
+        return ref.new_tensor(0.0) if torch.is_tensor(ref) else torch.tensor(0.0)
+    total = views[0].new_tensor(0.0)
+    for z in views:
+        total = total + vicreg_loss(z, var_weight=var_weight, cov_weight=cov_weight, inv_weight=0.0)
+    return total / len(views)
+
+
 def uti_readout_consistency_loss(
     student: torch.Tensor,
     teacher: torch.Tensor | None = None,
@@ -625,7 +695,7 @@ def foundation_pretrain_losses(
             losses["mae"] = _clamp_loss(mae_reconstruction_loss(pred, target, mae_mask))
     if _need("impute"):
         span = resolve_recon_mask(outputs, "imputation")
-        if span is None:
+        if span is None or not bool(span.any()):
             losses["impute"] = pred.new_tensor(0.0)
         else:
             losses["impute"] = _clamp_loss(mae_reconstruction_loss(pred, target, span))
@@ -681,6 +751,23 @@ def foundation_pretrain_losses(
                 cov_weight=float(outputs.get("vicreg_cov_weight", 1.0) or 1.0),
                 inv_weight=float(outputs.get("vicreg_inv_weight", 0.0) or 0.0),
             )
+    if _need("vicreg_token"):
+        h_enc = outputs.get("h_enc")
+        visible = outputs.get("visible", outputs.get("patch_mask"))
+        if h_enc is None or visible is None:
+            losses["vicreg_token"] = pred.new_tensor(0.0)
+        else:
+            losses["vicreg_token"] = vicreg_token_loss(
+                h_enc,
+                visible & outputs.get("patch_mask", visible),
+                var_weight=float(outputs.get("vicreg_var_weight", 25.0) or 25.0),
+                cov_weight=float(outputs.get("vicreg_cov_weight", 1.0) or 1.0),
+            )
+    if _need("view_div"):
+        view_vecs = [outputs.get(f"z_{name}") for name in ("semantic", "source", "context")]
+        div = view_decorrelation_loss([v for v in view_vecs if v is not None])
+        vv = view_vicreg_loss(outputs)
+        losses["view_div"] = div + vv
     if _need("uti_pooled"):
         student_p = outputs.get("uti_pooled")
         if student_p is None:
@@ -777,6 +864,7 @@ def downstream_task_loss(
     prototype_anchor_weight: float = 0.0,
     uti_replay_weight: float = 0.0,
     z_probe_weight: float = 1.0,
+    emitter_label_smoothing: float = 0.0,
     cluster_utilization_weight: float = 0.02,
     cluster_consistency_weight: float = 1.0,
     cluster_balance_mix: float = 0.35,
@@ -833,7 +921,7 @@ def downstream_task_loss(
         else:
             labels = raw_labels
         logits = _first_present(outputs, "task_logits", "emitter_logits")
-        ce = safe_cross_entropy(logits, labels)
+        ce = safe_cross_entropy(logits, labels, label_smoothing=emitter_label_smoothing)
         parts["task_ce"] = ce
         loss = loss + ce
         if "z_probe_logits" in outputs and outputs["z_probe_logits"] is not None:
@@ -841,7 +929,8 @@ def downstream_task_loss(
             parts["z_probe_ce"] = probe_ce
             loss = loss + float(z_probe_weight) * probe_ce
         if emitter_contrastive_weight > 0:
-            contrastive = supervised_contrastive_loss(feat, labels)
+            contrastive_feat = feat
+            contrastive = supervised_contrastive_loss(contrastive_feat, labels)
             parts["emitter_contrastive"] = contrastive
             loss = loss + float(emitter_contrastive_weight) * contrastive
     elif kind == "clustering":

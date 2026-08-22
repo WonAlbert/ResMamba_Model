@@ -12,7 +12,7 @@ from resmamba_signal_model.models.model import SignalFoundationModel, SignalMode
 from resmamba_signal_model.models.peft import TOKENIZER_LAST_PREFIXES
 from resmamba_signal_model.models.task_interface import SOURCE_TO_TASK
 from resmamba_signal_model.training.task_catalog import resolve_task_catalog
-from resmamba_signal_model.training.data_module import merge_source_batches
+from resmamba_signal_model.training.data_module import merge_source_batches, pretrain_collate_firewall
 from resmamba_signal_model.training.checkpointing import (
     aggregate_multitask_geomean,
     aggregate_specialist_geomean,
@@ -449,10 +449,13 @@ class SignalLitModule(_Base):
         self, batch: Any, *, default_source: str | None = None
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, Any]]:
         sources = _as_source_map(batch, default_name=default_source)
-        if bool(self.train_cfg.get("combine_then_pack", True)) or len(sources) != 1:
+        if len(sources) == 1:
+            merged = next(iter(sources.values()))
+        elif bool(self.train_cfg.get("combine_then_pack", True)):
             merged = merge_source_batches(sources)
         else:
             merged = next(iter(sources.values()))
+        merged = pretrain_collate_firewall(merged)
         self.model.grl.lambd = self._dann_lambda()
         self._schedule_temperature()
         outputs = self.model(merged, mode="pretrain")
@@ -590,6 +593,7 @@ class SignalLitModule(_Base):
                 prototype_anchor_weight=float(self.train_cfg.get("prototype_anchor_weight", 0.0)),
                 uti_replay_weight=uti_replay_weight,
                 z_probe_weight=float(self.train_cfg.get("z_probe_weight", 1.0)),
+                emitter_label_smoothing=float(self.train_cfg.get("emitter_label_smoothing", 0.0)),
                 cluster_utilization_weight=float(self.train_cfg.get("cluster_utilization_weight", 0.02)),
                 cluster_consistency_weight=float(self.train_cfg.get("cluster_consistency_weight", 1.0)),
                 cluster_balance_mix=float(self.train_cfg.get("cluster_balance_mix", 0.35)),

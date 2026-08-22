@@ -120,7 +120,7 @@ def move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     return out
 
 
-def find_h5(rfdata_root: Path, dataset: str, split: str = "test") -> Path:
+def find_h5(rfdata_root: Path, dataset: str, split: str = "val") -> Path:
     return resolve_dataset_h5(rfdata_root, dataset, split)
 
 
@@ -228,7 +228,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--datasets", nargs="+", default=None)
     p.add_argument("--rfdata-root", default="dataset")
     p.add_argument("--config", default=None, help="训练 YAML，用于对齐 token_budget/val_seed/val_batches")
-    p.add_argument("--split", choices=("val", "test"), default="test")
+    p.add_argument("--split", choices=("val", "test"), default="val")
     p.add_argument("--token-budget", type=int, default=None)
     p.add_argument("--val-seed", type=int, default=None)
     p.add_argument("--val-batches", type=int, default=None)
@@ -280,7 +280,8 @@ def main() -> None:
         peft_cfg.shared_lora = peft_cfg.shared_lora or ("shared" in lora_tasks)
         inject_hybrid_lora(model, lora_tasks, peft_cfg)
         print(f"[infer] injected Hybrid-LoRA+ tasks={lora_tasks}", flush=True)
-    missing, unexpected = model.load_state_dict(state, strict=False)
+    model.load_emitter_dataset_class_mask(rfdata_root)
+    missing, unexpected = model.load_weights(state, strict=False)
     model = model.to(device)
     print(f"[infer] missing={len(missing)} unexpected={len(unexpected)} device={device}")
 

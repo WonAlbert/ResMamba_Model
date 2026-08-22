@@ -27,6 +27,15 @@ model:
   physics_project: true
   revin_std_min: 0.01
   revin_clip: 8.0
+  revin_scale_mode: joint_energy
+  revin_winsorize_top_frac: 0.01
+  revin_peak_papr_clip: 16.0
+  revin_affine: false
+  revin_shared_affine: true
+  mae_mask_probs:
+    random: 0.333333
+    contiguous: 0.333333
+    mixed: 0.333334
   phase_plugin: false
   encode_visible_only: true
   sequence_packing: true
