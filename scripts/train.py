@@ -375,6 +375,7 @@ def main() -> None:
     )
     from resmamba_signal_model.training.task_schedule import (
         TaskScheduleCallback,
+        expand_task_schedule_with_joint,
         resolve_task_schedule,
         sources_for_tasks,
         total_schedule_epochs,
@@ -392,7 +393,7 @@ def main() -> None:
         if train_cfg.get("continual_sessions"):
             train_cfg["epochs"] = total_continual_epochs(sessions, default_epochs=int(train_cfg.get("epochs", 1)))
 
-    task_sessions = resolve_task_schedule(train_cfg)
+    task_sessions = expand_task_schedule_with_joint(resolve_task_schedule(train_cfg), train_cfg)
     if task_sessions:
         train_cfg["epochs"] = total_schedule_epochs(
             task_sessions, default_epochs=int(train_cfg.get("epochs", 1))

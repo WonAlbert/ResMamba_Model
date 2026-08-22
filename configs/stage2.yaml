@@ -88,6 +88,8 @@ task_schedule:
     epochs: 10
   - task: imputation
     epochs: 10
+# 每个单任务段结束后联合训练已完成任务（train+val 多源混训，不走 replay）
+task_joint_epochs: 2
 # 增加任务示例：
 # - name: sonar
 #   kind: classification
@@ -115,6 +117,7 @@ profiles:
     warmup_steps: 1
     learning_rate: 1.0e-3
     require_mamba_kernel: false
+    task_joint_epochs: 1
     task_schedule:
       - task: modulation
         epochs: 1

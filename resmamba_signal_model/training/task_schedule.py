@@ -40,6 +40,36 @@ def resolve_task_schedule(train_cfg: dict[str, Any]) -> list[dict[str, Any]]:
     return sessions
 
 
+def expand_task_schedule_with_joint(
+    sessions: list[dict[str, Any]],
+    train_cfg: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """在每个单任务会话后插入联合训练段（``task_joint_epochs``）。"""
+    joint_epochs = int(train_cfg.get("task_joint_epochs", 0) or 0)
+    if joint_epochs <= 0 or not sessions:
+        return [dict(item) for item in sessions]
+    out: list[dict[str, Any]] = []
+    completed: list[str] = []
+    for session in sessions:
+        solo = dict(session)
+        solo.setdefault("joint", False)
+        out.append(solo)
+        for task in solo.get("tasks") or []:
+            name = str(task).strip()
+            if name and name not in completed:
+                completed.append(name)
+        if completed:
+            out.append(
+                {
+                    "name": f"joint_{'+'.join(completed)}",
+                    "tasks": list(completed),
+                    "epochs": joint_epochs,
+                    "joint": True,
+                }
+            )
+    return out
+
+
 def total_schedule_epochs(sessions: list[dict[str, Any]], *, default_epochs: int = 1) -> int:
     if not sessions:
         return int(default_epochs)
@@ -133,35 +163,46 @@ class TaskScheduleCallback(Callback):
             return
         tasks = [str(t) for t in session.get("tasks") or []]
         sources = sources_for_tasks(self.train_cfg, tasks)
-        key = tuple(tasks)
+        is_joint = bool(session.get("joint"))
+        key = ("joint",) + tuple(tasks) if is_joint else tuple(tasks)
         replay_ratio = float(self.train_cfg.get("replay_mix_ratio", 0.0) or 0.0)
-        replay_tasks = replay_tasks_for_epoch(self.sessions, int(epoch))
-        replay_sources = sources_for_tasks(self.train_cfg, replay_tasks) if replay_ratio > 0 and replay_tasks else []
+        if is_joint:
+            replay_tasks: list[str] = []
+            replay_sources: list[str] = []
+        else:
+            replay_tasks = replay_tasks_for_epoch(self.sessions, int(epoch))
+            replay_sources = (
+                sources_for_tasks(self.train_cfg, replay_tasks) if replay_ratio > 0 and replay_tasks else []
+            )
         self.train_cfg["active_train_tasks"] = list(tasks)
         self.train_cfg["active_train_sources"] = list(sources)
         self.train_cfg["active_replay_tasks"] = list(replay_tasks)
         self.train_cfg["active_replay_sources"] = list(replay_sources)
+        self.train_cfg["active_joint_session"] = is_joint
         dm = getattr(trainer, "datamodule", None)
         if dm is not None and hasattr(dm, "set_active_train_filter"):
             dm.set_active_train_filter(sources, replay_sources=replay_sources or None)
         if key != self._last_key:
             import logging
 
+            phase = "joint" if is_joint else "solo"
             logging.getLogger("resmamba").info(
-                "task_schedule epoch=%s session=%s tasks=%s sources=%s replay=%s (train+val)",
+                "task_schedule epoch=%s session=%s phase=%s tasks=%s sources=%s replay=%s (train+val)",
                 epoch,
                 session.get("name"),
+                phase,
                 tasks,
                 sources,
                 replay_sources,
             )
             print(
-                f"task_schedule epoch={epoch} session={session.get('name')} "
+                f"task_schedule epoch={epoch} session={session.get('name')} phase={phase} "
                 f"tasks={tasks} sources={sources} replay={replay_sources} (train+val)",
                 flush=True,
             )
             if (
-                self._last_key is not None
+                not is_joint
+                and self._last_key is not None
                 and replay_ratio > 0
                 and replay_sources
                 and pl_module is not None
