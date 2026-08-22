@@ -96,3 +96,28 @@ def test_truncate_backward_trains_view_adapters() -> None:
     assert adapter_grads
     assert any(grad is not None and float(grad.abs().sum()) > 0.0 for grad in adapter_grads)
     assert out["z_semantic"].requires_grad
+
+
+def test_truncate_backward_trains_emitter_fingerprint_not_encoder() -> None:
+    model = SignalFoundationModel(_ci_cfg())
+    model.truncate_backward = True
+    model.skip_recon = True
+    model.train()
+    for param in model.parameters():
+        param.requires_grad = False
+    for param in model.emitter_head.parameters():
+        param.requires_grad = True
+    for param in model.emitter_fingerprint.parameters():
+        param.requires_grad = True
+    for param in model.task_interface.parameters():
+        param.requires_grad = True
+    out = model(make_batch(), mode="task", task="emitter")
+    out["emitter_logits"].sum().backward()
+    for param in model.encoder.parameters():
+        assert param.grad is None
+    assert any(
+        p.grad is not None and float(p.grad.abs().sum()) > 0
+        for p in model.emitter_fingerprint.parameters()
+    )
+    assert "emitter_fingerprint" in out
+    assert out["emitter_fingerprint"].requires_grad

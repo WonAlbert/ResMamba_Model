@@ -141,6 +141,36 @@ def test_uti_v2_composes_semantics_instead_of_random_task_ids() -> None:
     assert torch.allclose(feat_a.tokens, feat_b.tokens)
 
 
+def test_source_view_keeps_encoder_identity_and_is_not_constant() -> None:
+    """个体任务只用 source 视图；若先对去均值 token 池化，z_src 会退化成常数。"""
+    torch.manual_seed(0)
+    uti = UniversalTaskInterfaceV2(d_model=32, rank=8, dropout=0.0)
+    z = torch.randn(6, 32)
+    tokens = torch.randn(6, 8, 32)
+    mask = torch.ones(6, 8, dtype=torch.bool)
+    z_src, h_src = uti.build_views(z, tokens, patch_mask=mask)["source"]
+    assert z_src.shape == z.shape
+    assert float(z_src.detach().norm(dim=-1).mean()) > 0.5
+    # 样本间必须可分，不能是 bias 常数
+    assert float((z_src - z_src.mean(dim=0)).detach().norm(dim=-1).mean()) > 0.1
+    cos = torch.nn.functional.cosine_similarity(z_src, z, dim=-1).mean()
+    assert float(cos.detach()) > 0.5
+    # token 侧仍是去均值残差通路，与 raw h 不同
+    assert not torch.allclose(h_src, tokens, atol=1.0e-4)
+
+
+def test_emitter_pooled_tracks_z_enc_not_chance_collapse() -> None:
+    torch.manual_seed(1)
+    uti = UniversalTaskInterfaceV2(d_model=32, rank=8, dropout=0.0)
+    z = torch.randn(5, 32)
+    tokens = torch.randn(5, 6, 32)
+    mask = torch.ones(5, 6, dtype=torch.bool)
+    feat = uti(z, tokens, mask, "emitter")
+    cos = torch.nn.functional.cosine_similarity(feat.pooled, z, dim=-1).mean()
+    assert float(cos.detach()) > 0.2
+    assert float((feat.pooled - feat.pooled.mean(dim=0)).detach().norm(dim=-1).mean()) > 0.05
+
+
 def test_uti_v2_exposes_general_views_and_three_readouts() -> None:
     uti = UniversalTaskInterfaceV2(d_model=24, rank=6, dropout=0.0, task_names=())
     uti.add_task("pooled", TaskSpec("pooled", "classification", "pooled", "semantic", "rf"))

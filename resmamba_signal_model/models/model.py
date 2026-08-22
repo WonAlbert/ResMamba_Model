@@ -12,6 +12,7 @@ from resmamba_signal_model.models.adapters import SharedTaskAdapter, TaskAdapter
 from resmamba_signal_model.models.backbone import HybridEncoder
 from resmamba_signal_model.models.decoder import AttentionPooling, SharedDecoder
 from resmamba_signal_model.models.domain import DomainDiscriminator, GradientReversal
+from resmamba_signal_model.models.emitter_fingerprint import EmitterFingerprintBranch
 from resmamba_signal_model.models.heads import (
     EmitterHead,
     ImputationHead,
@@ -120,6 +121,8 @@ class SignalModelConfig:
     uti_legacy_mode: bool = False
     use_specialist_views: bool = True
     domain_prompt_size: int = 6
+    emitter_fingerprint: bool = True
+    emitter_fingerprint_channels: int = 64
     adapter_down_dim: int = 64
     num_task_types: int = 8
     build_adapters: bool = False
@@ -241,6 +244,7 @@ class SignalFoundationModel(nn.Module):
         self._skip_recon = False
         self._active_task: str | None = None
         self._negcos_temperature: float | None = None
+        self.emitter_fingerprint: EmitterFingerprintBranch | None = None
         task_names = tuple(cfg.task_names) or DEFAULT_TASKS
         need_uti = bool(cfg.build_task_heads or cfg.build_task_interface)
         if need_uti:
@@ -270,6 +274,14 @@ class SignalFoundationModel(nn.Module):
                     if kind in ("classification", "emitter"):
                         n_cls = int(cfg.num_emitters if kind == "emitter" else cfg.num_mod_classes)
                         self.z_linear_probes[name] = nn.Linear(cfg.d_model, n_cls)
+                if bool(getattr(cfg, "emitter_fingerprint", True)) and (
+                    "emitter" in task_names or self.emitter_head is not None
+                ):
+                    self.emitter_fingerprint = EmitterFingerprintBranch(
+                        cfg.d_model,
+                        conv_channels=int(getattr(cfg, "emitter_fingerprint_channels", 64) or 64),
+                        dropout=cfg.dropout,
+                    )
         if cfg.build_adapters:
             self.task_adapters = nn.ModuleDict(
                 {name: TaskAdapter(cfg.d_model, down_dim=cfg.adapter_down_dim) for name in task_names}
@@ -315,6 +327,9 @@ class SignalFoundationModel(nn.Module):
                 param.requires_grad = train_heads
         if self.recognition_heads is not None:
             for param in self.recognition_heads.parameters():
+                param.requires_grad = train_heads
+        if self.emitter_fingerprint is not None:
+            for param in self.emitter_fingerprint.parameters():
                 param.requires_grad = train_heads
 
     def task_kind(self, name: str) -> str:
@@ -1333,6 +1348,14 @@ class SignalFoundationModel(nn.Module):
             elif head is not None:
                 if kind == "classification" or task == "modulation":
                     out.update(head(features, dataset_id=dataset_id))
+                elif kind == "emitter" or task == "emitter":
+                    out.update(
+                        head(
+                            features,
+                            dataset_id=dataset_id,
+                            fingerprint=out.get("emitter_fingerprint"),
+                        )
+                    )
                 elif kind == "clustering":
                     ns = DEVICE_NAMESPACE if task == "emitter" else CONTENT_NAMESPACE
                     out.update(
@@ -1517,6 +1540,21 @@ class SignalFoundationModel(nn.Module):
             )
         if task_metadata is not None:
             out["task_metadata"] = task_metadata
+
+        if (
+            task_mode
+            and task
+            and (task == "emitter" or self.task_kind(task) == "emitter")
+            and self.emitter_fingerprint is not None
+        ):
+            # 必须在 truncate/no_grad 之外算：raw IQ 指纹支路要完整反传，encoder 仍截断。
+            out["emitter_fingerprint"] = self.emitter_fingerprint(
+                iq_t,
+                mask_t,
+                revin_stats=out.get("revin_stats"),
+                modality_id=out.get("modality_id", modality_id),
+                complex_pair=complex_pair,
+            )
 
         if mode in ("pretrain", "mae") and self.task_interface is not None:
             out = self._attach_uti_readouts(out, task="pretrain", allow_dataset_condition=False)

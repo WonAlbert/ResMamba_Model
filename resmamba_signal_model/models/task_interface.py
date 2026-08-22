@@ -473,8 +473,9 @@ class UniversalTaskInterfaceV2(nn.Module):
     ) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
         """构造 specialist 视图。
 
-        不再是 ``adapter(z_general)`` 的三份拷贝：semantic / source / context
-        分别用 encoder token 的均匀池化、去均值残差、慢衰减池化，再经低秩残差。
+        不再是 ``adapter(z_general)`` 的三份拷贝：semantic 为 ``z_enc`` 低秩残差；
+        source 为去均值 token 残差（先 adapter 再池化，并加回 ``z_enc``）；
+        context 为慢衰减池化后再低秩残差。
         ``general`` 仍对应 encoder 全局读出 ``z_general`` / ``h_general``。
         """
         views: dict[str, tuple[torch.Tensor, torch.Tensor]] = {
@@ -499,11 +500,13 @@ class UniversalTaskInterfaceV2(nn.Module):
         z_sem = self.view_adapters["semantic"](z_general)
         h_sem = self.view_adapters["semantic"](h_general)
 
+        # source：去均值 token → 低秩残差 → 再池化，并残差加回 z_enc。
+        # 旧实现先 pool(h-mean) 再 adapter：均匀 mask 下 mean(h-mean)≡0，
+        # z_src 退化为与样本无关的常数，个体头只能落到 1/C 随机水平。
         z_mean = self._masked_mean(h_general, patch_mask)
-        h_src = h_general - z_mean.unsqueeze(1)
-        z_src = self._masked_mean(h_src, patch_mask)
-        h_src = self.view_adapters["source"](h_src)
-        z_src = self.view_adapters["source"](z_src)
+        h_resid = h_general - z_mean.unsqueeze(1)
+        h_src = self.view_adapters["source"](h_resid)
+        z_src = self.view_adapters["source"](z_general) + self._masked_mean(h_src, patch_mask)
 
         z_ctx = self._context_pool(h_general, patch_mask)
         h_ctx = self.view_adapters["context"](h_general)

@@ -117,6 +117,8 @@ def test_default_heads_use_low_rank_prototype() -> None:
     assert model.modulation_head.classifier.low_rank_prototype
     assert model.emitter_head.classifier.low_rank_prototype
     assert model.modulation_head.classifier.weight.shape[-1] == 64
+    assert model.emitter_fingerprint is not None
+    assert any(n.startswith("fp_head.") for n in model.emitter_head.state_dict())
 
 
 def test_low_rank_prototype_shrinks_cosine_and_mlp_and_stays_opt_in() -> None:

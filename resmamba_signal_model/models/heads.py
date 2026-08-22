@@ -293,7 +293,11 @@ class ModulationHead(nn.Module):
 
 
 class EmitterHead(nn.Module):
-    """低秩原型分类（默认）或深层 Cosine 头；禁止与调制共用 MLP。消费 UTI pooled。"""
+    """低秩原型分类（默认）或深层 Cosine 头；禁止与调制共用 MLP。消费 UTI pooled。
+
+    可选 ``fingerprint``：raw-IQ 指纹支路。``classifier.*`` 键名不变，旧预训练 /
+    调制段权重仍可加载；新增 ``fp_head`` 缺键时随机初始化。
+    """
 
     def __init__(
         self,
@@ -316,11 +320,28 @@ class EmitterHead(nn.Module):
             low_rank_prototype=low_rank_prototype,
             prototype_rank=prototype_rank,
         )
+        # 指纹直连分类（类 CNN 的 GAP→FC），不经过 64 维 cosine 瓶颈。
+        self.fp_head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, num_emitters),
+        )
 
-    def forward(self, features: torch.Tensor | TaskFeatures, dataset_id: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        features: torch.Tensor | TaskFeatures,
+        dataset_id: torch.Tensor | None = None,
+        fingerprint: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         del dataset_id
         h = _as_pooled(features)
+        if fingerprint is not None:
+            h = h + fingerprint.to(dtype=h.dtype)
         logits = self.classifier(h + self.shared(h))
+        if fingerprint is not None:
+            logits = logits + self.fp_head(fingerprint.float()).to(dtype=logits.dtype)
         return {"emitter_logits": logits, "task_logits": logits}
 
 

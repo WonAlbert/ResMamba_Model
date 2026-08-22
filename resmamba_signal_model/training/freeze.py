@@ -73,6 +73,7 @@ def apply_stage_freeze(
         # encoder 读出在 truncate 后重算，需可训
         _set_module_grad(getattr(model, "encoder_pool", None), True)
         _set_module_grad(getattr(model, "encoder_repr_norm", None), True)
+        _set_module_grad(getattr(model, "emitter_fingerprint", None), True)
         for _name, head in _iter_task_heads(model):
             _set_module_grad(head, True)
         return
@@ -100,6 +101,8 @@ def apply_stage_freeze(
         if head is None and hasattr(model, "get_task_head"):
             head = model.get_task_head(task)
         _set_module_grad(head, True)
+        if task == "emitter":
+            _set_module_grad(getattr(model, "emitter_fingerprint", None), True)
         if bool(train_cfg.get("ssm_cotrain_dt_bias") or (train_cfg.get("peft") or {}).get("ssm_cotrain_dt_bias")):
             _unfreeze_dt_bias(model)
         return
@@ -120,6 +123,7 @@ def apply_stage_freeze(
                 _set_module_grad(adapter, True)
         _set_module_grad(getattr(model, "shared_adapter", None), True)
         _set_module_grad(getattr(model, "prototype_registry", None), True)
+        _set_module_grad(getattr(model, "emitter_fingerprint", None), True)
         for _name, head in _iter_task_heads(model):
             _set_module_grad(head, True)
         if bool(train_cfg.get("ssm_cotrain_dt_bias") or (train_cfg.get("peft") or {}).get("ssm_cotrain_dt_bias")):
