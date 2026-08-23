@@ -90,12 +90,18 @@ class DecoderBlock(nn.Module):
         *,
         seq_idx: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor | None = None,
+        moe_route_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x = self.mamba(x, key_padding_mask=key_padding_mask, seq_idx=seq_idx, cu_seqlens=cu_seqlens)
         self.last_moe_aux = None
         ffn_in = self.ffn_norm(x)
         if self._ffn_is_moe:
-            ffn_out, aux = self.ffn(ffn_in, key_padding_mask=key_padding_mask)
+            ffn_out, aux = self.ffn(
+                ffn_in,
+                key_padding_mask=key_padding_mask,
+                route_weights=moe_route_weights,
+                seq_idx=seq_idx,
+            )
             self.last_moe_aux = aux
         else:
             ffn_out = self.ffn(ffn_in)
@@ -435,10 +441,18 @@ class SharedDecoder(nn.Module):
         key_padding_mask: torch.Tensor | None,
         seq_idx: torch.Tensor | None,
         cu_seqlens: torch.Tensor | None,
+        *,
+        moe_route_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         self._last_moe_aux.clear()
         for block in self.blocks:
-            h = block(h, key_padding_mask=key_padding_mask, seq_idx=seq_idx, cu_seqlens=cu_seqlens)
+            h = block(
+                h,
+                key_padding_mask=key_padding_mask,
+                seq_idx=seq_idx,
+                cu_seqlens=cu_seqlens,
+                moe_route_weights=moe_route_weights,
+            )
             if block.last_moe_aux is not None:
                 self._last_moe_aux.append(block.last_moe_aux)
         return h
@@ -460,6 +474,7 @@ class SharedDecoder(nn.Module):
         legacy_reconstruction: bool | None = None,
         physics_mask: torch.Tensor | None = None,
         amp_aux: torch.Tensor | None = None,
+        moe_route_weights: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         packing = self.sequence_packing if sequence_packing is None else sequence_packing
         if target_mask is None:
@@ -480,11 +495,11 @@ class SharedDecoder(nn.Module):
 
         if packing:
             packed, cu_seqlens, seq_idx = pack_valid_tokens(tokens, tok_valid)
-            dec_out = self._run_blocks(packed, None, seq_idx, cu_seqlens)
+            dec_out = self._run_blocks(packed, None, seq_idx, cu_seqlens, moe_route_weights=moe_route_weights)
             h_dec_full = scatter_packed_tokens(dec_out, tok_valid)
         else:
             pad_mask = ~tok_valid
-            h_dec_full = self._run_blocks(tokens, pad_mask, None, None)
+            h_dec_full = self._run_blocks(tokens, pad_mask, None, None, moe_route_weights=moe_route_weights)
 
         dec_h = h_dec_full[:, 0]
         patch_h = h_dec_full[:, 1:]

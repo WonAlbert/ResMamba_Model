@@ -29,9 +29,15 @@ class MambaMoEFFNBlock(nn.Module):
         *,
         seq_idx: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor | None = None,
+        moe_route_weights: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, MoEAux | None]:
         x = self.mamba(x, key_padding_mask=key_padding_mask, seq_idx=seq_idx, cu_seqlens=cu_seqlens)
-        y, aux = self.moe_ffn(self.ffn_norm(x), key_padding_mask=key_padding_mask)
+        y, aux = self.moe_ffn(
+            self.ffn_norm(x),
+            key_padding_mask=key_padding_mask,
+            route_weights=moe_route_weights,
+            seq_idx=seq_idx,
+        )
         return x + y, aux
 
 
@@ -132,6 +138,7 @@ class HybridEncoder(nn.Module):
         key_padding_mask: torch.Tensor | None,
         seq_idx: torch.Tensor | None,
         cu_seqlens: torch.Tensor | None,
+        moe_route_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if isinstance(layer, MambaMoEFFNBlock):
             hidden, aux = layer(
@@ -139,6 +146,7 @@ class HybridEncoder(nn.Module):
                 key_padding_mask=key_padding_mask,
                 seq_idx=seq_idx,
                 cu_seqlens=cu_seqlens,
+                moe_route_weights=moe_route_weights,
             )
             if aux is not None:
                 self._last_moe_aux.append(aux)
@@ -152,6 +160,7 @@ class HybridEncoder(nn.Module):
         *,
         seq_idx: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor | None = None,
+        moe_route_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         hidden = tokens
         packed = seq_idx is not None and cu_seqlens is not None
@@ -160,20 +169,40 @@ class HybridEncoder(nn.Module):
         for layer in self.mamba_layers:
             if use_checkpoint:
                 fn: Callable[..., torch.Tensor] = lambda x, layer=layer: self._run_mamba_layer(
-                    layer, x, key_padding_mask, seq_idx, cu_seqlens
+                    layer,
+                    x,
+                    key_padding_mask,
+                    seq_idx,
+                    cu_seqlens,
+                    moe_route_weights,
                 )
                 hidden = checkpoint(fn, hidden, use_reentrant=False)
             else:
-                hidden = self._run_mamba_layer(layer, hidden, key_padding_mask, seq_idx, cu_seqlens)
+                hidden = self._run_mamba_layer(
+                    layer,
+                    hidden,
+                    key_padding_mask,
+                    seq_idx,
+                    cu_seqlens,
+                    moe_route_weights,
+                )
         for layer in self.transformer_layers:
             if packed:
                 padded, valid = unpack_packed_tokens(hidden, cu_seqlens)
-                padded = layer(padded, key_padding_mask=~valid)
+                padded = layer(
+                    padded,
+                    key_padding_mask=~valid,
+                    moe_route_weights=moe_route_weights,
+                )
                 if layer.last_moe_aux is not None:
                     self._last_moe_aux.append(layer.last_moe_aux)
                 hidden = repack_tokens(padded, cu_seqlens)
             else:
-                hidden = layer(hidden, key_padding_mask=key_padding_mask)
+                hidden = layer(
+                    hidden,
+                    key_padding_mask=key_padding_mask,
+                    moe_route_weights=moe_route_weights,
+                )
                 if layer.last_moe_aux is not None:
                     self._last_moe_aux.append(layer.last_moe_aux)
         return self.norm(hidden)

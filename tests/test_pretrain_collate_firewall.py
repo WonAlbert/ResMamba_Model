@@ -19,7 +19,7 @@ def test_pretrain_collate_strips_ids() -> None:
         "dataset_id": torch.tensor([1, 2]),
         "mod_label_id": torch.tensor([3, 4]),
         "emitter_id": torch.tensor([5, 6]),
-        "h5_path": ["a.h5", "b.h5"],
+        "h5_path": ["dataset/h5/radchar_train.h5", "dataset/h5/radar_mod15_train.h5"],
         "receiver_id": ["rx1", "rx2"],
     }
     out = pretrain_collate_firewall(batch)
@@ -28,6 +28,7 @@ def test_pretrain_collate_strips_ids() -> None:
     assert "emitter_id" not in out
     assert "h5_path" not in out
     assert "receiver_id" not in out
+    assert out["moe_route_stem"] == ["radchar", "radar_mod15"]
     assert "length" in out
 
 

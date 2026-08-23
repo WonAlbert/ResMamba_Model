@@ -49,6 +49,7 @@ def main() -> None:
     }
     with torch.no_grad():
         out = model(batch, mode="pretrain")
+        out_task = model(batch, mode="downstream", task="ld_intrapulse")
     losses = foundation_pretrain_losses(out, batch)
     total, parts = weighted_pretrain_loss(
         out,
@@ -63,6 +64,12 @@ def main() -> None:
     assert "moe_load_balance" in out
     assert torch.isfinite(out["moe_load_balance"])
     assert "moe" in parts
+    aux = out_task.get("moe_gate_weights")
+    assert aux
+    tok_weights = aux[0][0]
+    active = tok_weights.sum(dim=-1) > 0
+    assert bool(active.any())
+    assert (tok_weights[active].argmax(dim=-1) == 0).all()
     print("smoke_forward ok")
 
 

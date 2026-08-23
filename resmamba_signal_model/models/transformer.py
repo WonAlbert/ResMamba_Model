@@ -133,7 +133,13 @@ class MemoryTransformerBlock(nn.Module):
             mem_pad = valid.squeeze(-1).sum(dim=-1) <= 0
         return mem, mem_pad, chunk_size
 
-    def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        key_padding_mask: torch.Tensor | None = None,
+        *,
+        moe_route_weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         seq_len = x.shape[1]
         h = self.norm1(x)
         if seq_len <= self.attn_window:
@@ -148,7 +154,11 @@ class MemoryTransformerBlock(nn.Module):
         self.last_moe_aux = None
         ffn_in = self.norm2(x)
         if self._ffn_is_moe:
-            ffn_out, aux = self.ffn(ffn_in, key_padding_mask=key_padding_mask)
+            ffn_out, aux = self.ffn(
+                ffn_in,
+                key_padding_mask=key_padding_mask,
+                route_weights=moe_route_weights,
+            )
             self.last_moe_aux = aux
         else:
             ffn_out = self.ffn(ffn_in)

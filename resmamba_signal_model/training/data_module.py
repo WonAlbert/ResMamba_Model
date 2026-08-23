@@ -27,6 +27,7 @@ from resmamba_signal_model.data.sampling import (
     build_dataset_balanced_sampler,
     build_uniform_sampler,
     dataset_class_ids,
+    h5_dataset_stem,
     plan_fixed_token_budget_batches,
     pool_sample_lengths,
     regroup_token_batches_by_length,
@@ -112,7 +113,16 @@ def is_pretrain_blocked_key(key: str) -> bool:
 
 
 def pretrain_collate_firewall(batch: dict[str, Any]) -> dict[str, Any]:
-    """预训练模型 batch 不得含标签 / dataset_id / 采集元数据 / 文件身份。"""
+    """预训练模型 batch 不得含标签 / dataset_id / 采集元数据 / 文件身份。
+
+    ``moe_route_stem`` 由 ``h5_path`` 派生，仅用于 MoE family 路由，不进入标签空间。
+    """
+    if "h5_path" in batch and "moe_route_stem" not in batch:
+        paths = batch["h5_path"]
+        if isinstance(paths, (list, tuple)):
+            batch["moe_route_stem"] = [h5_dataset_stem(Path(path).name) for path in paths]
+        else:
+            batch["moe_route_stem"] = h5_dataset_stem(Path(paths).name)
     return {key: value for key, value in batch.items() if not is_pretrain_blocked_key(key)}
 
 # 训练 sampler 不得使用 global_label_id（仅 val 聚类指标）。

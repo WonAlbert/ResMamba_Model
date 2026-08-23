@@ -82,7 +82,7 @@ class _TimeBranchExpert(nn.Module):
 
 
 class TimeFreqTokenizer(nn.Module):
-    """共享 stem + 三路具名专家（LD 脉内 / LD 型号 / TX 调制）+ 内容 gate 融合。"""
+    """共享 stem + 三路具名专家（LD 脉内 / LD 型号 / TX 调制）+ task/family 硬路由融合。"""
 
     def __init__(self, cfg: TimeFreqTokenizerConfig) -> None:
         super().__init__()
@@ -160,6 +160,7 @@ class TimeFreqTokenizer(nn.Module):
         *,
         modality_id: torch.Tensor | None = None,
         complex_pair: torch.Tensor | bool | None = True,
+        moe_route_weights: torch.Tensor | None = None,
         **_unused,
     ) -> dict[str, torch.Tensor]:
         if iq.ndim != 3 or iq.shape[1] != 2:
@@ -179,7 +180,11 @@ class TimeFreqTokenizer(nn.Module):
         pad_mask = ~patch_mask
         self._last_moe_aux.clear()
         if self.moe_fusion is not None:
-            tokens, aux = self.moe_fusion(branches, key_padding_mask=pad_mask)
+            tokens, aux = self.moe_fusion(
+                branches,
+                key_padding_mask=pad_mask,
+                route_weights=moe_route_weights,
+            )
             self._last_moe_aux.append(aux)
         else:
             tokens = sum(branches) / float(len(branches))

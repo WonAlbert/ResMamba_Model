@@ -6,8 +6,31 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from resmamba_signal_model.data.sampling import h5_dataset_stem, stem_matches_pattern
+
 # 与识别任务对齐的三路专家语义（聚类/预测复用混合，不另开专家）
 MOE_EXPERT_NAMES: tuple[str, ...] = ("ld_intrapulse", "ld_model", "tx_modulation")
+
+# 下游：按任务名硬路由（gate 不得使用标签）
+TASK_MOE_ROUTES: dict[str, tuple[float, ...]] = {
+    "ld_intrapulse": (1.0, 0.0, 0.0),
+    "ld_model": (0.0, 1.0, 0.0),
+    "tx_modulation": (0.0, 0.0, 1.0),
+    "ld_clustering": (0.5, 0.5, 0.0),
+    "tx_clustering": (0.0, 0.0, 1.0),
+    "prediction": (1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0),
+}
+
+# 预训练：按 H5 dataset stem（非 dataset_id）映射到专家；radcom 族均匀混合
+PRETRAIN_STEM_MOE_PATTERNS: tuple[tuple[str, tuple[float, ...]], ...] = (
+    ("radchar", (1.0, 0.0, 0.0)),
+    ("radar_mod15", (0.0, 1.0, 0.0)),
+    ("cjr_mix", (0.0, 1.0, 0.0)),
+    ("rml2016_*", (0.0, 0.0, 1.0)),
+    ("xidian14", (0.0, 0.0, 1.0)),
+    ("panoradio_hf", (0.0, 0.0, 1.0)),
+    ("radcom_*", (1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0)),
+)
 
 
 @dataclass
@@ -15,6 +38,82 @@ class MoEAux:
     gate_weights: torch.Tensor
     load_balance_loss: torch.Tensor
     expert_names: tuple[str, ...] = field(default_factory=lambda: MOE_EXPERT_NAMES)
+
+
+def _normalize_route_vector(weights: tuple[float, ...] | list[float], num_experts: int) -> torch.Tensor:
+    vec = list(weights[:num_experts])
+    if len(vec) < num_experts:
+        vec.extend([0.0] * (num_experts - len(vec)))
+    total = float(sum(vec))
+    if total <= 0.0:
+        vec = [1.0 / float(num_experts)] * num_experts
+    else:
+        vec = [float(v) / total for v in vec]
+    return torch.tensor(vec, dtype=torch.float32)
+
+
+def uniform_route_weights(num_experts: int, *, device: torch.device | None = None) -> torch.Tensor:
+    return torch.full((num_experts,), 1.0 / float(max(num_experts, 1)), device=device, dtype=torch.float32)
+
+
+def resolve_task_route_weights(task: str, num_experts: int) -> torch.Tensor:
+    key = str(task).strip()
+    if key in TASK_MOE_ROUTES:
+        return _normalize_route_vector(TASK_MOE_ROUTES[key], num_experts)
+    return uniform_route_weights(num_experts)
+
+
+def resolve_pretrain_stem_route_weights(stem: str, num_experts: int) -> torch.Tensor:
+    name = h5_dataset_stem(str(stem)) if str(stem).endswith(".h5") else str(stem)
+    for pattern, weights in PRETRAIN_STEM_MOE_PATTERNS:
+        if stem_matches_pattern(name, pattern):
+            return _normalize_route_vector(weights, num_experts)
+    return uniform_route_weights(num_experts)
+
+
+def resolve_pretrain_batch_route_weights(
+    stems: list[str] | tuple[str, ...],
+    num_experts: int,
+    *,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    rows = [resolve_pretrain_stem_route_weights(stem, num_experts) for stem in stems]
+    return torch.stack(rows, dim=0).to(device=device)
+
+
+def expand_route_weights(
+    route_weights: torch.Tensor,
+    x: torch.Tensor,
+    *,
+    num_experts: int,
+    key_padding_mask: torch.Tensor | None = None,
+    seq_idx: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """[B,E] 或 [E] -> [B,T,E] token 级路由权重；packed 路径用 ``seq_idx`` 对齐原 batch。"""
+    batch, seq_len = int(x.shape[0]), int(x.shape[1])
+    w = route_weights
+    if w.ndim == 1:
+        w = w.unsqueeze(0)
+    w = w.to(device=x.device, dtype=x.dtype)
+    if w.shape[-1] != num_experts:
+        raise ValueError(f"route_weights 末维 {w.shape[-1]} != num_experts {num_experts}")
+
+    if seq_idx is not None and w.shape[0] != batch:
+        idx = seq_idx.reshape(-1).long()
+        if idx.numel() != seq_len:
+            raise ValueError(f"seq_idx 长度 {idx.numel()} != seq_len {seq_len}")
+        idx = idx.clamp(min=0, max=max(w.shape[0] - 1, 0))
+        token_w = w.index_select(0, idx)
+        weights = token_w.view(batch, seq_len, num_experts)
+    elif w.shape[0] == 1 and batch > 1:
+        weights = w.expand(batch, -1)[:, None, :].expand(batch, seq_len, num_experts).contiguous()
+    elif w.shape[0] == batch:
+        weights = w[:, None, :].expand(batch, seq_len, num_experts).contiguous()
+    else:
+        raise ValueError(f"route_weights batch {w.shape[0]} 与 x batch {batch} 不匹配")
+    if key_padding_mask is not None:
+        weights = weights.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
+    return weights
 
 
 def load_balancing_loss(
@@ -41,7 +140,7 @@ def load_balancing_loss(
 
 
 class MoEGate(nn.Module):
-    """内容路由 gate；禁止 dataset_id / task 名等域泄漏特征。"""
+    """Legacy 内容路由 gate（checkpoint 兼容）；前向默认使用 task / family 硬路由。"""
 
     def __init__(self, in_dim: int, num_experts: int, *, top_k: int | None = None) -> None:
         super().__init__()
@@ -85,7 +184,7 @@ class ExpertSwiGLU(nn.Module):
 
 
 class MoEFFN(nn.Module):
-    """稠密 softmax 混合 MoE-FFN；可选 top-k 稀疏路由。"""
+    """稠密 MoE-FFN；路由由 task / dataset stem 指定，不用内容 gate。"""
 
     def __init__(
         self,
@@ -99,6 +198,7 @@ class MoEFFN(nn.Module):
         super().__init__()
         self.d_model = int(d_model)
         self.num_experts = int(num_experts)
+        self.top_k = top_k
         hidden = max(8, int(d_model * float(ffn_expand)))
         self.experts = nn.ModuleList(ExpertSwiGLU(d_model, hidden) for _ in range(self.num_experts))
         self.gate = MoEGate(gate_input_dim or d_model, self.num_experts, top_k=top_k)
@@ -109,12 +209,28 @@ class MoEFFN(nn.Module):
         *,
         gate_input: torch.Tensor | None = None,
         key_padding_mask: torch.Tensor | None = None,
+        route_weights: torch.Tensor | None = None,
+        seq_idx: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, MoEAux]:
-        gate_in = x if gate_input is None else gate_input
-        weights, _ = self.gate(gate_in, key_padding_mask=key_padding_mask)
+        del gate_input  # 内容路由已禁用
+        if route_weights is None:
+            route_weights = uniform_route_weights(self.num_experts, device=x.device)
+        weights = expand_route_weights(
+            route_weights,
+            x,
+            num_experts=self.num_experts,
+            key_padding_mask=key_padding_mask,
+            seq_idx=seq_idx,
+        )
+        if self.top_k is not None and self.top_k < self.num_experts:
+            topk_vals, topk_idx = torch.topk(weights, k=self.top_k, dim=-1)
+            sparse = weights.new_zeros(weights.shape)
+            sparse.scatter_(-1, topk_idx, topk_vals)
+            denom = sparse.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
+            weights = sparse / denom
         expert_outs = torch.stack([expert(x) for expert in self.experts], dim=-2)
         mixed = (weights.unsqueeze(-1) * expert_outs).sum(dim=-2)
-        lb = load_balancing_loss(weights, num_experts=self.num_experts, key_padding_mask=key_padding_mask)
+        lb = weights.new_tensor(0.0)
         names = MOE_EXPERT_NAMES[: self.num_experts]
         if len(names) < self.num_experts:
             names = tuple(f"expert_{i}" for i in range(self.num_experts))
@@ -122,7 +238,7 @@ class MoEFFN(nn.Module):
 
 
 class MoEFusion(nn.Module):
-    """多路分支输出按 token 级 gate 融合（Tokenizer 等）。"""
+    """多路分支输出按 task / family 硬路由融合（Tokenizer）。"""
 
     def __init__(
         self,
@@ -134,6 +250,7 @@ class MoEFusion(nn.Module):
         super().__init__()
         self.d_model = int(d_model)
         self.num_branches = int(num_branches)
+        self.top_k = top_k
         self.gate = MoEGate(d_model * num_branches, num_branches, top_k=top_k)
 
     def forward(
@@ -141,14 +258,30 @@ class MoEFusion(nn.Module):
         branches: list[torch.Tensor],
         *,
         key_padding_mask: torch.Tensor | None = None,
+        route_weights: torch.Tensor | None = None,
+        seq_idx: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, MoEAux]:
         if len(branches) != self.num_branches:
             raise ValueError(f"期望 {self.num_branches} 路分支，收到 {len(branches)}")
         stacked = torch.stack(branches, dim=-2)
-        gate_in = torch.cat(branches, dim=-1)
-        weights, _ = self.gate(gate_in, key_padding_mask=key_padding_mask)
+        ref = branches[0]
+        if route_weights is None:
+            route_weights = uniform_route_weights(self.num_branches, device=ref.device)
+        weights = expand_route_weights(
+            route_weights,
+            ref,
+            num_experts=self.num_branches,
+            key_padding_mask=key_padding_mask,
+            seq_idx=seq_idx,
+        )
+        if self.top_k is not None and self.top_k < self.num_branches:
+            topk_vals, topk_idx = torch.topk(weights, k=self.top_k, dim=-1)
+            sparse = weights.new_zeros(weights.shape)
+            sparse.scatter_(-1, topk_idx, topk_vals)
+            denom = sparse.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
+            weights = sparse / denom
         fused = (weights.unsqueeze(-1) * stacked).sum(dim=-2)
-        lb = load_balancing_loss(weights, num_experts=self.num_branches, key_padding_mask=key_padding_mask)
+        lb = weights.new_tensor(0.0)
         names = MOE_EXPERT_NAMES[: self.num_branches]
         if len(names) < self.num_branches:
             names = tuple(f"branch_{i}" for i in range(self.num_branches))

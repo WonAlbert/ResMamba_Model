@@ -21,7 +21,13 @@ from resmamba_signal_model.models.heads import (
     remap_task_head_checkpoints,
     register_task as register_task_head,
 )
-from resmamba_signal_model.models.moe import aggregate_moe_aux
+from resmamba_signal_model.models.moe import (
+    aggregate_moe_aux,
+    resolve_pretrain_batch_route_weights,
+    resolve_pretrain_stem_route_weights,
+    resolve_task_route_weights,
+    uniform_route_weights,
+)
 from resmamba_signal_model.models.physics import project_patch_energy, restore_absolute_log_power, sequence_physics
 from resmamba_signal_model.models.prototypes import DEVICE_NAMESPACE, CONTENT_NAMESPACE, PrototypeRegistry
 from resmamba_signal_model.models.revin import RevIN, RevINStats, clip_normalized
@@ -932,7 +938,14 @@ class SignalFoundationModel(nn.Module):
             iq, sample_mask = random_train_chunk(iq, sample_mask, self.cfg.chunk_len)
         return iq, sample_mask
 
-    def _encode_tokens(self, tokens: torch.Tensor, visible: torch.Tensor, patch_mask: torch.Tensor) -> tuple[torch.Tensor, bool]:
+    def _encode_tokens(
+        self,
+        tokens: torch.Tensor,
+        visible: torch.Tensor,
+        patch_mask: torch.Tensor,
+        *,
+        moe_route_weights: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, bool]:
         visible = _ensure_min_visible(visible, patch_mask)
         if self.cfg.encode_visible_only:
             if int(visible.sum()) == 0:
@@ -940,11 +953,27 @@ class SignalFoundationModel(nn.Module):
             packed, cu_seqlens, seq_idx = pack_valid_tokens(tokens, visible)
             if packed.shape[1] == 0:
                 return packed, True
-            return self.encoder(packed, seq_idx=seq_idx, cu_seqlens=cu_seqlens), True
+            return (
+                self.encoder(
+                    packed,
+                    seq_idx=seq_idx,
+                    cu_seqlens=cu_seqlens,
+                    moe_route_weights=moe_route_weights,
+                ),
+                True,
+            )
         if self.cfg.sequence_packing:
             packed, cu_seqlens, seq_idx = pack_valid_tokens(tokens, patch_mask)
-            return self.encoder(packed, seq_idx=seq_idx, cu_seqlens=cu_seqlens), True
-        return self.encoder(tokens, key_padding_mask=~patch_mask), False
+            return (
+                self.encoder(
+                    packed,
+                    seq_idx=seq_idx,
+                    cu_seqlens=cu_seqlens,
+                    moe_route_weights=moe_route_weights,
+                ),
+                True,
+            )
+        return self.encoder(tokens, key_padding_mask=~patch_mask, moe_route_weights=moe_route_weights), False
 
     def _pool_encoder_identity(
         self,
@@ -984,6 +1013,29 @@ class SignalFoundationModel(nn.Module):
         aux_list.extend(self.encoder.pop_moe_aux())
         aux_list.extend(self.decoder.pop_moe_aux())
         return aggregate_moe_aux(aux_list)
+
+    def _resolve_moe_route_weights(
+        self,
+        *,
+        batch_size: int,
+        device: torch.device,
+        mode: str,
+        task: str | None,
+        batch: dict[str, Any] | None,
+    ) -> torch.Tensor:
+        num_experts = max(1, int(self.cfg.moe_num_experts))
+        if mode in ("task", "downstream") and task:
+            vec = resolve_task_route_weights(task, num_experts).to(device=device)
+            return vec.unsqueeze(0).expand(batch_size, -1)
+        if mode in ("pretrain", "mae") and batch is not None:
+            stems = batch.get("moe_route_stem")
+            if isinstance(stems, (list, tuple)) and len(stems) == batch_size:
+                return resolve_pretrain_batch_route_weights(stems, num_experts, device=device)
+            if isinstance(stems, str):
+                vec = resolve_pretrain_stem_route_weights(stems, num_experts).to(device=device)
+                return vec.unsqueeze(0).expand(batch_size, -1)
+        vec = uniform_route_weights(num_experts, device=device)
+        return vec.unsqueeze(0).expand(batch_size, -1)
 
     def _refresh_encoder_identity(self, out: dict[str, Any]) -> dict[str, Any]:
         """truncate_backward 后在可微路径上重算 encoder 读出，使 ``encoder_pool`` 可训。"""
@@ -1031,6 +1083,7 @@ class SignalFoundationModel(nn.Module):
         modality_id: torch.Tensor | None = None,
         complex_pair: torch.Tensor | bool | None = True,
         mae_strategy: str | None = None,
+        moe_route_weights: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         orig_patches, orig_patch_mask = patchify_iq(iq, sample_mask, self.cfg.patch_size)
         mae_mask, suffix_mask, span_mask, mask_strategy = self._mask_for_mode(
@@ -1078,6 +1131,7 @@ class SignalFoundationModel(nn.Module):
             sample_mask,
             modality_id=modality_id,
             complex_pair=complex_pair,
+            moe_route_weights=moe_route_weights,
         )
         tokens = tok["tokens"]
         patch_mask = tok["patch_mask"]
@@ -1102,7 +1156,12 @@ class SignalFoundationModel(nn.Module):
         mae_mask = mae_mask & target_mask
         suffix_mask = suffix_mask & target_mask
         span_mask = span_mask & target_mask
-        h_vis, packed_enc = self._encode_tokens(tokens, visible, patch_mask)
+        h_vis, packed_enc = self._encode_tokens(
+            tokens,
+            visible,
+            patch_mask,
+            moe_route_weights=moe_route_weights,
+        )
         z_enc, h_enc = self._pool_encoder_identity(
             tokens,
             patch_mask,
@@ -1124,6 +1183,7 @@ class SignalFoundationModel(nn.Module):
             task_context=task_context,
             physics_mask=phys_mask,
             amp_aux=amp_aux_vec,
+            moe_route_weights=moe_route_weights,
         )
         skip_recon = dec["recon_norm"] is None
         if skip_recon:
@@ -1215,6 +1275,7 @@ class SignalFoundationModel(nn.Module):
         modality_id: torch.Tensor | None = None,
         complex_pair: torch.Tensor | bool | None = True,
         mae_strategy: str | None = None,
+        moe_route_weights: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         length = int(iq.shape[-1])
         overlap = self.cfg.chunk_overlap_samples
@@ -1238,6 +1299,7 @@ class SignalFoundationModel(nn.Module):
                 modality_id=modality_id,
                 complex_pair=complex_pair,
                 mae_strategy=mae_strategy,
+                moe_route_weights=moe_route_weights,
             )
             if not out["patch_mask"].any():
                 continue
@@ -1258,6 +1320,7 @@ class SignalFoundationModel(nn.Module):
                 modality_id=modality_id,
                 complex_pair=complex_pair,
                 mae_strategy=mae_strategy,
+                moe_route_weights=moe_route_weights,
             )
         assert last is not None
         stacked = torch.stack(zs, dim=1)
@@ -1299,6 +1362,7 @@ class SignalFoundationModel(nn.Module):
         modality_id: torch.Tensor | None = None,
         complex_pair: torch.Tensor | bool | None = True,
         mae_strategy: str | None = None,
+        moe_route_weights: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         length = int(sample_mask.sum().item())
         if (not is_train) and length > self.cfg.chunk_len:
@@ -1311,6 +1375,7 @@ class SignalFoundationModel(nn.Module):
                 modality_id=modality_id,
                 complex_pair=complex_pair,
                 mae_strategy=mae_strategy,
+                moe_route_weights=moe_route_weights,
             )
         return self._core_forward(
             iq,
@@ -1321,6 +1386,7 @@ class SignalFoundationModel(nn.Module):
             modality_id=modality_id,
             complex_pair=complex_pair,
             mae_strategy=mae_strategy,
+            moe_route_weights=moe_route_weights,
         )
 
     def _forward_heterogeneous_batch(
@@ -1380,6 +1446,7 @@ class SignalFoundationModel(nn.Module):
         modality_id: torch.Tensor | None = None,
         complex_pair: torch.Tensor | bool | None = True,
         mae_strategy: str | None = None,
+        moe_route_weights: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         if (not is_train) and int(mask_t.sum(dim=1).max().item()) > self.cfg.chunk_len:
             return self._forward_chunked(
@@ -1391,6 +1458,7 @@ class SignalFoundationModel(nn.Module):
                 modality_id=modality_id,
                 complex_pair=complex_pair,
                 mae_strategy=mae_strategy,
+                moe_route_weights=moe_route_weights,
             )
         return self._core_forward(
             iq_t,
@@ -1401,6 +1469,7 @@ class SignalFoundationModel(nn.Module):
             modality_id=modality_id,
             complex_pair=complex_pair,
             mae_strategy=mae_strategy,
+            moe_route_weights=moe_route_weights,
         )
 
     @staticmethod
@@ -1481,6 +1550,13 @@ class SignalFoundationModel(nn.Module):
                 is_train=is_train,
                 modality_id=modality_id,
                 complex_pair=complex_pair,
+                moe_route_weights=self._resolve_moe_route_weights(
+                    batch_size=int(iq_t.shape[0]) if torch.is_tensor(iq_t) else len(iq_t),
+                    device=iq_t.device if torch.is_tensor(iq_t) else iq_t[0].device,
+                    mode="encode",
+                    task=None,
+                    batch=batch,
+                ),
             )
         finally:
             self._skip_recon = prev_skip
@@ -1698,6 +1774,14 @@ class SignalFoundationModel(nn.Module):
                     metadata=pretrain_meta,
                     dataset_id=None,
                 )
+        batch_size = int(iq_t.shape[0]) if torch.is_tensor(iq_t) else len(iq_t)
+        moe_route_weights = self._resolve_moe_route_weights(
+            batch_size=batch_size,
+            device=iq_t.device if torch.is_tensor(iq_t) else iq_t[0].device,
+            mode=mode,
+            task=task,
+            batch=batch,
+        )
         if truncate:
             with torch.no_grad():
                 out = self._run_backbone(
@@ -1710,6 +1794,7 @@ class SignalFoundationModel(nn.Module):
                     modality_id=modality_id,
                     complex_pair=complex_pair,
                     mae_strategy=mae_strategy,
+                    moe_route_weights=moe_route_weights,
                 )
             out = self._detach_output(out)
         else:
@@ -1723,6 +1808,7 @@ class SignalFoundationModel(nn.Module):
                 modality_id=modality_id,
                 complex_pair=complex_pair,
                 mae_strategy=mae_strategy,
+                moe_route_weights=moe_route_weights,
             )
         if task_metadata is not None:
             out["task_metadata"] = task_metadata

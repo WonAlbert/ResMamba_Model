@@ -76,8 +76,6 @@ def test_phase_plugin_is_opt_in_and_changes_tokens() -> None:
         if on.physics_proj is not None and off.physics_proj is not None:
             on.physics_proj.weight.copy_(off.physics_proj.weight)
             on.physics_proj.bias.copy_(off.physics_proj.bias)
-        on.moe_fusion.gate.router.weight.copy_(off.moe_fusion.gate.router.weight)
-        on.moe_fusion.gate.router.bias.copy_(off.moe_fusion.gate.router.bias)
         on.norm.weight.copy_(off.norm.weight)
         on.norm.bias.copy_(off.norm.bias)
     out_off = off(iq)
