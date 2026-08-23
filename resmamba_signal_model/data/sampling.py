@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import math
 import random
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Iterator, Literal
+from pathlib import Path
+from typing import Iterator, Literal, Mapping
 
 import h5py
 import numpy as np
@@ -11,6 +13,12 @@ import torch
 from torch.utils.data import Sampler, WeightedRandomSampler
 
 from resmamba_signal_model.data.rfdata import RFDataPoolDataset
+
+DEFAULT_FAMILY_QUOTAS: dict[str, float] = {
+    "tx_comm": 0.40,
+    "ld_radar": 0.35,
+    "radcom": 0.25,
+}
 
 BalancedSamplingStrategy = Literal[
     "none",

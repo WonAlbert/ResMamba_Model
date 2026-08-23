@@ -38,8 +38,8 @@ clustering_view2: true
 distill_weight: 0.0
 prototype_anchor_weight: 0.0
 absorb_unknown: false
-cluster_utilization_weight: 0.02
-cluster_balance_mix: 0.35
+cluster_utilization_weight: 0.15
+cluster_balance_mix: 0.7
 cluster_sinkhorn_epsilon: 0.1
 loss_weights:
   physical: 0.1

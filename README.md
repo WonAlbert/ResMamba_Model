@@ -62,70 +62,29 @@ pytest -q
 
 - **Encoder**：`M-M-M-M-M-T`。预训练 `encode_visible_only`：只对可见 token 编码并 **GatingPool**（默认；可切 `attn_pool`）→ **`z_enc` / `h_enc`**（`z_general` / `z` 别名；默认 L2 归一化）。下游无 mask 时对全有效 patch 池化。
 - **Decoder**：1 层 `DecoderBlock`；token 通路重建；`[DEC]` + AttnPool → **`z_recon`**（重建 / 物理 readout，不作分类身份）。
-- **UTI**：semantic = 低秩残差(`z_enc`)；source = 去均值 token 池化；context = 慢衰减池化。个体分类走 **encoder + UTI source**（已移除 raw-IQ 指纹 CNN）。
-- **Tokenizer**：共享 stem + 多尺度时域 + 复数双侧频谱分带；无 dataset/task token。
+- **下游**：冻结 `z_enc` → TaskAdapter → 六任务独立头；联合仅 `SharedTaskAdapter`。
+- **MoE**：Tokenizer / Encoder / Decoder 共用三路专家（`ld_intrapulse` / `ld_model` / `tx_modulation`）；`phase_plugin: true`。
 - **归一化**：`revin_scale_mode: joint_energy`（抗峰 Winsorize + 逐时刻 PAPR 钳制）；`amp_aux` 保留 RSSI 供 Decoder / 物理损失，不进分类表征。
 - **物理约束**：patch 级相对特征 + `log_power_rel + log_scale` 还原绝对功率；软 SmoothL1 + 硬能量投影。分类在归一化空间，重建在 denorm 后。
 - **变长**：`sequence_packing=true`；预训练 **`HomogeneousTokenBudgetSampler`**（每 batch 单一 H5）+ `combine_then_pack: false`；其它阶段用 `TokenBudgetSampler`；`L < 16` 报错；`L > 8192` 重叠切块；`p_trunc=0.3`。
 - **多域**：Domain GRL 仅约束 UTI 不变视图（默认 `semantic`）；预训练 `domain: 0`。预训练 collate 防火墙：标签 / `dataset_id` / 采集元数据不进 forward。
 
-预训练 MAE：每 batch 从 `{random, contiguous, mixed}` 抽样（`mae_mask_probs`）。损失见 `configs/pretrain.yaml`：`L_mae + λ_phys + λ_impute + λ_struct (+ phase) + λ_readout + λ_vicreg(z_enc) + λ_vicreg_token(h_enc) + λ_view_div`。
+预训练 MAE + MoE 负载均衡；`HomogeneousTokenBudgetSampler`（族配额 + sqrt(N)）+ `combine_then_pack: false`。
 
 ## 训练
 
-唯一入口：`scripts/train.py`（PyTorch Lightning + TensorBoard + `train.log`）。
+唯一入口：`scripts/train.py`。阶段：`pretrain` → `stage2` → `stage3`（六任务之一）→ `joint`。
 
 ```bash
-# 阶段一：预训练（单 H5 / batch，无标签）
-python scripts/train.py --stage pretrain --config configs/pretrain.yaml
-
 python scripts/train.py --stage pretrain --config configs/pretrain.yaml --profile tiny --synthetic
-
-# 阶段二：冻结骨干 + 截断反传，训 UTI + 五头 + z 线性探针
-python scripts/train.py --stage stage2 --config configs/stage2.yaml \
-  --init-from runs/experiments/<pretrain>/ckpts/best.ckpt
-
 python scripts/train.py --stage stage2 --config configs/stage2.yaml --profile tiny --synthetic
-
-# 阶段三 3a：单任务 Hybrid-LoRA+
-python scripts/train.py --stage stage3 --task modulation --config configs/stage3.yaml \
-  --init-from runs/experiments/<stage2>/ckpts/best.ckpt
-python scripts/train.py --stage stage3 --task emitter --init-from runs/experiments/<stage2>/ckpts/best.ckpt
-
-python scripts/train.py --stage stage3 --task modulation --profile tiny --synthetic
-
-# 阶段三 3b：联合 PEFT
-python scripts/train.py --stage joint --config configs/joint.yaml \
-  --init-from runs/experiments/<stage2>/ckpts/best.ckpt \
-  --adapter-dir runs/experiments/stage3_modulation_<ts> \
-  --adapter-dir runs/experiments/stage3_emitter_<ts>
-
-python scripts/train.py --stage joint --profile tiny --synthetic
+python scripts/train.py --stage stage3 --task tx_modulation --profile tiny --synthetic
+python scripts/train.py --stage joint --config configs/joint.yaml --profile tiny --synthetic
 ```
 
-旧 `--stage downstream` 仍可用，验收主路径为 pretrain → stage2 → stage3。
+## 验收
 
-**注意**：旧预训练 checkpoint 与 `joint_energy` / 无指纹 CNN 协议不兼容，协议变更后需重新预训练。
-
-日志：`runs/experiments/<run>/`（`config.yaml`、`train.log`、`tb/`、`csv/`、`ckpts/`）。
-
-## 推理
-
-默认在 **`*_val.h5`** 上评估（`--split val`）：
-
-```bash
-python scripts/infer.py --task modulation --checkpoint runs/experiments/<run>/ckpts/best.ckpt \
-  --model-config configs/model.yaml --datasets rml2016_10a --split val
-```
-
-## 验收门控
-
-完成正式预训练后，阶段二 / 三须达到 `AGENTS.md` 硬门控（调制 ≥80%、个体 ≥70%；阶段三相对提升 ≥10%）。未跑满 `docs/sota_gate.md` 编排前不得宣称 SOTA。
-
-```bash
-python scripts/run_sota_gate.py --dry-run
-python scripts/run_sota_gate.py --smoke
-```
+**Tiny 全流程冒烟**（见 `AGENTS.md`）：`smoke_forward` + 各 stage `--profile tiny --synthetic` + `pytest -q`。正式 acc 门控待预训练跑满后更新。
 
 ## 配置
 

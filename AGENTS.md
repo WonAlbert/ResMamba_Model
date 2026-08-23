@@ -38,7 +38,7 @@ pytest -q
 
 | 阶段 | 命令要点 | 冻结策略 |
 |------|----------|----------|
-| 一 预训练 | `--stage pretrain --config configs/pretrain.yaml` | 全量训练骨干 + UTI（`view_div`） |
+| 一 预训练 | `--stage pretrain --config configs/pretrain.yaml` | 全量训练骨干 + MoE 负载均衡 |
 | 二 LP 探测 | `--stage stage2 --config configs/stage2.yaml --init-from <pretrain>/ckpts/best.ckpt` | 冻结骨干；只训**当前任务头**（+ 可选 `z_enc` 线性探针）；截断反传 |
 | 三 单任务适配 | `--stage stage3 --task <name> --config configs/stage3.yaml --init-from <stage2>/best.ckpt` | 该任务 Hybrid-LoRA+ + TaskAdapter + 头 |
 | 三 联合 | `--stage joint --config configs/joint.yaml` + `--adapter-dir` | 各任务 LoRA/Adapter/头 + **仅** `SharedTaskAdapter` |
@@ -89,7 +89,7 @@ pytest -q
 - **变长**：`sequence_packing=true`；预训练 `HomogeneousTokenBudgetSampler`（每 batch 单一 H5）+ `combine_then_pack: false`；`TokenBudgetSampler` 用于其它阶段；`L < 16` 报错；`L > 8192` 重叠切块。
 - **多域**：Domain GRL **只**约束 UTI 声明不变的低秩视图（默认 `semantic`），梯度不进入 `z_enc`；预训练默认关闭 domain 损失。跨域对比学习仅在下游标签可对齐时启用（如调制 contrastive），预训练无 InfoNCE。
 
-预训练损失（默认权重见 `configs/pretrain.yaml`）：`L_mae + λ_phys L_phys + λ_impute L_span + λ_struct L_structure + λ_phase L_structure_phase + λ_readout L_global_phys + λ_vicreg L_VICReg(z_enc) + λ_token L_VICReg(h_enc) + λ_view L_view_div`。MAE 每 batch 从 `{random, contiguous, mixed}` 抽样（`mae_mask_probs`）。`latent` / `domain` / `uti_*` 默认关闭。预训练 `use_labels=False` + collate 防火墙（无 `dataset_id`/标签/采集元数据进 forward）。
+预训练损失（默认权重见 `configs/pretrain.yaml`）：`L_mae + λ_phys + λ_moe + …`（`view_div` / `uti_*` 默认关闭）。族配额 Homogeneous 采样见 `source_groups` / `family_quotas`。
 
 ## 配置索引
 
