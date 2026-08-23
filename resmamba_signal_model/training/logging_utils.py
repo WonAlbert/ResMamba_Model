@@ -84,11 +84,17 @@ def _format_task_report_lines(report: dict[str, Any]) -> list[str]:
                     f"f1={_fmt_metric(float(row['f1']))}  n={int(row.get('n', 0))}"
                 )
         elif kind == "clustering":
-            parts = [
-                f"nmi={_fmt_metric(float(info['nmi']))}",
-                f"mean_nmi={_fmt_metric(float(info['mean_nmi']))}",
-                f"n={int(info.get('n', 0))}",
-            ]
+            parts = [f"mean_nmi={_fmt_metric(float(info['mean_nmi']))}"]
+            if "mean_nmi_modulation" in info:
+                parts.append(f"mean_nmi_modulation={_fmt_metric(float(info['mean_nmi_modulation']))}")
+            if "mean_nmi_emitter" in info:
+                parts.append(f"mean_nmi_emitter={_fmt_metric(float(info['mean_nmi_emitter']))}")
+            parts.extend(
+                [
+                    f"nmi={_fmt_metric(float(info['nmi']))}",
+                    f"n={int(info.get('n', 0))}",
+                ]
+            )
             lines.append(f"{task}  " + "  ".join(parts))
             for dataset, row in sorted((info.get("datasets") or {}).items()):
                 lines.append(

@@ -6,7 +6,7 @@ from typing import Any
 TASK_SELECTION_DEFAULTS: dict[str, str] = {
     "modulation": "f1",
     "emitter": "per_dataset_macro_acc",
-    "clustering": "nmi",
+    "clustering": "nmi_within_domain",
     "prediction": "mse",
     "imputation": "mse",
 }
@@ -34,6 +34,8 @@ def _normalize_metric_name(name: str) -> str:
         "loss": "val_loss",
         "macro_acc": "acc",
         "macro_f1": "f1",
+        "mean_nmi": "nmi_within_domain",
+        "macro_nmi": "nmi_within_domain",
     }
     return aliases.get(key, key)
 
@@ -66,6 +68,8 @@ def resolve_checkpoint_monitor_name(train_cfg: dict[str, Any], *, stage: str, ta
         return f"val/{metric}"
     task_name = str(task or "")
     if task_name and task_name not in ("all",):
+        if metric in ("nmi_within_domain", "mean_nmi", "macro_nmi") and task_name == "clustering":
+            return "val/nmi_within_domain"
         if metric == "nmi" and task_name == "clustering":
             return "val/nmi"
         if metric in ("mse", "recon_mse") and task_name == "prediction":
@@ -153,6 +157,11 @@ def compute_selection_score(val_metrics: dict[str, float], metric_name: str) -> 
         if not math.isfinite(mse):
             return 0.0
         return 1.0 / (1.0 + max(mse, 0.0))
+
+    if metric_name in ("nmi_within_domain", "mean_nmi", "macro_nmi"):
+        for key in ("nmi_within_domain", "mean_nmi", "macro_nmi", "nmi"):
+            if key in val_metrics:
+                return float(val_metrics[key])
 
     if metric_name in val_metrics:
         return float(val_metrics[metric_name])

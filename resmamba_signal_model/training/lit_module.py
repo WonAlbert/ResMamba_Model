@@ -49,6 +49,17 @@ from resmamba_signal_model.training.metrics import (
     ssim_iq_accumulate,
 )
 from resmamba_signal_model.training.mix import DynamicRatioScheduler
+from resmamba_signal_model.training.emitter_labels import (
+    GlobalEmitterLabelMap,
+    build_global_emitter_label_map,
+    global_emitter_labels,
+)
+from resmamba_signal_model.training.modulation_labels import (
+    CompactModulationLabelMap,
+    build_compact_modulation_label_map,
+    remap_modulation_labels,
+)
+from resmamba_signal_model.training.compact_labels import compact_task_labels_enabled
 
 try:
     import lightning as L
@@ -155,7 +166,77 @@ class SignalLitModule(_Base):
         self._val_absorb_embeds: list[torch.Tensor] = []
         self._val_absorb_scores: list[torch.Tensor] = []
         self._val_openset: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]] = []
+        self._emitter_offset_lookup: torch.Tensor | None = None
+        self._modulation_compact_lookup: torch.Tensor | None = None
+        self._init_compact_label_lookups()
         self._reset_val_buffers()
+
+    def _init_compact_label_lookups(self) -> None:
+        """阶段二/三：调制/个体用下游紧凑标签空间。"""
+        if not compact_task_labels_enabled(self.train_cfg, stage=self.stage):
+            return
+        root = self.train_cfg.get("rfdata_root")
+        if not root:
+            return
+        compact_emitter = self.train_cfg.get("compact_emitter")
+        if isinstance(compact_emitter, dict) and compact_emitter.get("offsets"):
+            offsets = {int(k): int(v) for k, v in dict(compact_emitter["offsets"]).items()}
+            counts_raw = compact_emitter.get("class_counts") or {}
+            counts = {int(k): int(v) for k, v in dict(counts_raw).items()} if counts_raw else None
+            names_raw = compact_emitter.get("datasets") or {}
+            names = {int(k): str(v) for k, v in dict(names_raw).items()}
+            emitter_map = GlobalEmitterLabelMap(
+                offsets=offsets,
+                dataset_names=names,
+                num_emitters=int(compact_emitter.get("num_emitters") or self.model.cfg.num_emitters),
+                class_counts=counts,
+            )
+            self._emitter_offset_lookup = emitter_map.offset_lookup()
+        else:
+            try:
+                emitter_map = build_global_emitter_label_map(root, train_cfg=self.train_cfg)
+                self._emitter_offset_lookup = emitter_map.offset_lookup()
+            except (FileNotFoundError, KeyError, OSError):
+                self._emitter_offset_lookup = None
+
+        compact_mod = self.train_cfg.get("compact_modulation")
+        if isinstance(compact_mod, dict) and compact_mod.get("old_to_new"):
+            old_to_new = {int(k): int(v) for k, v in dict(compact_mod["old_to_new"]).items()}
+            mod_map = CompactModulationLabelMap(
+                old_to_new=old_to_new,
+                num_classes=int(compact_mod.get("num_classes") or len(old_to_new)),
+                dataset_names=tuple(str(x) for x in (compact_mod.get("datasets") or ())),
+            )
+            self._modulation_compact_lookup = mod_map.lookup()
+        else:
+            try:
+                mod_map = build_compact_modulation_label_map(root, train_cfg=self.train_cfg)
+                self._modulation_compact_lookup = mod_map.lookup()
+            except (FileNotFoundError, KeyError, OSError):
+                self._modulation_compact_lookup = None
+
+    def _remap_emitter_labels(
+        self,
+        batch: dict[str, Any],
+        labels: Any,
+    ) -> Any:
+        if self._emitter_offset_lookup is None:
+            return labels
+        local = batch.get("emitter_id")
+        dataset_id = batch.get("dataset_id")
+        if local is None or dataset_id is None:
+            return labels
+        lookup = self._emitter_offset_lookup
+        if torch.is_tensor(local):
+            lookup = lookup.to(device=local.device)
+        return global_emitter_labels(dataset_id, local, lookup)
+
+    def _remap_modulation_labels(self, labels: Any) -> Any:
+        if self._modulation_compact_lookup is None or labels is None:
+            return labels
+        if not torch.is_tensor(labels):
+            labels = torch.as_tensor(labels)
+        return remap_modulation_labels(labels, self._modulation_compact_lookup.to(device=labels.device))
 
     @property
     def ema_teacher(self):
@@ -578,8 +659,11 @@ class SignalLitModule(_Base):
                 outputs,
                 sub,
                 task,
+                emitter_offset_lookup=self._emitter_offset_lookup,
+                modulation_compact_lookup=self._modulation_compact_lookup,
                 modulation_contrastive_weight=float(self.train_cfg.get("modulation_contrastive_weight", 0.25)),
                 emitter_contrastive_weight=float(self.train_cfg.get("emitter_contrastive_weight", 0.0)),
+                z_contrastive_weight=float(self.train_cfg.get("z_contrastive_weight", 0.0)),
                 domain_weight=float(self.loss_weights.get("domain", 0.1)),
                 recon_weight=float(self.train_cfg.get("lambda_recon", 0.1)),
                 phys_weight=float(self.loss_weights.get("physical", 0.1)),
@@ -594,9 +678,9 @@ class SignalLitModule(_Base):
                 uti_replay_weight=uti_replay_weight,
                 z_probe_weight=float(self.train_cfg.get("z_probe_weight", 1.0)),
                 emitter_label_smoothing=float(self.train_cfg.get("emitter_label_smoothing", 0.0)),
-                cluster_utilization_weight=float(self.train_cfg.get("cluster_utilization_weight", 0.02)),
+                cluster_utilization_weight=float(self.train_cfg.get("cluster_utilization_weight", 0.15)),
                 cluster_consistency_weight=float(self.train_cfg.get("cluster_consistency_weight", 1.0)),
-                cluster_balance_mix=float(self.train_cfg.get("cluster_balance_mix", 0.35)),
+                cluster_balance_mix=float(self.train_cfg.get("cluster_balance_mix", 0.7)),
                 cluster_sinkhorn_epsilon=float(self.train_cfg.get("cluster_sinkhorn_epsilon", 0.1)),
                 cluster_sinkhorn_iters=int(self.train_cfg.get("cluster_sinkhorn_iters", 3)),
             )
@@ -821,6 +905,7 @@ class SignalLitModule(_Base):
                 break
         if kind == "classification" and logits is not None:
             labels = batch_u.get(label_field or "canonical_mod_label_id", batch_u.get("mod_label_id"))
+            labels = self._remap_modulation_labels(labels)
             self._collect_cls(task or "modulation", logits.argmax(dim=-1), labels, batch_u.get("dataset_id"))
             z_probe = packed.get("z_probe_logits")
             if z_probe is not None:
@@ -836,6 +921,7 @@ class SignalLitModule(_Base):
                 pred_e = packed.get("emitter_logits")
             if pred_e is not None:
                 labels_e = batch_u.get(label_field or "global_emitter_id", batch_u.get("emitter_id"))
+                labels_e = self._remap_emitter_labels(batch_u, labels_e)
                 self._collect_cls(task or "emitter", pred_e.argmax(dim=-1), labels_e, batch_u.get("dataset_id"))
                 z_probe = packed.get("z_probe_logits")
                 if z_probe is not None:
@@ -913,6 +999,10 @@ class SignalLitModule(_Base):
             self._log_scalar("val/ari" if task == "clustering" else f"val/ari_{task}", info["ari"])
             self._log_scalar("val/nmi_within_domain", info["mean_nmi"])
             self._log_scalar(f"val/macro_nmi_{task}", info["mean_nmi"])
+            if "mean_nmi_modulation" in info:
+                self._log_scalar("val/mean_nmi_modulation", info["mean_nmi_modulation"])
+            if "mean_nmi_emitter" in info:
+                self._log_scalar("val/mean_nmi_emitter", info["mean_nmi_emitter"])
             self._log_scalar(f"val/macro_ari_{task}", info["mean_ari"])
             self._log_scalar("val/cluster_completeness" if task == "clustering" else f"val/completeness_{task}", info["completeness"])
             self._log_scalar("val/cluster_homogeneity" if task == "clustering" else f"val/homogeneity_{task}", info["homogeneity"])
@@ -1010,6 +1100,8 @@ class SignalLitModule(_Base):
                     metrics.setdefault(f"val/acc_{task}/{dataset}", row["acc"])
             elif info.get("kind") == "clustering":
                 metrics.setdefault("val/nmi" if task == "clustering" else f"val/nmi_{task}", info["nmi"])
+                metrics.setdefault("val/nmi_within_domain", info["mean_nmi"])
+                metrics.setdefault(f"val/macro_nmi_{task}", info["mean_nmi"])
             elif info.get("kind") == "reconstruction":
                 if task == "prediction":
                     metrics.setdefault("val/mse_prediction", info["mse"])

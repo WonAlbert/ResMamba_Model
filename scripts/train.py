@@ -43,6 +43,11 @@ from resmamba_signal_model.data.rfdata import format_iq_ram_cache
 from resmamba_signal_model.training.data_module import SignalDataModule
 from resmamba_signal_model.training.early_stopping import make_early_stopping_callback
 from resmamba_signal_model.training.emitter_labels import load_emitter_namespace_num_emitters
+from resmamba_signal_model.training.compact_labels import (
+    apply_compact_task_labels,
+    compact_emitter_class_mask,
+    compact_task_labels_enabled,
+)
 from resmamba_signal_model.training.freeze import apply_stage_freeze, filter_specialist_state
 from resmamba_signal_model.training.lit_module import SignalLitModule
 from resmamba_signal_model.training.logging_utils import link_autodl_tensorboard, setup_run_file_logger, silence_third_party_warnings
@@ -51,11 +56,9 @@ from resmamba_signal_model.training.param_stats import format_param_stats
 
 STAGE_DEFAULT_CONFIG = {
     "pretrain": "configs/pretrain.yaml",
-    "downstream": "configs/downstream.yaml",
     "stage2": "configs/stage2.yaml",
     "stage3": "configs/stage3.yaml",
     "joint": "configs/joint.yaml",
-    "continual": "configs/continual.yaml",
 }
 
 
@@ -167,6 +170,9 @@ _MODEL_OVERLAY_KEYS = (
     "share_bidirectional_weights",
     "phase_plugin",
     "legacy_decoder_reconstruction",
+    "encoder_pool_type",
+    "encoder_pool_heads",
+    "encoder_z_l2_normalize",
 )
 
 
@@ -179,7 +185,8 @@ def load_train_bundle(config: str, *, profile: str | None, model_config: str | N
         train_cfg["model"] = deep_merge(dict(model_section), dict(train_cfg.get("model") or {}))
     model = train_cfg.setdefault("model", {})
     for key in _MODEL_OVERLAY_KEYS:
-        if key in train_cfg and key not in model:
+        if key in train_cfg:
+            # 训练 yaml 顶层覆盖 model.yaml（如 stage3 对齐 stage2 的 attn_pool）
             model[key] = train_cfg[key]
     return train_cfg
 
@@ -245,7 +252,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Signal foundation model Lightning trainer")
     parser.add_argument(
         "--stage",
-        choices=("pretrain", "downstream", "stage2", "stage3", "joint", "continual"),
+        choices=("pretrain", "stage2", "stage3", "joint"),
         default="pretrain",
     )
     parser.add_argument("--config", default=None, help="训练 YAML，默认按 --stage 选择")
@@ -254,7 +261,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--task",
         default=None,
-        help="stage3 必填：目录中的任意任务名（默认含 modulation/emitter/clustering/prediction/imputation）",
+        help="stage3 必填：ld_intrapulse / ld_model / tx_modulation / ld_clustering / tx_clustering / prediction",
     )
     parser.add_argument("--task-kind", default=None, help="新任务的 kind：classification|emitter|clustering|prediction|imputation")
     parser.add_argument("--tasks", default=None, help="覆盖任务目录，逗号分隔，如 modulation,emitter,sonar")
@@ -346,18 +353,25 @@ def main() -> None:
 
     model_cfg = SignalModelConfig.from_dict(train_cfg.get("model") or {})
     model_cfg.build_task_heads = args.stage != "pretrain"
-    model_cfg.build_task_interface = True
+    model_cfg.build_task_interface = False
     model_cfg.build_prototype_registry = args.stage != "pretrain"
-    model_cfg.build_adapters = args.stage in ("stage3", "joint", "continual")
-    model_cfg.build_shared_adapter = args.stage in ("joint", "continual")
+    model_cfg.build_adapters = args.stage in ("stage3", "joint")
+    model_cfg.build_shared_adapter = args.stage == "joint"
     apply_catalog_to_model_cfg(model_cfg, catalog)
     train_cfg.setdefault("patch_size", model_cfg.patch_size)
+    compact_emitter_map = None
     if not bool(train_cfg.get("synthetic", False)):
-        n_emitters = load_emitter_namespace_num_emitters(train_cfg.get("rfdata_root"))
-        if n_emitters:
-            model_cfg.num_emitters = int(n_emitters)
-            model_section = train_cfg.setdefault("model", {})
-            model_section["num_emitters"] = int(n_emitters)
+        if compact_task_labels_enabled(train_cfg, stage=args.stage):
+            compact_emitter_map, _compact_mod = apply_compact_task_labels(
+                train_cfg, model_cfg, stage=args.stage
+            )
+        else:
+            n_emitters = load_emitter_namespace_num_emitters(train_cfg.get("rfdata_root"))
+            if n_emitters:
+                model_cfg.num_emitters = int(n_emitters)
+                model_section = train_cfg.setdefault("model", {})
+                model_section["num_emitters"] = int(n_emitters)
+            train_cfg.setdefault("compact_task_labels", False)
 
     adapter_dirs = parse_adapter_dirs(args.adapter_dir, catalog.names)
     if args.stage == "joint" and adapter_dirs and not train_cfg.get("specialist_scores"):
@@ -365,11 +379,6 @@ def main() -> None:
         if scores:
             train_cfg["specialist_scores"] = scores
 
-    from resmamba_signal_model.training.continual import (
-        ContinualSessionCallback,
-        resolve_continual_sessions,
-        total_continual_epochs,
-    )
     from resmamba_signal_model.training.task_schedule import (
         TaskScheduleCallback,
         expand_task_schedule_with_joint,
@@ -385,18 +394,6 @@ def main() -> None:
         train_cfg["task_schedule"] = sliced
         if completed:
             train_cfg["replay_completed_tasks"] = completed
-
-    sessions = resolve_continual_sessions(train_cfg, stage=args.stage)
-    if args.stage == "continual" or sessions:
-        train_cfg["continual"] = True if args.stage == "continual" else bool(train_cfg.get("continual", False))
-        if args.stage == "continual":
-            train_cfg["continual"] = True
-            train_cfg.setdefault("distill_weight", 0.5)
-            train_cfg.setdefault("prototype_anchor_weight", 0.1)
-            train_cfg.setdefault("absorb_unknown", True)
-            train_cfg.setdefault("shared_lora", True)
-        if train_cfg.get("continual_sessions"):
-            train_cfg["epochs"] = total_continual_epochs(sessions, default_epochs=int(train_cfg.get("epochs", 1)))
 
     task_sessions = expand_task_schedule_with_joint(resolve_task_schedule(train_cfg), train_cfg)
     if task_sessions:
@@ -455,7 +452,24 @@ def main() -> None:
     print(cache_msg, flush=True)
 
     model = SignalFoundationModel(model_cfg)
-    model.load_emitter_dataset_class_mask(train_cfg.get("rfdata_root"))
+    if compact_emitter_map is not None:
+        mask = compact_emitter_class_mask(
+            compact_emitter_map,
+            num_datasets=int(model_cfg.num_datasets),
+        )
+        model.load_emitter_dataset_class_mask(train_cfg.get("rfdata_root"), mask=mask)
+    else:
+        model.load_emitter_dataset_class_mask(train_cfg.get("rfdata_root"))
+    if bool(train_cfg.get("compact_task_labels")):
+        logger.info(
+            "compact_task_labels num_mod_classes=%s num_emitters=%s",
+            model_cfg.num_mod_classes,
+            model_cfg.num_emitters,
+        )
+        print(
+            f"compact_task_labels mod={model_cfg.num_mod_classes} emitter={model_cfg.num_emitters}",
+            flush=True,
+        )
     if args.init_from:
         init_path = Path(args.init_from)
         if not init_path.is_absolute():
@@ -465,10 +479,9 @@ def main() -> None:
         print(f"init-from {init_path} missing={len(missing)} unexpected={len(unexpected)}", flush=True)
 
     peft_cfg = None
-    if args.stage in ("stage3", "joint", "continual"):
+    if args.stage in ("stage3", "joint"):
         peft_cfg = peft_config_from_train_cfg(train_cfg)
-        if args.stage in ("joint", "continual"):
-            peft_cfg.shared_lora = bool(train_cfg.get("shared_lora", args.stage == "continual" or peft_cfg.shared_lora))
+        peft_cfg.shared_lora = bool(train_cfg.get("shared_lora", False))
         tasks = [args.task] if args.stage == "stage3" and args.task else list(catalog.names)
         inject_hybrid_lora(model, tasks, peft_cfg)
         logger.info("injected Hybrid-LoRA+ tasks=%s modules=%s", tasks, len(getattr(model.peft, "names", [])))
@@ -532,11 +545,8 @@ def main() -> None:
             ckpt_mode,
             int(train_cfg.get("early_stopping_patience") or 0),
         )
-    if sessions and (args.stage == "continual" or bool(train_cfg.get("continual")) or bool(train_cfg.get("absorb_unknown"))):
-        callbacks.append(ContinualSessionCallback(sessions, train_cfg))
-        logger.info("continual sessions=%s distill_weight=%s prototype_anchor_weight=%s", len(sessions), train_cfg.get("distill_weight"), train_cfg.get("prototype_anchor_weight"))
     if task_sessions:
-        callbacks.append(TaskScheduleCallback(task_sessions, train_cfg))
+        callbacks.append(TaskScheduleCallback(task_sessions, train_cfg, stage=args.stage))
         logger.info("task_schedule=%s", [(s.get("name"), s.get("epochs"), s.get("tasks")) for s in task_sessions])
 
     trainer_kwargs: dict[str, Any] = dict(

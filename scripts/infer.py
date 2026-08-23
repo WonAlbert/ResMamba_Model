@@ -44,6 +44,15 @@ from resmamba_signal_model.training.metrics import (  # noqa: E402
 )
 from resmamba_signal_model.training.losses import _first_present  # noqa: E402
 from resmamba_signal_model.training.task_catalog import builtin_spec  # noqa: E402
+from resmamba_signal_model.training.emitter_labels import (  # noqa: E402
+    build_global_emitter_label_map,
+    global_emitter_labels,
+)
+from resmamba_signal_model.training.modulation_labels import (  # noqa: E402
+    build_compact_modulation_label_map,
+    remap_modulation_labels,
+)
+from resmamba_signal_model.training.compact_labels import compact_emitter_class_mask  # noqa: E402
 
 TASKS = ("modulation", "emitter", "prediction", "clustering", "imputation", "encode")
 TASK_DATASETS: dict[str, list[str]] = {
@@ -56,14 +65,82 @@ TASK_DATASETS: dict[str, list[str]] = {
 }
 
 
-def task_label_tensor(task: str, batch: dict[str, Any]) -> torch.Tensor | None:
-    """与训练/验证相同的标签列：调制用 canonical，个体用 global_emitter_id。"""
+def _tensor_class_dim(state: dict[str, torch.Tensor], *suffixes: str) -> int | None:
+    for key, value in state.items():
+        if not torch.is_tensor(value) or value.ndim < 1:
+            continue
+        for suffix in suffixes:
+            if key.endswith(suffix):
+                return int(value.shape[0])
+    return None
+
+
+def resolve_compact_overrides(
+    state: dict[str, torch.Tensor],
+    train_cfg: dict[str, Any],
+    rfdata_root: Path,
+) -> dict[str, Any]:
+    """从 ckpt 权重形状 / train_cfg 恢复紧凑类数，供建头与标签重映射。"""
+    overrides: dict[str, Any] = {}
+    model_section = dict(train_cfg.get("model") or {})
+    n_mod = _tensor_class_dim(
+        state,
+        "modulation_head.classifier.weight",
+        "z_linear_probes.modulation.weight",
+    )
+    n_emit = _tensor_class_dim(
+        state,
+        "emitter_head.classifier.weight",
+        "z_linear_probes.emitter.weight",
+    )
+    if n_mod is None and model_section.get("num_mod_classes") is not None:
+        n_mod = int(model_section["num_mod_classes"])
+    if n_emit is None and model_section.get("num_emitters") is not None:
+        n_emit = int(model_section["num_emitters"])
+    if train_cfg.get("compact_modulation", {}).get("num_classes") is not None:
+        n_mod = int(train_cfg["compact_modulation"]["num_classes"])
+    if train_cfg.get("compact_emitter", {}).get("num_emitters") is not None:
+        n_emit = int(train_cfg["compact_emitter"]["num_emitters"])
+    if n_mod is not None:
+        overrides["num_mod_classes"] = int(n_mod)
+    if n_emit is not None:
+        overrides["num_emitters"] = int(n_emit)
+    # 默认：类数小于全库 ontology / namespace 时启用紧凑重映射
+    use_compact = bool(train_cfg.get("compact_task_labels"))
+    if not use_compact and rfdata_root.is_dir():
+        try:
+            compact_e = build_global_emitter_label_map(rfdata_root, train_cfg=train_cfg)
+            if n_emit is not None and int(n_emit) == int(compact_e.num_emitters):
+                use_compact = True
+        except (FileNotFoundError, KeyError, OSError):
+            pass
+        try:
+            compact_m = build_compact_modulation_label_map(rfdata_root, train_cfg=train_cfg)
+            if n_mod is not None and int(n_mod) == int(compact_m.num_classes):
+                use_compact = True
+        except (FileNotFoundError, KeyError, OSError):
+            pass
+    overrides["_use_compact"] = use_compact
+    return overrides
+
+
+def task_label_tensor(
+    task: str,
+    batch: dict[str, Any],
+    *,
+    emitter_offset_lookup: torch.Tensor | None = None,
+    modulation_compact_lookup: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """与训练/验证相同的标签列；紧凑模式下做连续 ID 重映射。"""
     try:
         field = builtin_spec(task).label_field
     except KeyError:
         field = None
     if task == "emitter":
-        value = batch.get(field or "global_emitter_id", batch.get("emitter_id"))
+        if emitter_offset_lookup is not None and "emitter_id" in batch and "dataset_id" in batch:
+            value = global_emitter_labels(batch["dataset_id"], batch["emitter_id"], emitter_offset_lookup)
+        else:
+            value = batch.get(field or "global_emitter_id", batch.get("emitter_id"))
     elif task == "clustering":
         value = batch.get(field or "global_label_id")
     elif task in ("prediction", "imputation", "encode"):
@@ -73,6 +150,10 @@ def task_label_tensor(task: str, batch: dict[str, Any]) -> torch.Tensor | None:
             field or "canonical_mod_label_id",
             batch.get("mod_label_id", batch.get("source_label_id")),
         )
+        if value is not None and modulation_compact_lookup is not None:
+            if not torch.is_tensor(value):
+                value = torch.as_tensor(value)
+            value = remap_modulation_labels(value, modulation_compact_lookup)
     if value is None:
         return None
     return value.cpu() if torch.is_tensor(value) else torch.as_tensor(value)
@@ -151,7 +232,15 @@ def build_loader(
 
 
 @torch.no_grad()
-def run_task(model: SignalFoundationModel, loader: DataLoader, device: torch.device, task: str) -> dict[str, Any]:
+def run_task(
+    model: SignalFoundationModel,
+    loader: DataLoader,
+    device: torch.device,
+    task: str,
+    *,
+    emitter_offset_lookup: torch.Tensor | None = None,
+    modulation_compact_lookup: torch.Tensor | None = None,
+) -> dict[str, Any]:
     model.eval()
     preds: list[torch.Tensor] = []
     labels: list[torch.Tensor] = []
@@ -162,6 +251,10 @@ def run_task(model: SignalFoundationModel, loader: DataLoader, device: torch.dev
     osr_unknown: list[torch.Tensor] = []
     osr_conf: list[torch.Tensor] = []
     mode = "encode" if task == "encode" else "task"
+    label_kw = {
+        "emitter_offset_lookup": emitter_offset_lookup,
+        "modulation_compact_lookup": modulation_compact_lookup,
+    }
     for batch in tqdm(loader, desc=f"infer:{task}"):
         batch = move_batch(batch, device)
         out = model(batch, mode=mode, task=None if task == "encode" else task)
@@ -172,17 +265,17 @@ def run_task(model: SignalFoundationModel, loader: DataLoader, device: torch.dev
         elif task == "emitter" and ("emitter_logits" in out or logits is not None):
             pred = out.get("emitter_logits", logits)
             preds.append(pred.argmax(dim=-1).cpu())
-            label = task_label_tensor(task, batch)
+            label = task_label_tensor(task, batch, **label_kw)
             if label is not None:
                 labels.append(label)
         elif task == "clustering" and "cluster_logits" in out:
             preds.append(out["cluster_logits"].argmax(dim=-1).cpu())
-            label = task_label_tensor(task, batch)
+            label = task_label_tensor(task, batch, **label_kw)
             if label is not None:
                 labels.append(label)
         elif logits is not None and task not in ("prediction", "imputation"):
             preds.append(logits.argmax(dim=-1).cpu())
-            label = task_label_tensor(task, batch)
+            label = task_label_tensor(task, batch, **label_kw)
             if label is not None:
                 labels.append(label)
         elif task in ("prediction", "imputation") or "pred_patches" in out:
@@ -192,7 +285,7 @@ def run_task(model: SignalFoundationModel, loader: DataLoader, device: torch.dev
         score = out.get("openset_score", out.get("openset_energy"))
         if score is not None:
             osr_scores.append(score.detach().reshape(-1).cpu())
-            label = task_label_tensor(task, batch)
+            label = task_label_tensor(task, batch, **label_kw)
             if label is not None:
                 osr_unknown.append((label.reshape(-1) < 0).cpu())
             logits = _first_present(out, "task_logits", "cluster_logits")
@@ -257,6 +350,36 @@ def main() -> None:
 
     ckpt_path = Path(args.checkpoint) if Path(args.checkpoint).is_absolute() else root / args.checkpoint
     blob, state = load_checkpoint(ckpt_path)
+    train_cfg: dict[str, Any] = {}
+    if args.config:
+        cfg_path = Path(args.config)
+        if not cfg_path.is_absolute():
+            cfg_path = root / cfg_path
+        train_cfg = load_yaml_config(cfg_path)
+    else:
+        # 同 run 目录的 config.yaml（训练时写出 compact_*）
+        run_cfg = ckpt_path.parents[1] / "config.yaml"
+        if run_cfg.is_file():
+            train_cfg = load_yaml_config(run_cfg)
+    compact_overrides = resolve_compact_overrides(state, train_cfg, rfdata_root)
+    use_compact = bool(compact_overrides.pop("_use_compact", False))
+    emitter_offset_lookup = None
+    modulation_compact_lookup = None
+    compact_emitter_map = None
+    if use_compact:
+        try:
+            compact_emitter_map = build_global_emitter_label_map(rfdata_root, train_cfg=train_cfg)
+            emitter_offset_lookup = compact_emitter_map.offset_lookup()
+            compact_overrides.setdefault("num_emitters", int(compact_emitter_map.num_emitters))
+        except (FileNotFoundError, KeyError, OSError):
+            compact_emitter_map = None
+        try:
+            compact_mod = build_compact_modulation_label_map(rfdata_root, train_cfg=train_cfg)
+            modulation_compact_lookup = compact_mod.lookup()
+            compact_overrides.setdefault("num_mod_classes", int(compact_mod.num_classes))
+        except (FileNotFoundError, KeyError, OSError):
+            modulation_compact_lookup = None
+
     lora_tasks = blob.get("peft_tasks") or infer_lora_tasks(state) or list(DEFAULT_TASKS)
     catalog_names = [t for t in lora_tasks if t != "shared"]
     for key in state:
@@ -267,12 +390,13 @@ def main() -> None:
     tasks = list(catalog_names) if args.task == "all" else [args.task]
     build_adapters = bool(blob.get("build_adapters")) or any(k.startswith("task_adapters.") for k in state)
     build_shared = bool(blob.get("build_shared_adapter")) or any(k.startswith("shared_adapter.") for k in state)
+    model_overrides = {"task_names": tuple(catalog_names or DEFAULT_TASKS), **compact_overrides}
     model = build_model(
         model_config,
         build_task_heads=any(t != "encode" for t in tasks),
         build_adapters=build_adapters,
         build_shared_adapter=build_shared,
-        overrides={"task_names": tuple(catalog_names or DEFAULT_TASKS)},
+        overrides=model_overrides,
     )
     if state_has_lora(state):
         peft_blob = blob.get("peft_cfg") or {}
@@ -280,17 +404,23 @@ def main() -> None:
         peft_cfg.shared_lora = peft_cfg.shared_lora or ("shared" in lora_tasks)
         inject_hybrid_lora(model, lora_tasks, peft_cfg)
         print(f"[infer] injected Hybrid-LoRA+ tasks={lora_tasks}", flush=True)
-    model.load_emitter_dataset_class_mask(rfdata_root)
+    if compact_emitter_map is not None:
+        mask = compact_emitter_class_mask(
+            compact_emitter_map,
+            num_datasets=int(model.cfg.num_datasets),
+        )
+        model.load_emitter_dataset_class_mask(rfdata_root, mask=mask)
+    else:
+        model.load_emitter_dataset_class_mask(rfdata_root)
     missing, unexpected = model.load_weights(state, strict=False)
     model = model.to(device)
     print(f"[infer] missing={len(missing)} unexpected={len(unexpected)} device={device}")
+    if use_compact:
+        print(
+            f"[infer] compact_task_labels mod={model.cfg.num_mod_classes} emitter={model.cfg.num_emitters}",
+            flush=True,
+        )
 
-    train_cfg: dict[str, Any] = {}
-    if args.config:
-        cfg_path = Path(args.config)
-        if not cfg_path.is_absolute():
-            cfg_path = root / cfg_path
-        train_cfg = load_yaml_config(cfg_path)
     model_raw = load_yaml_config(model_config)
     model_section = model_raw.get("model", model_raw)
     token_budget = int(args.token_budget or train_cfg.get("token_budget") or 4096)
@@ -318,6 +448,7 @@ def main() -> None:
         "token_budget": token_budget,
         "val_seed": val_seed,
         "val_batches": val_batches,
+        "compact_task_labels": use_compact,
         "tasks": {},
     }
     for task in tasks:
@@ -336,7 +467,14 @@ def main() -> None:
             num_workers=args.num_workers,
             task=None if task == "encode" else task,
         )
-        metrics = run_task(model, loader, device, task)
+        metrics = run_task(
+            model,
+            loader,
+            device,
+            task,
+            emitter_offset_lookup=emitter_offset_lookup,
+            modulation_compact_lookup=modulation_compact_lookup,
+        )
         report["tasks"][task] = {"datasets": datasets, "split": args.split, **metrics}
         print(f"[infer] {task}: {metrics}")
     (out_dir / "metrics.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")

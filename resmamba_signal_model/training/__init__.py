@@ -27,9 +27,14 @@ from resmamba_signal_model.training.metrics import (
 )
 from resmamba_signal_model.training.pool_filters import (
     filter_excluded_dataset_pool,
+    load_clustering_comm_datasets,
+    load_clustering_radar_datasets,
+    load_downstream_comm_modulation_datasets,
     load_downstream_modulation_datasets,
+    load_downstream_radar_model_datasets,
     load_downstream_shared_datasets,
     load_excluded_datasets,
+    load_prediction_datasets,
     load_pretrain_datasets,
 )
 from resmamba_signal_model.training.param_stats import (
@@ -63,6 +68,12 @@ __all__ = [
     "h5_dataset_name",
     "load_emitter_downstream_datasets",
     "load_downstream_modulation_datasets",
+    "load_downstream_comm_modulation_datasets",
+    "load_downstream_radar_model_datasets",
+    "load_downstream_radar_modulation_datasets",
+    "load_clustering_radar_datasets",
+    "load_clustering_comm_datasets",
+    "load_prediction_datasets",
     "load_downstream_shared_datasets",
     "load_excluded_datasets",
     "load_pretrain_datasets",

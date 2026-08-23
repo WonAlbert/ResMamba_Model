@@ -57,6 +57,16 @@ def macro_f1(preds: torch.Tensor | np.ndarray, labels: torch.Tensor | np.ndarray
     return float(_sklearn_metric(f1_score, labels_np[valid], preds_np[valid], average="macro", zero_division=0))
 
 
+def clustering_dataset_family(name: str) -> str:
+    """将聚类子数据集归到调制 / 个体，便于分开报 NMI。"""
+    key = str(name).lower()
+    if any(token in key for token in ("wisig", "adsb", "wifi", "manytx")):
+        return "emitter"
+    if any(token in key for token in ("rml", "radcom", "panoradio", "xidian")):
+        return "modulation"
+    return "other"
+
+
 def nmi_score(pred_clusters: torch.Tensor | np.ndarray, true_labels: torch.Tensor | np.ndarray, mask: torch.Tensor | np.ndarray | None = None) -> float:
     pred_np = _to_numpy(pred_clusters)
     true_np = _to_numpy(true_labels)
@@ -252,7 +262,12 @@ def clustering_epoch_scores(
             datasets[name] = row
     mean_nmi = float(np.mean([row["nmi"] for row in datasets.values()])) if datasets else overall
     mean_ari = float(np.mean([row["ari"] for row in datasets.values()])) if datasets else overall_ari
-    return {
+    family_scores: dict[str, list[float]] = {"modulation": [], "emitter": []}
+    for name, row in datasets.items():
+        family = clustering_dataset_family(name)
+        if family in family_scores:
+            family_scores[family].append(float(row["nmi"]))
+    report = {
         "kind": "clustering",
         "nmi": overall,
         "ari": overall_ari,
@@ -262,6 +277,11 @@ def clustering_epoch_scores(
         "datasets": datasets,
         **overseg,
     }
+    if family_scores["modulation"]:
+        report["mean_nmi_modulation"] = float(np.mean(family_scores["modulation"]))
+    if family_scores["emitter"]:
+        report["mean_nmi_emitter"] = float(np.mean(family_scores["emitter"]))
+    return report
 
 
 def reconstruction_epoch_scores(

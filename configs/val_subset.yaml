@@ -4,4 +4,4 @@ val_subset_seed: 42
 val_subset_resample_each_epoch: true
 # 下列子数据集验证时使用全量 val（不受 fraction / max_per_dataset 限制）
 val_subset_full_datasets:
-  - open_real_data
+  - radar_mod15

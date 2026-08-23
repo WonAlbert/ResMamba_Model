@@ -171,8 +171,12 @@ def extract_task_selection_metrics(callback_metrics: dict[str, Any]) -> dict[str
 
     for stored, raw in callback_metrics.items():
         name = _DATALOADER_IDX_RE.sub("", str(stored))
-        if name in ("val/nmi", "val/nmi_within_domain"):
-            add("clustering", "nmi" if name == "val/nmi" else "nmi_within_domain", raw)
+        if name in ("val/nmi", "val/nmi_within_domain", "val/macro_nmi_clustering"):
+            add(
+                "clustering",
+                "nmi" if name == "val/nmi" else "nmi_within_domain",
+                raw,
+            )
             continue
         if name in ("val/mse_prediction", "val/mse"):
             add("prediction", "mse", raw)

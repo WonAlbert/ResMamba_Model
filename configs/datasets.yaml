@@ -1,39 +1,76 @@
-# 数据集 pool 过滤与白名单（原 excluded / downstream / emitter 四个文件合并）
-# 各 loader 按 section 名读取 datasets 列表
+# 数据集 pool 过滤与白名单
+# 任务：识别（雷达脉内调制 / 雷达型号 / 通信调制样式）、聚类（雷达 / 通信调制）、预测（时序波形）
+# 各 loader 按 section 名读取 datasets 列表；预训练仅用 *_train.h5 无标签数据
 
 excluded:
   # 从所有 task pool（含预训练、下游、预测、聚类）中排除
   datasets:
-    - communication_emitters
+    - communication_emitters  # 通信；30 类通信辐射源个体识别（仿真 int16）；非当前任务范围
 
 pretrain:
-  # MAE 预训练：各阶段训练数据的并集 → *_train.h5（无标签）
+  # MAE 预训练：雷达脉内调制 / 雷达型号 / 通信调制样式相关无标签数据 → *_train.h5
   datasets:
-    - electromagnetic_0926
-    - open_real_data
-    - radar_emitters
+    - radar_mod15             # 雷达；15 类舰载/对海雷达系统型号；型号识别
+    - radchar                 # 雷达；RadChar-Small；5 类脉内调制（CPT/Barker/Poly-Barker/Frank/LFM）
+    - radcom_awgn             # 雷达+通信；RadarComm 仿真+AWGN；波形调制 + 雷达/通信场景
+    - radcom_dynamic          # 雷达+通信；RadarComm 仿真+动态信道
+    - radcom_ota              # 雷达+通信；RadarComm 2.45GHz 空口实测
+    - cjr_mix                 # 雷达；EM-Radar-Mix 混合仿真；9 类 infer_class
+    - rml2016_04c             # 通信；11 类调制（RadioML 2016.04C）；调制样式识别
+    - rml2016_10a             # 通信；11 类调制（RadioML 2016.10a）
+    - rml2016_10b             # 通信；10 类调制（RadioML 2016.10b）
+    - xidian14                # 通信；14 类调制识别
+    - panoradio_hf            # 通信；18 类 HF 短波模式（PSK/RTTY/OLIVIA/USB 等）
+    # radchar 已接入 pretrain / downstream_radar_modulation / clustering_radar
+    # --- 不符合当前任务范围（已注释）---
+    # - electromagnetic_0926  # 通信/导航；7 类电磁信号源类型识别（ADSB/AIS/AM/FM/GPS 等）
+    # - radar_emitters          # 雷达；10 部导航雷达个体（CW）；辐射源个体识别
+    # - wisig                   # 通信；150 类 WiFi 发射机个体；射频指纹/个体识别
+    # - adsb2                   # 通信；100 类 ADS-B 发射机个体；射频指纹/个体识别
+
+downstream_radar_modulation:
+  # 雷达信号脉内调制类型识别：*_test.h5 训练，*_val.h5 验证
+  datasets:
+    - radchar                 # 雷达脉内调制；5 类（CPT / Barker / Polyphase-Barker / Frank / LFM）
+
+downstream_radar_model:
+  # 雷达型号识别
+  datasets:
+    - radar_mod15             # 雷达；15 类舰载/对海雷达系统型号
+    - cjr_mix                 # 雷达；9 类混合雷达 infer_class
+
+downstream_comm_modulation:
+  # 通信调制样式识别（原 downstream_modulation）
+  datasets:
+    - rml2016_04c             # 通信；11 类调制；stage2/3 门控基准
+    - rml2016_10a
+    - rml2016_10b
+    # - rml2018_1a            # 通信；24 类调制；可选扩展（需单独 prepare + 质量过滤）
+
+clustering_radar:
+  # 雷达信号聚类
+  datasets:
+    - radar_mod15
+    - cjr_mix
+    - radchar                 # 雷达脉内调制；5 类
+
+clustering_comm:
+  # 通信调制聚类
+  datasets:
+    - rml2016_04c
+    - rml2016_10a
+    - rml2016_10b
     - xidian14
     - panoradio_hf
+
+prediction:
+  # 时序波形预测
+  datasets:
     - radcom_awgn
     - radcom_dynamic
     - radcom_ota
-    - cjr_mix
-    - rml2016_04c
-    - rml2016_10a
-    - rml2016_10b
-    - wisig
-    - adsb2
+    - radar_mod15
 
-downstream_modulation:
-  # 调制识别（非个体识别）下游：*_test.h5 训练，*_val.h5 验证
-  datasets:
-    - rml2016_04c
-    - rml2016_10a
-    - rml2016_10b
-    # - rml2018_1a
-
-emitter_downstream:
-  # 个体识别下游微调；WiSig 为主基准，ADSB2 作跨域补充
-  datasets:
-    - wisig
-    - adsb2
+# --- 兼容旧配置键（勿在新任务中引用）---
+# downstream_modulation → downstream_comm_modulation
+# emitter_downstream    → downstream_radar_model（原 wisig/adsb2 个体识别已移出）

@@ -43,11 +43,7 @@ from resmamba_signal_model.data.splits import (
     write_immutable_manifest,
 )
 from resmamba_signal_model.training.clustering_labels import GLOBAL_LABEL_NAMESPACE, global_cluster_labels
-from resmamba_signal_model.training.emitter_labels import (
-    filter_emitter_downstream_pool,
-    h5_dataset_name,
-    load_emitter_downstream_datasets,
-)
+from resmamba_signal_model.training.emitter_labels import h5_dataset_name
 from resmamba_signal_model.data.wisig_manytx import (
     WiSigBlockSink,
     emitter_labels,
@@ -56,9 +52,13 @@ from resmamba_signal_model.data.wisig_manytx import (
 from resmamba_signal_model.training.pool_filters import (
     filter_dataset_pool,
     filter_excluded_dataset_pool,
-    load_downstream_modulation_datasets,
+    load_clustering_comm_datasets,
+    load_clustering_radar_datasets,
+    load_downstream_comm_modulation_datasets,
     load_downstream_modulation_extra_datasets,
-    load_downstream_shared_datasets,
+    load_downstream_radar_modulation_datasets,
+    load_downstream_radar_model_datasets,
+    load_prediction_datasets,
     load_excluded_datasets,
     load_pretrain_datasets,
 )
@@ -88,9 +88,18 @@ RML2018_ORDER = [
 ]
 EVAL_QUALITY_DATASETS = frozenset({"rml2018_1a", "adsb2", "wifi150", "xidian14"})
 EVAL_QUALITY_SPLITS = ("val", "test")
-# 仅 val/test、不做类别均衡的数据集（不参与 MAE 预训练时的旧约定；open_real_data 已改为 train/val）
+# 仅 val/test、不做类别均衡的数据集（不参与 MAE 预训练时的旧约定；radar_mod15 已改为 train/val）
 VAL_TEST_ONLY_DATASETS = frozenset()
 VAL_TEST_SPLIT_RATIO = 0.8
+RADCHAR_SIGNAL_TYPE_NAMES = (
+    "coherent_pulse_train",
+    "barker_code",
+    "polyphase_barker_code",
+    "frank_code",
+    "linear_frequency_modulated",
+)
+RADCHAR_SAMPLE_RATE_HZ = 3_200_000.0
+RADCHAR_DEFAULT_SOURCE = WORKSPACE / "RadChar-Small.h5"
 RML2018_EVAL_MIN_SNR = 6.0
 MISSING_TEST_SPLIT_SEED = 20260822
 MISSING_TEST_FRACTION = 0.2
@@ -1381,9 +1390,9 @@ def cjr_mix(ctx: Context, dataset_id: int) -> None:
     ctx.done(name, "train", writer, raw, removed, labels)
 
 
-def open_real_data(ctx: Context, dataset_id: int) -> None:
+def radar_mod15(ctx: Context, dataset_id: int) -> None:
     """open_realData round7 CSV → RFData H5；train/val（8:2），不做类别均衡。"""
-    name = "open_real_data"
+    name = "radar_mod15"
     root = NON_EMITTER / "open_realData" / "outputv2" / "round7_dataset"
     summary = json.loads((root / "manifests" / "summary.json").read_text(encoding="utf-8"))
     labels = {
@@ -1480,6 +1489,128 @@ def open_real_data(ctx: Context, dataset_id: int) -> None:
     }
 
 
+def resolve_radchar_source(source: str | Path | None = None) -> Path:
+    candidates: list[Path] = []
+    if source is not None:
+        candidates.append(Path(source))
+    env = os.environ.get("RADCHAR_H5") or os.environ.get("RADCHAR_SOURCE")
+    if env:
+        candidates.append(Path(env))
+    candidates.extend(
+        (
+            RADCHAR_DEFAULT_SOURCE,
+            EXTERNAL / "radchar" / "RadChar-Small.h5",
+            ROOT / "dataset" / "external" / "radchar" / "RadChar-Small.h5",
+        )
+    )
+    for path in candidates:
+        if path.is_file():
+            return path.resolve()
+    raise FileNotFoundError(
+        "未找到 RadChar-Small.h5。请放到 /root/autodl-tmp/RadChar-Small.h5，"
+        "或设置环境变量 RADCHAR_H5。"
+    )
+
+
+def radchar(ctx: Context, dataset_id: int, source: str | Path | None = None) -> None:
+    """RadChar-Small：5 类雷达脉内调制、512 点复基带 → 项目 RFData H5（train/val 8:2）。"""
+    name = "radchar"
+    src = resolve_radchar_source(source)
+    labels = {str(kind): int(idx) for idx, kind in enumerate(RADCHAR_SIGNAL_TYPE_NAMES)}
+    ctx.maps["datasets"][str(dataset_id)] = name
+    ctx.maps["modulations"][name] = labels
+    ctx.maps["sources"][name] = labels
+
+    for suffix in ("train", "val", "test"):
+        (ctx.h5 / f"{name}_{suffix}.h5").unlink(missing_ok=True)
+
+    with h5py.File(src, "r") as handle:
+        n_total = int(handle["iq"].shape[0])
+        length = int(handle["iq"].shape[1])
+        lab = handle["labels"][:]
+    signal_type = np.asarray(lab["signal_type"], dtype=np.int32)
+    snr = np.asarray(lab["signal_to_noise_ratio"], dtype=np.float32)
+    if int(signal_type.min()) < 0 or int(signal_type.max()) >= len(RADCHAR_SIGNAL_TYPE_NAMES):
+        raise ValueError(f"{src} 的 signal_type 超出 0..{len(RADCHAR_SIGNAL_TYPE_NAMES) - 1}")
+
+    keep = np.zeros(n_total, dtype=bool)
+    removed: Counter = Counter()
+    chunk = 4096
+    with h5py.File(src, "r") as handle:
+        for start in range(0, n_total, chunk):
+            end = min(start + chunk, n_total)
+            iq = as_iq(handle["iq"][start:end]).astype(np.float32, copy=False)
+            mask, reasons = quality_mask(iq, labels=signal_type[start:end])
+            keep[start:end] = mask
+            removed.update(reasons)
+
+    kept_idx = np.flatnonzero(keep)
+    if kept_idx.size == 0:
+        raise ValueError(f"{name} 清洗后无可用样本")
+
+    rng = np.random.default_rng(20260823)
+    order = rng.permutation(kept_idx)
+    n_train = int(len(order) * VAL_TEST_SPLIT_RATIO)
+    split_of = np.full(n_total, -1, dtype=np.int8)
+    split_of[order[:n_train]] = 0
+    split_of[order[n_train:]] = 1
+
+    writers = {
+        "train": Writer(ctx.h5 / f"{name}_train.h5", length, np.float32, dataset_id, 0, src),
+        "val": Writer(ctx.h5 / f"{name}_val.h5", length, np.float32, dataset_id, 0, src),
+    }
+    for writer in writers.values():
+        writer.f.attrs["sampling_rate_hz"] = RADCHAR_SAMPLE_RATE_HZ
+        writer.f.attrs["radchar_signal_types"] = json.dumps(list(RADCHAR_SIGNAL_TYPE_NAMES))
+
+    with h5py.File(src, "r") as handle:
+        for start in range(0, n_total, chunk):
+            end = min(start + chunk, n_total)
+            assign = split_of[start:end]
+            if np.all(assign < 0):
+                continue
+            iq = as_iq(handle["iq"][start:end]).astype(np.float32, copy=False)
+            y = signal_type[start:end]
+            s = snr[start:end]
+            for split_id, split_name in ((0, "train"), (1, "val")):
+                sel = assign == split_id
+                if not np.any(sel):
+                    continue
+                writers[split_name].append_raw(
+                    iq[sel],
+                    mod_label_id=y[sel],
+                    source_label_id=y[sel],
+                    snr=s[sel],
+                )
+
+    ctx.touched.add(name)
+    entry = ctx.report["datasets"].setdefault(name, {"labels": labels, "splits": {}})
+    entry["labels"] = labels
+    entry["source_path"] = str(src)
+    entry.pop("balanced_split", None)
+    entry["splits"].pop("train", None)
+    entry["splits"].pop("test", None)
+    for split_name, writer in writers.items():
+        writer.close()
+        entry["splits"][split_name] = {
+            "raw": int(n_total),
+            "kept": writer.count,
+            "removed": dict(removed) if split_name == "train" else {},
+            "file": writer.path.name,
+        }
+    entry["val_test_split"] = {
+        "label_field": "mod_label_id",
+        "train_ratio": VAL_TEST_SPLIT_RATIO,
+        "no_class_balance": True,
+        "total_kept": int(kept_idx.size),
+        "classes": len(RADCHAR_SIGNAL_TYPE_NAMES),
+        "splits": {
+            split: {"kept": entry["splits"][split]["kept"], "file": entry["splits"][split]["file"]}
+            for split in ("train", "val")
+        },
+    }
+
+
 def rebuild_pools_from_h5(ctx: Context) -> None:
     ctx.pool = defaultdict(list)
     ctx.final_label_fields = {}
@@ -1540,7 +1671,28 @@ def _write_int_column(f: h5py.File, key: str, values: np.ndarray) -> None:
     )
 
 
-def stamp_semantic_namespaces(ctx: Context) -> dict[str, dict[str, int]]:
+def _h5_paths_for_datasets(ctx: Context, only_datasets: set[str] | None = None) -> list[Path]:
+    if not ctx.h5.exists():
+        return []
+    paths: list[Path] = []
+    for path in sorted(ctx.h5.glob("*.h5")):
+        if "__balanced_" in path.name:
+            continue
+        if only_datasets is not None:
+            try:
+                if h5_dataset_name(path.name) not in only_datasets:
+                    continue
+            except ValueError:
+                continue
+        paths.append(path)
+    return paths
+
+
+def stamp_semantic_namespaces(
+    ctx: Context,
+    *,
+    only_datasets: set[str] | None = None,
+) -> dict[str, dict[str, int]]:
     """写入 canonical modulation 与 namespaced emitter 的连续全局 ID。"""
     ontology = build_modulation_ontology(
         ctx.maps.get("modulations", {}),
@@ -1561,9 +1713,7 @@ def stamp_semantic_namespaces(ctx: Context) -> dict[str, dict[str, int]]:
     emitter_stats: dict[str, int] = {}
     if not ctx.h5.exists():
         return {"canonical_mod_label_id": canonical_stats, "global_emitter_id": emitter_stats}
-    for path in sorted(ctx.h5.glob("*.h5")):
-        if "__balanced_" in path.name:
-            continue
+    for path in _h5_paths_for_datasets(ctx, only_datasets):
         with h5py.File(path, "r+") as f:
             n = int(f["iq"].shape[0])
             dataset_ids = _read_label_array(f, "dataset_id", n)
@@ -1593,14 +1743,16 @@ def stamp_semantic_namespaces(ctx: Context) -> dict[str, dict[str, int]]:
     }
 
 
-def stamp_global_label_ids(ctx: Context) -> dict[str, int]:
+def stamp_global_label_ids(
+    ctx: Context,
+    *,
+    only_datasets: set[str] | None = None,
+) -> dict[str, int]:
     """为每个 H5 样本写入跨数据集唯一的 global_label_id（用于 clustering）。"""
     if not ctx.h5.exists():
         return {}
     stats: dict[str, int] = {}
-    for path in sorted(ctx.h5.glob("*.h5")):
-        if "__balanced_" in path.name:
-            continue
+    for path in _h5_paths_for_datasets(ctx, only_datasets):
         with h5py.File(path, "r+") as f:
             n = int(f["iq"].shape[0])
             dataset_id = np.asarray(f["dataset_id"][:])
@@ -1767,6 +1919,7 @@ def ensure_missing_test_splits(
     *,
     seed: int = MISSING_TEST_SPLIT_SEED,
     frac: float = MISSING_TEST_FRACTION,
+    only_datasets: set[str] | None = None,
 ) -> dict[str, int]:
     """只处理「有 train、无 test」；不动已有 test/val（WiSig group-held-out 保持原样）。
 
@@ -1780,6 +1933,8 @@ def ensure_missing_test_splits(
         if "__balanced_" in train_path.name:
             continue
         base = train_path.name[: -len("_train.h5")]
+        if only_datasets is not None and base not in only_datasets:
+            continue
         test_path = ctx.h5 / f"{base}_test.h5"
         val_path = ctx.h5 / f"{base}_val.h5"
         if test_path.is_file():
@@ -1840,7 +1995,7 @@ def finalize_task_pools(ctx: Context) -> None:
     - *_train.h5：MAE 预训练（pretrain_train）
     - *_val.h5：各阶段验证（早停 / 选模 / 报告指标）
     - *_test.h5：阶段二/三有标签训练（downstream_*_train / clustering_train）
-    白名单见 configs/datasets.yaml（pretrain / downstream_modulation / emitter_downstream）。
+    白名单见 configs/datasets.yaml（pretrain / downstream_* / clustering_* / prediction）。
     """
     rebuild_pools_from_h5(ctx)
     train = sorted(ctx.pool["train"])
@@ -1850,9 +2005,12 @@ def finalize_task_pools(ctx: Context) -> None:
     pf = lambda split, **kw: pool_files(split, fields, **kw)
     config_path = ROOT / "configs" / "datasets.yaml"
     pretrain_datasets = load_pretrain_datasets(config_path=config_path)
-    modulation_datasets = load_downstream_modulation_datasets(config_path=config_path)
-    emitter_downstream = load_emitter_downstream_datasets(config_path=config_path)
-    shared_datasets = load_downstream_shared_datasets(config_path=config_path)
+    radar_mod_datasets = load_downstream_radar_modulation_datasets(config_path=config_path)
+    radar_model_datasets = load_downstream_radar_model_datasets(config_path=config_path)
+    comm_mod_datasets = load_downstream_comm_modulation_datasets(config_path=config_path)
+    clustering_radar_datasets = load_clustering_radar_datasets(config_path=config_path)
+    clustering_comm_datasets = load_clustering_comm_datasets(config_path=config_path)
+    prediction_datasets = load_prediction_datasets(config_path=config_path)
     excluded = load_excluded_datasets(config_path=config_path)
 
     def _pool(split_files: list[tuple[str, int]], **kwargs: object) -> list[str]:
@@ -1865,47 +2023,102 @@ def finalize_task_pools(ctx: Context) -> None:
     ) -> list[str]:
         return filter_dataset_pool(_pool(split_files, **kwargs), allowed)
 
-    modulation_train = _whitelist_pool(
-        test, modulation_datasets, task_id=0, label_field="mod_label_id"
+    radar_mod_train = _whitelist_pool(
+        test, radar_mod_datasets, task_id=0, label_field="mod_label_id"
     )
-    modulation_val = _whitelist_pool(
-        val, modulation_datasets, task_id=0, label_field="mod_label_id"
+    radar_mod_val = _whitelist_pool(
+        val, radar_mod_datasets, task_id=0, label_field="mod_label_id"
     )
-    emitter_train = filter_emitter_downstream_pool(
-        _whitelist_pool(test, emitter_downstream, task_id=1, label_field="emitter_id"),
-        emitter_downstream,
+    radar_model_train = _whitelist_pool(
+        test, radar_model_datasets, task_id=0, label_field="mod_label_id"
     )
-    emitter_val = filter_emitter_downstream_pool(
-        _whitelist_pool(val, emitter_downstream, task_id=1, label_field="emitter_id"),
-        emitter_downstream,
+    radar_model_val = _whitelist_pool(
+        val, radar_model_datasets, task_id=0, label_field="mod_label_id"
     )
-    shared_train = sorted(set(modulation_train) | set(emitter_train))
-    shared_val = sorted(set(modulation_val) | set(emitter_val))
-    shared_train = filter_dataset_pool(shared_train, shared_datasets)
-    shared_val = filter_dataset_pool(shared_val, shared_datasets)
+    comm_mod_train = _whitelist_pool(
+        test, comm_mod_datasets, task_id=0, label_field="mod_label_id"
+    )
+    comm_mod_val = _whitelist_pool(
+        val, comm_mod_datasets, task_id=0, label_field="mod_label_id"
+    )
+    prediction_train = _whitelist_pool(test, prediction_datasets)
+    prediction_val = _whitelist_pool(val, prediction_datasets)
+    clustering_radar_train = pool_files_with_global_labels(
+        ctx,
+        [
+            (filename, tid)
+            for filename, tid in test
+            if filename in set(_whitelist_pool(test, clustering_radar_datasets))
+        ],
+    )
+    clustering_radar_val = pool_files_with_global_labels(
+        ctx,
+        [
+            (filename, tid)
+            for filename, tid in val
+            if filename in set(_whitelist_pool(val, clustering_radar_datasets))
+        ],
+    )
+    clustering_comm_train = pool_files_with_global_labels(
+        ctx,
+        [
+            (filename, tid)
+            for filename, tid in test
+            if filename in set(_whitelist_pool(test, clustering_comm_datasets))
+        ],
+    )
+    clustering_comm_val = pool_files_with_global_labels(
+        ctx,
+        [
+            (filename, tid)
+            for filename, tid in val
+            if filename in set(_whitelist_pool(val, clustering_comm_datasets))
+        ],
+    )
+    clustering_train = sorted(set(clustering_radar_train) | set(clustering_comm_train))
+    clustering_val = sorted(set(clustering_radar_val) | set(clustering_comm_val))
 
     ctx.maps["task_pools"] = {
         "pretrain_train": _whitelist_pool(train, pretrain_datasets),
         "pretrain_val": _whitelist_pool(val, pretrain_datasets),
-        "downstream_modulation_train": modulation_train,
-        "downstream_modulation_val": modulation_val,
-        "downstream_source_train": _whitelist_pool(test, modulation_datasets, task_id=0, label_field="source_label_id"),
-        "downstream_source_val": _whitelist_pool(val, modulation_datasets, task_id=0, label_field="source_label_id"),
-        "downstream_emitter_train": emitter_train,
-        "downstream_emitter_val": emitter_val,
-        "downstream_prediction_train": shared_train,
-        "downstream_prediction_val": shared_val,
-        "clustering_train": pool_files_with_global_labels(
-            ctx, [(filename, tid) for filename, tid in test if filename in set(shared_train)]
+        "downstream_radar_modulation_train": radar_mod_train,
+        "downstream_radar_modulation_val": radar_mod_val,
+        "downstream_radar_model_train": radar_model_train,
+        "downstream_radar_model_val": radar_model_val,
+        "downstream_comm_modulation_train": comm_mod_train,
+        "downstream_comm_modulation_val": comm_mod_val,
+        # 兼容旧 pool 名（通信调制）
+        "downstream_modulation_train": comm_mod_train,
+        "downstream_modulation_val": comm_mod_val,
+        "downstream_emitter_train": [],
+        "downstream_emitter_val": [],
+        "downstream_source_train": _whitelist_pool(
+            test, comm_mod_datasets, task_id=0, label_field="source_label_id"
         ),
-        "clustering_val": pool_files_with_global_labels(
-            ctx, [(filename, tid) for filename, tid in val if filename in set(shared_val)]
+        "downstream_source_val": _whitelist_pool(
+            val, comm_mod_datasets, task_id=0, label_field="source_label_id"
         ),
+        "downstream_prediction_train": prediction_train,
+        "downstream_prediction_val": prediction_val,
+        "clustering_radar_train": clustering_radar_train,
+        "clustering_radar_val": clustering_radar_val,
+        "clustering_comm_train": clustering_comm_train,
+        "clustering_comm_val": clustering_comm_val,
+        "clustering_train": clustering_train,
+        "clustering_val": clustering_val,
     }
     ctx.maps["pretrain_datasets"] = list(pretrain_datasets)
-    ctx.maps["downstream_modulation_datasets"] = list(modulation_datasets)
-    ctx.maps["emitter_downstream_datasets"] = list(emitter_downstream)
-    ctx.maps["downstream_shared_datasets"] = list(shared_datasets)
+    ctx.maps["downstream_radar_modulation_datasets"] = list(radar_mod_datasets)
+    ctx.maps["downstream_radar_model_datasets"] = list(radar_model_datasets)
+    ctx.maps["downstream_comm_modulation_datasets"] = list(comm_mod_datasets)
+    ctx.maps["downstream_modulation_datasets"] = list(comm_mod_datasets)
+    ctx.maps["emitter_downstream_datasets"] = []
+    ctx.maps["clustering_radar_datasets"] = list(clustering_radar_datasets)
+    ctx.maps["clustering_comm_datasets"] = list(clustering_comm_datasets)
+    ctx.maps["prediction_datasets"] = list(prediction_datasets)
+    ctx.maps["downstream_shared_datasets"] = sorted(
+        set(radar_model_datasets) | set(comm_mod_datasets) | set(clustering_radar_datasets) | set(clustering_comm_datasets)
+    )
     ctx.maps["excluded_datasets"] = list(excluded)
 
 
@@ -1992,10 +2205,11 @@ def build_registry() -> dict[str, object]:
       "wifi150": lambda ctx: npy_dataset(ctx, "wifi150", 7, EMITTER / "wifi_cls150", 1, "emitter_id", None, [("train", "train"), ("val", "val"), ("test", "test")]),
       "communication_emitters": lambda ctx: dat_emitters(ctx, "communication_emitters", 8, EMITTER / "通信辐射源个体识别数据集", 2048, False),
       "radar_emitters": lambda ctx: dat_emitters(ctx, "radar_emitters", 9, EMITTER / "雷达辐射源个体识别数据集", 1000, True),
-      "open_real_data": lambda ctx: open_real_data(ctx, 10),
+      "radar_mod15": lambda ctx: radar_mod15(ctx, 10),
       "wisig": lambda ctx: wisig_manytx(ctx, 11),
       "panoradio_hf": lambda ctx: panoradio_hf(ctx, 12),
       "cjr_mix": lambda ctx: cjr_mix(ctx, 31),
+      "radchar": lambda ctx: radchar(ctx, 16),
   }
   for ds_name, ds_id, filename, snr_min in RADCOM_VARIANTS:
       registry[ds_name] = (
@@ -2105,13 +2319,46 @@ def run_builds_parallel(output: Path, names: list[str], jobs: int) -> None:
     merge_build_caches(Context(output), names)
 
 
-def refuse_manifested_h5_mutation(ctx: Context, operation: str) -> None:
+def manifested_dataset_names(ctx: Context) -> set[str]:
     manifest_path = ctx.output / "split_manifest.json"
-    if manifest_path.exists():
+    if not manifest_path.is_file():
+        return set()
+    payload = load_manifest(manifest_path)
+    return {str(name) for name in payload.get("datasets", {})}
+
+
+def refuse_manifested_h5_mutation(
+    ctx: Context,
+    operation: str,
+    *,
+    allow_new: set[str] | None = None,
+) -> None:
+    locked = manifested_dataset_names(ctx)
+    if not locked:
+        return
+    if allow_new is not None:
+        overlap = sorted(set(allow_new) & locked)
+        if not overlap:
+            return
         raise ImmutableManifestError(
-            f"{operation} 会修改已有 split 对应的 H5，但 {manifest_path} 已锁定该数据版本；"
-            "请使用新的 --output 目录"
+            f"{operation} 会覆盖已锁定数据集 {overlap}；请使用新的 --output 目录"
         )
+    manifest_path = ctx.output / "split_manifest.json"
+    raise ImmutableManifestError(
+        f"{operation} 会修改已有 split 对应的 H5，但 {manifest_path} 已锁定该数据版本；"
+        "请使用新的 --output 目录"
+    )
+
+
+def finalize_new_datasets(ctx: Context, names: list[str]) -> None:
+    """在已锁定 split_manifest 上追加新数据集：不 rebalance、不改写旧 H5。"""
+    only = set(names)
+    stamp_semantic_namespaces(ctx, only_datasets=only)
+    stamp_global_label_ids(ctx, only_datasets=only)
+    ensure_missing_test_splits(ctx, only_datasets=only)
+    finalize_task_pools(ctx)
+    refresh_split_manifest(ctx)
+    persist_maps_and_report(ctx)
 
 
 def main():
@@ -2175,6 +2422,12 @@ def main():
         help="ensure_missing_test_splits 固定种子",
     )
     parser.add_argument(
+        "--split-fraction",
+        type=float,
+        default=MISSING_TEST_FRACTION,
+        help="ensure_missing_test_splits 每类切分比例（默认 0.2）",
+    )
+    parser.add_argument(
         "--finalize-only",
         action="store_true",
         help="合并 .build_cache 并执行 rebalance、global_label_id、task_pools",
@@ -2206,7 +2459,9 @@ def main():
         return
     if args.ensure_missing_test_splits or args.rebuild_task_pools or args.rebuild_pools_only:
         if args.ensure_missing_test_splits:
-            split_stats = ensure_missing_test_splits(ctx, seed=int(args.split_seed))
+            split_stats = ensure_missing_test_splits(
+                ctx, seed=int(args.split_seed), frac=float(args.split_fraction)
+            )
             if split_stats:
                 print(f"[ensure-test-splits] {split_stats}", flush=True)
                 refresh_split_manifest(ctx)
@@ -2274,17 +2529,22 @@ def main():
         print(f"[sync-label-maps] {ctx.output}", flush=True)
         return
     selected = set(args.datasets)
-    refuse_manifested_h5_mutation(ctx, "dataset build")
     registry = build_registry()
     build_names = resolve_selected_builds(selected, registry)
     if not build_names:
         raise SystemExit("未选择任何数据集")
+    refuse_manifested_h5_mutation(ctx, "dataset build", allow_new=set(build_names))
     jobs = max(1, int(args.jobs))
     run_builds_parallel(args.output, build_names, jobs)
     if args.build_only:
         print(f"[build-only] {build_names}", flush=True)
         return
     merge_build_caches(ctx, build_names)
+    locked = manifested_dataset_names(ctx)
+    if locked and not (set(build_names) & locked):
+        finalize_new_datasets(ctx, build_names)
+        print(f"[done] appended {build_names} -> {ctx.output}", flush=True)
+        return
     finalize(ctx)
     print(f"[done] {ctx.output}", flush=True)
 

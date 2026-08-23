@@ -19,6 +19,7 @@ class GlobalEmitterLabelMap:
     offsets: dict[int, int]
     dataset_names: dict[int, str]
     num_emitters: int
+    class_counts: dict[int, int] | None = None
 
     def offset_lookup(self, max_dataset_id: int | None = None) -> torch.Tensor:
         size = (max(max(self.offsets) if self.offsets else 0, max_dataset_id or 0)) + 1
@@ -36,10 +37,27 @@ def build_emitter_dataset_class_mask(
     *,
     num_emitters: int,
     num_datasets: int,
+    compact: bool = False,
+    train_cfg: dict | None = None,
+    config_path: str | Path | None = None,
 ) -> torch.Tensor | None:
-    """``[num_datasets, num_emitters]``：每行是该 dataset_id 允许的全局个体类。"""
+    """``[num_datasets, num_emitters]``：每行是该 dataset_id 允许的全局个体类。
+
+    ``compact=True`` 时按下游紧凑标签图（仅 emitter_downstream 数据集）填 mask；
+    否则使用全库 ``emitter_namespace``。
+    """
     if rfdata_root is None or int(num_emitters) <= 0 or int(num_datasets) <= 0:
         return None
+    if compact:
+        label_map = build_global_emitter_label_map(
+            rfdata_root,
+            config_path=config_path,
+            train_cfg=train_cfg,
+        )
+        return build_compact_emitter_dataset_class_mask(
+            label_map,
+            num_datasets=int(num_datasets),
+        )
     path = Path(rfdata_root) / "label_maps.json"
     if not path.is_file():
         return None
@@ -59,6 +77,38 @@ def build_emitter_dataset_class_mask(
             class_id = int(raw_global)
             if 0 <= class_id < mask.shape[1]:
                 mask[dataset_id, class_id] = True
+    if not bool(mask.any()):
+        return None
+    return mask
+
+
+def build_compact_emitter_dataset_class_mask(
+    label_map: GlobalEmitterLabelMap,
+    *,
+    num_datasets: int,
+) -> torch.Tensor | None:
+    """紧凑标签空间：每个下游数据集只开放 ``offset:offset+count`` 区间。"""
+    n_emitters = int(label_map.num_emitters)
+    n_ds = int(num_datasets)
+    if n_emitters <= 0 or n_ds <= 0 or not label_map.offsets:
+        return None
+    mask = torch.zeros(n_ds, n_emitters, dtype=torch.bool)
+    counts = dict(label_map.class_counts or {})
+    if not counts:
+        # 由相邻 offset 推断各类数
+        ordered = sorted(label_map.offsets.items(), key=lambda item: item[1])
+        for idx, (dataset_id, offset) in enumerate(ordered):
+            end = ordered[idx + 1][1] if idx + 1 < len(ordered) else n_emitters
+            counts[int(dataset_id)] = int(end) - int(offset)
+    for dataset_id, offset in label_map.offsets.items():
+        ds = int(dataset_id)
+        if ds < 0 or ds >= n_ds:
+            continue
+        count = int(counts.get(ds, 0))
+        start = int(offset)
+        end = min(start + max(count, 0), n_emitters)
+        if start < end:
+            mask[ds, start:end] = True
     if not bool(mask.any()):
         return None
     return mask
@@ -88,6 +138,7 @@ def load_emitter_downstream_datasets(
     config_path: str | Path | None = None,
     train_cfg: dict | None = None,
 ) -> list[str]:
+    """通信/雷达辐射源个体识别下游白名单（当前任务范围外；保留兼容）。"""
     if train_cfg and train_cfg.get("emitter_downstream_datasets"):
         return [str(name) for name in train_cfg["emitter_downstream_datasets"]]
 
@@ -117,9 +168,7 @@ def load_emitter_downstream_datasets(
         if datasets:
             return [str(name) for name in datasets]
 
-    raise FileNotFoundError(
-        f"未找到 emitter 下游数据集配置，请提供 emitter_downstream_datasets 或 {DEFAULT_EMITTER_DOWNSTREAM_CONFIG}"
-    )
+    return []
 
 
 def h5_dataset_name(filename: str) -> str:
@@ -150,21 +199,28 @@ def build_global_emitter_label_map(
 
     dataset_id_by_name = {name: int(dataset_id) for dataset_id, name in label_maps.get("datasets", {}).items()}
     emitter_tables = label_maps.get("emitters", {})
+    dataset_names = [name for name in dataset_names if name in emitter_tables]
 
     offsets: dict[int, int] = {}
     dataset_name_by_id: dict[int, str] = {}
+    class_counts: dict[int, int] = {}
     next_offset = 0
     for dataset_name in sorted(dataset_names, key=lambda name: dataset_id_by_name.get(name, 10**9)):
-        if dataset_name not in emitter_tables:
-            raise KeyError(f"emitter 数据集 {dataset_name!r} 不在 label_maps.emitters 中")
         dataset_id = dataset_id_by_name.get(dataset_name)
         if dataset_id is None:
             raise KeyError(f"emitter 数据集 {dataset_name!r} 不在 label_maps.datasets 中")
+        n_classes = len(emitter_tables[dataset_name])
         offsets[dataset_id] = next_offset
         dataset_name_by_id[dataset_id] = dataset_name
-        next_offset += len(emitter_tables[dataset_name])
+        class_counts[dataset_id] = n_classes
+        next_offset += n_classes
 
-    return GlobalEmitterLabelMap(offsets=offsets, dataset_names=dataset_name_by_id, num_emitters=next_offset)
+    return GlobalEmitterLabelMap(
+        offsets=offsets,
+        dataset_names=dataset_name_by_id,
+        num_emitters=next_offset,
+        class_counts=class_counts,
+    )
 
 
 def global_emitter_labels(
@@ -174,9 +230,11 @@ def global_emitter_labels(
 ) -> torch.Tensor:
     valid = (dataset_id >= 0) & (emitter_id >= 0)
     dataset_idx = dataset_id.long().clamp_min(0)
+    # batch 在 GPU 时 lookup 常仍在 CPU（Lightning 不会自动搬非 buffer 张量）
+    offset_lookup = offset_lookup.to(device=dataset_idx.device, dtype=torch.long)
     if dataset_idx.numel() and int(dataset_idx.max()) >= offset_lookup.numel():
-        padded = torch.full((int(dataset_idx.max()) + 1,), -1, dtype=torch.long, device=offset_lookup.device)
-        padded[: offset_lookup.numel()] = offset_lookup.to(padded.device)
+        padded = torch.full((int(dataset_idx.max()) + 1,), -1, dtype=torch.long, device=dataset_idx.device)
+        padded[: offset_lookup.numel()] = offset_lookup
         offset_lookup = padded
     offsets = offset_lookup[dataset_idx]
     global_id = offsets + emitter_id.long()
