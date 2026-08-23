@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from resmamba_signal_model.data.packing import pack_valid_tokens, scatter_packed_tokens
 from resmamba_signal_model.models.mamba_backbone import build_mamba_block
+from resmamba_signal_model.models.moe import MoEAux, MoEFFN
 from resmamba_signal_model.models.norms import DropPath, RMSNorm, build_norm
 from resmamba_signal_model.models.physics import PHYS_DIM
 from resmamba_signal_model.models.revin import AMP_AUX_DIM
@@ -27,7 +28,7 @@ class SwiGLU(nn.Module):
 
 
 class DecoderBlock(nn.Module):
-    """Pre-LN：BiMamba2 混合 + SwiGLU。层数由 SharedDecoder 锁定为 1。"""
+    """Pre-LN：BiMamba2 混合 + MoE-FFN（复用 LD/TX 三路语义专家）。层数由 SharedDecoder 锁定为 1。"""
 
     def __init__(
         self,
@@ -46,6 +47,10 @@ class DecoderBlock(nn.Module):
         allow_fallback_mamba: bool = False,
         norm_type: str = "rmsnorm",
         drop_path: float = 0.0,
+        enable_moe: bool = True,
+        moe_num_experts: int = 3,
+        moe_top_k: int | None = None,
+        moe_ffn_expand: float = 2.0,
     ) -> None:
         super().__init__()
         self.mamba = build_mamba_block(
@@ -64,8 +69,19 @@ class DecoderBlock(nn.Module):
             norm=build_norm(norm_type, d_model),
         )
         self.ffn_norm = build_norm(norm_type, d_model)
-        self.ffn = SwiGLU(d_model)
+        if enable_moe:
+            self.ffn: nn.Module = MoEFFN(
+                d_model,
+                num_experts=max(1, int(moe_num_experts)),
+                ffn_expand=float(moe_ffn_expand),
+                top_k=moe_top_k,
+            )
+            self._ffn_is_moe = True
+        else:
+            self.ffn = SwiGLU(d_model)
+            self._ffn_is_moe = False
         self.drop_path = DropPath(drop_path)
+        self.last_moe_aux: MoEAux | None = None
 
     def forward(
         self,
@@ -76,7 +92,14 @@ class DecoderBlock(nn.Module):
         cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x = self.mamba(x, key_padding_mask=key_padding_mask, seq_idx=seq_idx, cu_seqlens=cu_seqlens)
-        x = x + self.drop_path(self.ffn(self.ffn_norm(x)))
+        self.last_moe_aux = None
+        ffn_in = self.ffn_norm(x)
+        if self._ffn_is_moe:
+            ffn_out, aux = self.ffn(ffn_in, key_padding_mask=key_padding_mask)
+            self.last_moe_aux = aux
+        else:
+            ffn_out = self.ffn(ffn_in)
+        x = x + self.drop_path(ffn_out)
         if key_padding_mask is not None:
             x = x.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
         return x
@@ -129,6 +152,48 @@ class AttentionPooling(nn.Module):
         query = self.query.expand(x.shape[0], -1, -1)
         out, _ = self.attn(query, x, x, key_padding_mask=key_padding_mask, need_weights=False)
         return out.squeeze(1)
+
+
+class GatingPooling(nn.Module):
+    """多头自适应时序池化（MambaSL gating 思路）：逐 token 打分 → Softmax → 加权求和。
+
+    与单 query AttnPool 相比，可同时覆盖全局模式与局部事件，输出仍为 ``[B, D]``。
+    """
+
+    def __init__(self, d_model: int, num_heads: int = 4) -> None:
+        super().__init__()
+        heads = max(1, min(int(num_heads), d_model))
+        self.num_heads = heads
+        self.score = nn.Linear(d_model, heads, bias=True)
+        self.out_proj = nn.Linear(d_model * heads, d_model, bias=False) if heads > 1 else None
+        # 零权重 + 零偏置：初始近似均匀加权，避免一开始塌到少数 token
+        nn.init.zeros_(self.score.weight)
+        nn.init.zeros_(self.score.bias)
+        if self.out_proj is not None:
+            nn.init.xavier_uniform_(self.out_proj.weight)
+
+    def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+        # x: [B, L, D]；key_padding_mask True = pad
+        logits = self.score(x)
+        if key_padding_mask is not None:
+            logits = logits.masked_fill(key_padding_mask.unsqueeze(-1), float("-inf"))
+        weights = torch.softmax(logits, dim=1)
+        weights = torch.nan_to_num(weights, nan=0.0)
+        # [B, H, D] = Σ_L w[b,l,h] * x[b,l,:]
+        pooled = torch.einsum("blh,bld->bhd", weights, x)
+        if self.out_proj is None:
+            return pooled.squeeze(1)
+        return self.out_proj(pooled.reshape(pooled.shape[0], -1))
+
+
+def build_sequence_pool(pool_type: str, d_model: int, num_heads: int = 4) -> nn.Module:
+    """构建序列级池化：``gating_pool``（默认）或 ``attn_pool``。"""
+    name = str(pool_type or "gating_pool").strip().lower()
+    if name in ("gating_pool", "gating", "adaptive", "adaptive_pool"):
+        return GatingPooling(d_model, num_heads=num_heads)
+    if name in ("attn_pool", "attention", "attention_pool", "attn"):
+        return AttentionPooling(d_model, num_heads=num_heads)
+    raise ValueError(f"未知 encoder_pool_type={pool_type!r}，可选 gating_pool / attn_pool")
 
 
 class ReconHead(nn.Module):
@@ -277,6 +342,10 @@ class SharedDecoder(nn.Module):
         query_dim: int = 320,
         condition_dim: int = 64,
         legacy_reconstruction: bool = False,
+        enable_moe: bool = True,
+        moe_num_experts: int = 3,
+        moe_top_k: int | None = None,
+        moe_ffn_expand: float = 2.0,
         **block_kwargs,
     ) -> None:
         super().__init__()
@@ -291,7 +360,20 @@ class SharedDecoder(nn.Module):
         self.skip_gate = nn.Linear(d_model * 2, d_model)
         self.pre_norm = RMSNorm(d_model)
         self.film = PhysicsFiLM(d_model)
-        self.blocks = nn.ModuleList([DecoderBlock(d_model, dropout=dropout, **block_kwargs) for _ in range(1)])
+        self.blocks = nn.ModuleList(
+            [
+                DecoderBlock(
+                    d_model,
+                    dropout=dropout,
+                    enable_moe=enable_moe,
+                    moe_num_experts=moe_num_experts,
+                    moe_top_k=moe_top_k,
+                    moe_ffn_expand=moe_ffn_expand,
+                    **block_kwargs,
+                )
+                for _ in range(1)
+            ]
+        )
         self.query_decoder = UnifiedQueryDecoder(
             d_model,
             patch_size,
@@ -304,8 +386,14 @@ class SharedDecoder(nn.Module):
         self.recon_head = ReconHead(d_model, patch_size)
         self.repr_head = ReprHead(d_model, num_heads=min(4, attn_num_heads))
         self.readout_phys = nn.Linear(d_model, PHYS_DIM)
+        self._last_moe_aux: list[MoEAux] = []
         nn.init.normal_(self.mask_token, std=0.02)
         nn.init.normal_(self.dec_token, std=0.02)
+
+    def pop_moe_aux(self) -> list[MoEAux]:
+        aux = list(self._last_moe_aux)
+        self._last_moe_aux.clear()
+        return aux
 
     def scatter_encoder(
         self,
@@ -348,8 +436,11 @@ class SharedDecoder(nn.Module):
         seq_idx: torch.Tensor | None,
         cu_seqlens: torch.Tensor | None,
     ) -> torch.Tensor:
+        self._last_moe_aux.clear()
         for block in self.blocks:
             h = block(h, key_padding_mask=key_padding_mask, seq_idx=seq_idx, cu_seqlens=cu_seqlens)
+            if block.last_moe_aux is not None:
+                self._last_moe_aux.append(block.last_moe_aux)
         return h
 
     def forward(

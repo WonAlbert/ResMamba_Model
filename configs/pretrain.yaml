@@ -20,13 +20,13 @@ seed: 0
 check_val_every_n_epoch: 1
 checkpoint_monitor: val/monitor
 checkpoint_mode: min
-early_stopping_patience: 3
+early_stopping_patience: 8
 early_stopping_min_delta: 0.001
 min_ratio: 0.05
 synthetic: false
 amp: true
 amp_dtype: bfloat16
-epochs: 25
+epochs: 30
 num_workers: 4
 prefetch_factor: 8
 max_grad_norm: 0.5
@@ -51,10 +51,11 @@ loss_weights:
   structure: 0.2
   structure_phase: 0.15
   latent: 0.0
-  vicreg: 0.3
+  vicreg: 0.5
   # 可见 token VICReg；UTI semantic/source/context 去相关（无分类 / InfoNCE）
-  vicreg_token: 0.15
+  vicreg_token: 0.2
   view_div: 0.1
+  moe: 0.01
   uti_pooled: 0.0
   uti_token: 0.0
   uti_query: 0.0
@@ -63,16 +64,20 @@ ema_momentum: 0.999
 supervised_clustering: false
 clustering_view2: true
 source_groups:
+  ld_radar: [radchar, radar_mod15, cjr_mix]
+  tx_comm: [rml2016_*, xidian14, panoradio_hf]
   radcom: [radcom_awgn, radcom_dynamic, radcom_ota]
-  radar: [radar_emitters, electromagnetic_0926]
-  comm: [xidian14, panoradio_hf, open_real_data, cjr_mix]
+family_quotas:
+  tx_comm: 0.40
+  ld_radar: 0.35
+  radcom: 0.25
 profiles:
   tiny:
     model_config: configs/model_tiny.yaml
     synthetic: true
     epochs: 1
     token_budget: 256
-    steps_per_epoch: 2
+    steps_per_epoch: 10
     limit_train_batches: 2
     limit_val_batches: 1
     val_batches: 1

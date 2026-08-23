@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from resmamba_signal_model.models.moe import MoEAux, MoEFFN
 from resmamba_signal_model.models.norms import DropPath, RMSNorm, build_norm
 
 
@@ -48,6 +49,10 @@ class MemoryTransformerBlock(nn.Module):
         attn_window: int = 1024,
         drop_path: float = 0.0,
         norm_type: str = "rmsnorm",
+        enable_moe: bool = True,
+        moe_num_experts: int = 3,
+        moe_top_k: int | None = None,
+        moe_ffn_expand: float = 2.0,
     ) -> None:
         super().__init__()
         if d_model % num_heads != 0:
@@ -63,9 +68,25 @@ class MemoryTransformerBlock(nn.Module):
         self.attn_drop = nn.Dropout(dropout)
         self.norm2 = build_norm(norm_type, d_model)
         hidden = int(d_model * ffn_expand)
-        self.ffn = nn.Sequential(nn.Linear(d_model, hidden), nn.GELU(), nn.Dropout(dropout), nn.Linear(hidden, d_model))
+        if enable_moe:
+            self.ffn: nn.Module = MoEFFN(
+                d_model,
+                num_experts=max(1, int(moe_num_experts)),
+                ffn_expand=float(moe_ffn_expand),
+                top_k=moe_top_k,
+            )
+            self._ffn_is_moe = True
+        else:
+            self.ffn = nn.Sequential(
+                nn.Linear(d_model, hidden),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden, d_model),
+            )
+            self._ffn_is_moe = False
         self.drop_path = DropPath(drop_path)
         self.last_used_memory = False
+        self.last_moe_aux: MoEAux | None = None
 
     def _attend(
         self,
@@ -124,7 +145,14 @@ class MemoryTransformerBlock(nn.Module):
             mem_out = self._attend(mem, mem_pad)
             attn_out = mem_out.repeat_interleave(chunk_size, dim=1)[:, :seq_len]
         x = x + self.drop_path(attn_out)
-        x = x + self.drop_path(self.ffn(self.norm2(x)))
+        self.last_moe_aux = None
+        ffn_in = self.norm2(x)
+        if self._ffn_is_moe:
+            ffn_out, aux = self.ffn(ffn_in, key_padding_mask=key_padding_mask)
+            self.last_moe_aux = aux
+        else:
+            ffn_out = self.ffn(ffn_in)
+        x = x + self.drop_path(ffn_out)
         if key_padding_mask is not None:
             x = x.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
         return x

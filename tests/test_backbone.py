@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 from resmamba_signal_model.data.packing import pack_valid_tokens
-from resmamba_signal_model.models.backbone import HybridEncoder
+from resmamba_signal_model.models.backbone import HybridEncoder, MambaMoEFFNBlock
 from resmamba_signal_model.models.mamba_backbone import BiMamba2Block
 from resmamba_signal_model.models.transformer import MemoryTransformerBlock
 
@@ -21,6 +21,9 @@ def _encoder(**kwargs) -> HybridEncoder:
         attn_window=16,
         dropout=0.0,
         norm_type="rmsnorm",
+        enable_moe=True,
+        moe_num_experts=3,
+        moe_encoder_layers=2,
     )
     defaults.update(kwargs)
     return HybridEncoder(**defaults)
@@ -30,8 +33,19 @@ def test_encoder_layer_layout() -> None:
     enc = _encoder()
     assert len(enc.mamba_layers) == 5
     assert len(enc.transformer_layers) == 1
-    assert all(isinstance(layer, BiMamba2Block) for layer in enc.mamba_layers)
+    assert sum(isinstance(layer, BiMamba2Block) for layer in enc.mamba_layers) == 3
+    assert sum(isinstance(layer, MambaMoEFFNBlock) for layer in enc.mamba_layers) == 2
     assert all(isinstance(layer, MemoryTransformerBlock) for layer in enc.transformer_layers)
+    assert isinstance(enc.transformer_layers[0].ffn, torch.nn.Module)
+
+
+def test_encoder_moe_aux_collected() -> None:
+    enc = _encoder()
+    x = torch.randn(2, 12, 32)
+    _ = enc(x)
+    aux = enc.pop_moe_aux()
+    assert len(aux) == 3
+    assert all(torch.isfinite(a.load_balance_loss) for a in aux)
 
 
 def test_encoder_pad_and_packed_paths() -> None:

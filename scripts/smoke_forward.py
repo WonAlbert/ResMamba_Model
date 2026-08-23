@@ -50,12 +50,19 @@ def main() -> None:
     with torch.no_grad():
         out = model(batch, mode="pretrain")
     losses = foundation_pretrain_losses(out, batch)
-    total, parts = weighted_pretrain_loss(out, batch, {"mae": 1.0, "physical": 0.2, "domain": 0.1, "readout": 0.1})
+    total, parts = weighted_pretrain_loss(
+        out,
+        batch,
+        {"mae": 1.0, "physical": 0.2, "domain": 0.1, "readout": 0.1, "moe": 0.01},
+    )
     print("z", tuple(out["z"].shape), "recon", tuple(out["mae_pred"].shape), "tokens", tuple(out["tokens"].shape))
     print("losses", {k: round(float(v.detach()), 6) for k, v in parts.items()})
     print("total", float(total.detach()))
     assert out["z"].shape[0] == 2
     assert torch.isfinite(out["z"]).all()
+    assert "moe_load_balance" in out
+    assert torch.isfinite(out["moe_load_balance"])
+    assert "moe" in parts
     print("smoke_forward ok")
 
 

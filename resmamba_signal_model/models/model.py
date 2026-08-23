@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from resmamba_signal_model.data.packing import pack_valid_tokens
 from resmamba_signal_model.models.adapters import SharedTaskAdapter, TaskAdapter, apply_task_adapters
 from resmamba_signal_model.models.backbone import HybridEncoder
-from resmamba_signal_model.models.decoder import AttentionPooling, SharedDecoder
+from resmamba_signal_model.models.decoder import AttentionPooling, SharedDecoder, build_sequence_pool
 from resmamba_signal_model.models.domain import DomainDiscriminator, GradientReversal
 from resmamba_signal_model.models.heads import (
     EmitterHead,
@@ -24,6 +24,7 @@ from resmamba_signal_model.models.heads import (
     remap_task_head_checkpoints,
     register_task as register_task_head,
 )
+from resmamba_signal_model.models.moe import aggregate_moe_aux
 from resmamba_signal_model.models.physics import project_patch_energy, restore_absolute_log_power, sequence_physics
 from resmamba_signal_model.models.prototypes import DEVICE_NAMESPACE, CONTENT_NAMESPACE, PrototypeRegistry
 from resmamba_signal_model.models.revin import RevIN, RevINStats, clip_normalized
@@ -101,7 +102,13 @@ class SignalModelConfig:
     mae_mask_probs: dict[str, float] = field(
         default_factory=lambda: {"random": 1.0 / 3.0, "contiguous": 1.0 / 3.0, "mixed": 1.0 / 3.0}
     )
-    phase_plugin: bool = False
+    phase_plugin: bool = True
+    enable_moe: bool = True
+    moe_num_experts: int = 3
+    moe_top_k: int | None = None
+    moe_ffn_expand: float = 2.0
+    moe_encoder_layers: int = 2
+    moe_load_balance_weight: float = 0.01
     encode_visible_only: bool = True
     sequence_packing: bool = True
     l_min: int = 16
@@ -112,6 +119,7 @@ class SignalModelConfig:
     num_mod_classes: int = 256
     num_emitters: int = 512
     num_prototypes: int = 32
+    clustering_num_prototypes: int | None = None
     use_dataset_bias: bool = False
     low_rank_prototype: bool = True
     prototype_rank: int = 64
@@ -129,6 +137,10 @@ class SignalModelConfig:
     uti_legacy_mode: bool = False
     use_specialist_views: bool = True
     domain_prompt_size: int = 6
+    # encoder → z_enc 读出：默认 gating_pool（多头自适应）；可选 attn_pool
+    encoder_pool_type: str = "gating_pool"
+    encoder_pool_heads: int = 4
+    encoder_z_l2_normalize: bool = True
     adapter_down_dim: int = 64
     num_task_types: int = 8
     build_adapters: bool = False
@@ -153,6 +165,9 @@ class SignalModelConfig:
         tok_phase = bool(getattr(self.tokenizer, "phase_plugin", False))
         self.phase_plugin = bool(self.phase_plugin or tok_phase)
         self.tokenizer.phase_plugin = self.phase_plugin
+        self.tokenizer.enable_moe = bool(self.enable_moe)
+        self.tokenizer.moe_num_experts = int(self.moe_num_experts)
+        self.tokenizer.moe_top_k = self.moe_top_k
         if self.attn_num_heads is None:
             for heads in (8, 4, 2, 1):
                 if self.d_model % heads == 0:
@@ -220,6 +235,13 @@ class SignalFoundationModel(nn.Module):
             allow_fallback_mamba=cfg.allow_fallback_mamba,
             norm_type=cfg.norm_type,
         )
+        moe_kwargs = dict(
+            enable_moe=bool(getattr(cfg, "enable_moe", True)),
+            moe_num_experts=int(getattr(cfg, "moe_num_experts", 3)),
+            moe_top_k=getattr(cfg, "moe_top_k", None),
+            moe_ffn_expand=float(getattr(cfg, "moe_ffn_expand", 2.0)),
+        )
+        encoder_moe_kwargs = {**moe_kwargs, "moe_encoder_layers": int(getattr(cfg, "moe_encoder_layers", 2))}
         self.encoder = HybridEncoder(
             d_model=cfg.d_model,
             encoder_mamba_layers=cfg.encoder_mamba_layers,
@@ -229,6 +251,7 @@ class SignalFoundationModel(nn.Module):
             attn_window=cfg.attn_window,
             drop_path=cfg.drop_path,
             **mamba_kwargs,
+            **encoder_moe_kwargs,
         )
         self.decoder = SharedDecoder(
             cfg.d_model,
@@ -241,12 +264,18 @@ class SignalFoundationModel(nn.Module):
             condition_dim=cfg.uti_rank,
             legacy_reconstruction=cfg.legacy_decoder_reconstruction,
             **{k: v for k, v in mamba_kwargs.items() if k != "dropout"},
+            **moe_kwargs,
         )
         self.domain_disc = DomainDiscriminator(cfg.d_model, num_datasets=max(2, cfg.num_datasets))
         self.grl = GradientReversal()
         self.chunk_pool = AttentionPooling(cfg.d_model, num_heads=min(4, heads))
-        # 分类身份：encoder token AttnPool（与 decoder ReprHead 的重建 z 分离）
-        self.encoder_pool = AttentionPooling(cfg.d_model, num_heads=min(4, heads))
+        # 分类身份：encoder token 池化 → z_enc（与 decoder ReprHead 的重建 z 分离）
+        pool_heads = int(getattr(cfg, "encoder_pool_heads", 4) or 4)
+        self.encoder_pool = build_sequence_pool(
+            getattr(cfg, "encoder_pool_type", "gating_pool"),
+            cfg.d_model,
+            num_heads=min(pool_heads, heads),
+        )
         self.encoder_repr_norm = nn.LayerNorm(cfg.d_model)
         self.task_interface: UniversalTaskInterface | None = None
         self.task_adapters: nn.ModuleDict | None = None
@@ -395,8 +424,10 @@ class SignalFoundationModel(nn.Module):
                 kwargs.setdefault("low_rank_prototype", True)
                 kwargs.setdefault("prototype_rank", prototype_rank)
         elif cls is PrototypeClusteringHead:
+            extra_k = getattr(self.cfg, "clustering_num_prototypes", None)
+            n_proto = int(extra_k) if extra_k else int(self.cfg.num_prototypes)
             kwargs.setdefault("proj_dim", max(64, self.cfg.d_model // 2))
-            kwargs.setdefault("num_prototypes", self.cfg.num_prototypes)
+            kwargs.setdefault("num_prototypes", n_proto)
             if head_rank:
                 kwargs.setdefault("low_rank_prototype", True)
                 kwargs.setdefault("prototype_rank", prototype_rank)
@@ -504,7 +535,7 @@ class SignalFoundationModel(nn.Module):
             if task == "emitter":
                 return ()
             if task == "clustering":
-                return ("semantic",)
+                return ()
         return tuple(getattr(self.cfg, "grl_invariant_views", ("semantic",)) or ())
 
     def _domain_logits(self, z_general: torch.Tensor, representations: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -573,6 +604,7 @@ class SignalFoundationModel(nn.Module):
         if not strict:
             own = self.state_dict()
             filtered: dict[str, Any] = {}
+            sliced_keys: list[str] = []
             for key, value in state.items():
                 current = own.get(key)
                 if (
@@ -581,10 +613,86 @@ class SignalFoundationModel(nn.Module):
                     and torch.is_tensor(current)
                     and tuple(current.shape) != tuple(value.shape)
                 ):
-                    continue
+                    # 紧凑标签把 num_emitters 从全库命名空间缩小（如 440→250）时，
+                    # 分类维在 dim0。纯切片会丢掉 wisig（命名空间 290..439）；
+                    # 对 emitter 头/探针做 adsb2|wisig 重排。
+                    adapted = self._adapt_class_dim_tensor(key, current, value)
+                    if adapted is None:
+                        continue
+                    value = adapted
+                    sliced_keys.append(key)
                 filtered[key] = value
             state = filtered
+            if sliced_keys:
+                import logging
+
+                logging.getLogger(__name__).info(
+                    "load_weights class-dim slice: %s", ", ".join(sliced_keys)
+                )
         return self.load_state_dict(state, strict=strict)
+
+    @staticmethod
+    def _slice_compatible_tensor(current: torch.Tensor, value: torch.Tensor) -> torch.Tensor | None:
+        """形状仅前导类维缩小/放大时可切片或零填充对齐。"""
+        if current.ndim != value.ndim or current.ndim < 1:
+            return None
+        if tuple(current.shape[1:]) != tuple(value.shape[1:]):
+            return None
+        c_out, v_out = int(current.shape[0]), int(value.shape[0])
+        if c_out == v_out:
+            return value
+        if c_out < v_out:
+            return value[:c_out].contiguous()
+        # 模型类数更大：拷贝已有行，其余保持模型初始化
+        out = current.detach().clone()
+        out[:v_out].copy_(value)
+        return out
+
+    @classmethod
+    def _adapt_class_dim_tensor(
+        cls,
+        key: str,
+        current: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """类维对齐；个体头在 440→250 时按命名空间重排到紧凑布局。"""
+        remapped = cls._remap_emitter_namespace_rows(key, current, value)
+        if remapped is not None:
+            return remapped
+        return cls._slice_compatible_tensor(current, value)
+
+    @staticmethod
+    def _remap_emitter_namespace_rows(
+        key: str,
+        current: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """adsb2=[0,100)、wisig 命名空间 [290,440) → 紧凑 [100,250)。"""
+        is_emitter_class = key.startswith("emitter_head.classifier.") or key.startswith(
+            "z_linear_probes.emitter"
+        )
+        if not is_emitter_class:
+            return None
+        if current.ndim != value.ndim or current.ndim < 1:
+            return None
+        if tuple(current.shape[1:]) != tuple(value.shape[1:]):
+            return None
+        c_out, v_out = int(current.shape[0]), int(value.shape[0])
+        # 跳过非类维参数（如 hidden MLP 的中间层）
+        if c_out not in (250, 440) or v_out not in (250, 440):
+            return None
+        # 紧凑 250 ↔ 全库 440：adsb2=[0,100)，wisig 命名空间 [290,440) ↔ 紧凑 [100,250)
+        if c_out == 250 and v_out == 440:
+            out = current.detach().clone()
+            out[:100].copy_(value[:100])
+            out[100:250].copy_(value[290:440])
+            return out
+        if c_out == 440 and v_out == 250:
+            out = current.detach().clone()
+            out[:100].copy_(value[:100])
+            out[290:440].copy_(value[100:250])
+            return out
+        return None
 
     def load_emitter_dataset_class_mask(
         self,
@@ -867,9 +975,22 @@ class SignalFoundationModel(nn.Module):
             h_enc = self.decoder.scatter_encoder(h_all, patch_mask, patch_mask, packed=packed_all)
             pool_mask = patch_mask
         h_enc = h_enc.masked_fill(~pool_mask.unsqueeze(-1), 0.0)
-        z_enc = self.encoder_pool(h_enc, key_padding_mask=~pool_mask)
-        z_enc = self.encoder_repr_norm(z_enc.float()).to(dtype=h_enc.dtype)
+        z_enc = self._finalize_encoder_z(self.encoder_pool(h_enc, key_padding_mask=~pool_mask), h_enc.dtype)
         return z_enc, h_enc
+
+    def _finalize_encoder_z(self, pooled: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        """LayerNorm（+ 可选 L2）得到分类身份 ``z_enc``。"""
+        z = self.encoder_repr_norm(pooled.float())
+        if bool(getattr(self.cfg, "encoder_z_l2_normalize", True)):
+            z = F.normalize(z, dim=-1)
+        return z.to(dtype=dtype)
+
+    def _collect_moe_aux(self) -> dict[str, Any]:
+        aux_list = []
+        aux_list.extend(self.tokenizer.pop_moe_aux())
+        aux_list.extend(self.encoder.pop_moe_aux())
+        aux_list.extend(self.decoder.pop_moe_aux())
+        return aggregate_moe_aux(aux_list)
 
     def _refresh_encoder_identity(self, out: dict[str, Any]) -> dict[str, Any]:
         """truncate_backward 后在可微路径上重算 encoder 读出，使 ``encoder_pool`` 可训。"""
@@ -879,8 +1000,7 @@ class SignalFoundationModel(nn.Module):
             return out
         visible = out.get("visible")
         pool_mask = (visible & patch_mask) if visible is not None else patch_mask
-        z_enc = self.encoder_pool(h_enc, key_padding_mask=~pool_mask)
-        z_enc = self.encoder_repr_norm(z_enc.float()).to(dtype=h_enc.dtype)
+        z_enc = self._finalize_encoder_z(self.encoder_pool(h_enc, key_padding_mask=~pool_mask), h_enc.dtype)
         out["z_enc"] = z_enc
         out["z_general"] = z_enc
         out["z"] = z_enc
@@ -1088,6 +1208,7 @@ class SignalFoundationModel(nn.Module):
             out["dataset_id"] = dataset_id
         for key, value in representations.items():
             out.setdefault(key, value)
+        out.update(self._collect_moe_aux())
         return out
 
     def _forward_chunked(
@@ -1469,7 +1590,7 @@ class SignalFoundationModel(nn.Module):
                 elif kind == "emitter" or task == "emitter":
                     out.update(head(features, dataset_id=dataset_id))
                 elif kind == "clustering":
-                    ns = DEVICE_NAMESPACE if task == "emitter" else CONTENT_NAMESPACE
+                    ns = DEVICE_NAMESPACE
                     out.update(
                         head(
                             features,
@@ -1524,7 +1645,7 @@ class SignalFoundationModel(nn.Module):
                     self.clustering_head(
                         out["z"],
                         registry=self.prototype_registry,
-                        namespace=CONTENT_NAMESPACE,
+                        namespace=DEVICE_NAMESPACE,
                         temperature=self._negcos_temperature,
                     )
                 )

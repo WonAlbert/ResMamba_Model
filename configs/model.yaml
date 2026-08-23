@@ -36,7 +36,12 @@ model:
     random: 0.333333
     contiguous: 0.333333
     mixed: 0.333334
-  phase_plugin: false
+  phase_plugin: true
+  enable_moe: true
+  moe_num_experts: 3
+  moe_top_k: null
+  moe_ffn_expand: 2.0
+  moe_encoder_layers: 2
   encode_visible_only: true
   sequence_packing: true
   l_min: 16
@@ -47,10 +52,14 @@ model:
   num_mod_classes: 256
   num_emitters: 512
   num_prototypes: 32
+  clustering_num_prototypes: 128
   use_dataset_bias: false
   low_rank_prototype: true
   prototype_rank: 64
   domain_prompt_size: 6
+  encoder_pool_type: gating_pool
+  encoder_pool_heads: 4
+  encoder_z_l2_normalize: true
   build_task_heads: false
   train_encoder: true
   train_decoder: true

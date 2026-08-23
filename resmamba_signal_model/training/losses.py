@@ -38,6 +38,7 @@ __all__ = [
     "view_decorrelation_loss",
     "mae_reconstruction_loss",
     "modulation_hierarchical_metric_loss",
+    "moe_load_balance_loss",
     "negcos_temperature",
     "physics_constraint_loss",
     "RECON_MONITOR_WEIGHTS",
@@ -369,16 +370,16 @@ def unsupervised_clustering_loss(
     logits_alt: torch.Tensor | None = None,
     prototypes: torch.Tensor | None = None,
     temperature: float = 0.1,
-    utilization_weight: float = 0.02,
+    utilization_weight: float = 0.15,
     consistency_weight: float = 1.0,
-    balance_mix: float = 0.35,
+    balance_mix: float = 0.7,
     sinkhorn_epsilon: float = 0.1,
     sinkhorn_iters: int = 3,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """跨视图原型一致性；Sinkhorn 均衡可混合削弱，降低过分割压力。
+    """跨视图原型一致性；Sinkhorn 均衡可混合，避免硬分配塌到少数原型。
 
-    ``balance_mix``∈[0,1]：1=纯 Sinkhorn 均摊；0=仅用 softmax 目标（更易塌缩但不易过分割）。
-    默认 0.35 + 较低 ``utilization_weight``，避免 强制占满全部原型槽。
+    ``balance_mix``∈[0,1]：1=纯 Sinkhorn 均摊；0=仅用 softmax 目标（更易塌缩）。
+    默认 0.7 + ``utilization_weight=0.15``，让硬 argmax 占用更多原型槽。
     """
     parts: dict[str, torch.Tensor] = {}
     z1 = safe_l2_normalize(embedding.float(), dim=-1)
@@ -673,6 +674,18 @@ def uti_readout_consistency_loss(
     return torch.tensor(0.0)
 
 
+def moe_load_balance_loss(outputs: dict[str, Any]) -> torch.Tensor:
+    """聚合 tokenizer / encoder / decoder MoE 负载均衡损失。"""
+    lb = outputs.get("moe_load_balance")
+    if lb is None:
+        ref = outputs.get("z_enc", outputs.get("z"))
+        return ref.new_tensor(0.0) if torch.is_tensor(ref) else torch.tensor(0.0)
+    if not torch.is_tensor(lb):
+        ref = outputs.get("z_enc", outputs.get("z"))
+        return ref.new_tensor(0.0) if torch.is_tensor(ref) else torch.tensor(0.0)
+    return _clamp_loss(lb)
+
+
 def foundation_pretrain_losses(
     outputs: dict[str, torch.Tensor],
     batch: dict[str, torch.Tensor] | None = None,
@@ -768,6 +781,8 @@ def foundation_pretrain_losses(
         div = view_decorrelation_loss([v for v in view_vecs if v is not None])
         vv = view_vicreg_loss(outputs)
         losses["view_div"] = div + vv
+    if _need("moe"):
+        losses["moe"] = moe_load_balance_loss(outputs)
     if _need("uti_pooled"):
         student_p = outputs.get("uti_pooled")
         if student_p is None:
@@ -849,8 +864,10 @@ def downstream_task_loss(
     task: str,
     *,
     emitter_offset_lookup: torch.Tensor | None = None,
+    modulation_compact_lookup: torch.Tensor | None = None,
     emitter_contrastive_weight: float = 0.0,
     modulation_contrastive_weight: float = 0.0,
+    z_contrastive_weight: float = 0.0,
     recon_weight: float = 0.1,
     phys_weight: float = 0.1,
     domain_weight: float = 0.1,
@@ -865,9 +882,9 @@ def downstream_task_loss(
     uti_replay_weight: float = 0.0,
     z_probe_weight: float = 1.0,
     emitter_label_smoothing: float = 0.0,
-    cluster_utilization_weight: float = 0.02,
+    cluster_utilization_weight: float = 0.15,
     cluster_consistency_weight: float = 1.0,
-    cluster_balance_mix: float = 0.35,
+    cluster_balance_mix: float = 0.7,
     cluster_sinkhorn_epsilon: float = 0.1,
     cluster_sinkhorn_iters: int = 3,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -899,6 +916,10 @@ def downstream_task_loss(
         if raw_labels is None:
             raise KeyError(f"分类任务 {task!r} 缺少标签列")
         labels = resolve_modulation_labels(raw_labels, batch.get("source_label_id"))
+        if modulation_compact_lookup is not None:
+            from resmamba_signal_model.training.modulation_labels import remap_modulation_labels
+
+            labels = remap_modulation_labels(labels, modulation_compact_lookup)
         ce = safe_cross_entropy(logits, labels)
         parts["task_ce"] = ce
         loss = loss + ce
@@ -914,12 +935,25 @@ def downstream_task_loss(
             )
             parts["modulation_contrastive"] = contrastive
             loss = loss + float(modulation_contrastive_weight) * contrastive
+        if float(z_contrastive_weight) > 0:
+            z_feat = outputs.get("z_enc", outputs.get("z_general", outputs.get("z")))
+            if z_feat is not None and torch.is_tensor(z_feat):
+                z_contrastive = modulation_hierarchical_metric_loss(
+                    z_feat,
+                    labels,
+                    batch.get("dataset_id", torch.zeros_like(labels)),
+                )
+                parts["z_contrastive"] = z_contrastive
+                loss = loss + float(z_contrastive_weight) * z_contrastive
     elif kind == "emitter":
-        raw_labels = batch.get(label_field or "emitter_id", batch["emitter_id"])
+        # 紧凑标签：必须用局部 emitter_id + offset，不能直接加在 namespace global_id 上。
         if emitter_offset_lookup is not None:
-            labels = global_emitter_labels(batch["dataset_id"], raw_labels, emitter_offset_lookup)
+            local = batch.get("emitter_id")
+            if local is None:
+                raise KeyError("紧凑个体标签需要 batch['emitter_id']")
+            labels = global_emitter_labels(batch["dataset_id"], local, emitter_offset_lookup)
         else:
-            labels = raw_labels
+            labels = batch.get(label_field or "emitter_id", batch["emitter_id"])
         logits = _first_present(outputs, "task_logits", "emitter_logits")
         ce = safe_cross_entropy(logits, labels, label_smoothing=emitter_label_smoothing)
         parts["task_ce"] = ce
@@ -933,6 +967,12 @@ def downstream_task_loss(
             contrastive = supervised_contrastive_loss(contrastive_feat, labels)
             parts["emitter_contrastive"] = contrastive
             loss = loss + float(emitter_contrastive_weight) * contrastive
+        if float(z_contrastive_weight) > 0:
+            z_feat = outputs.get("z_enc", outputs.get("z_general", outputs.get("z")))
+            if z_feat is not None and torch.is_tensor(z_feat):
+                z_contrastive = supervised_contrastive_loss(z_feat, labels)
+                parts["z_contrastive"] = z_contrastive
+                loss = loss + float(z_contrastive_weight) * z_contrastive
     elif kind == "clustering":
         # 训练路径默认无监督；global_label_id 不得进入 loss。
         if supervised_clustering:

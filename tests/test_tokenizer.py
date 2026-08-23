@@ -34,29 +34,50 @@ def test_tokenizer_no_task_or_max_tokens() -> None:
     assert out["tokens"].shape[1] == 25
 
 
+def test_tokenizer_moe_three_expert_branches() -> None:
+    tok = TimeFreqTokenizer(
+        TimeFreqTokenizerConfig(d_model=16, patch_size=8, stem_channels=8, freq_bands=4, moe_num_experts=3)
+    )
+    assert tok.moe_fusion is not None
+    assert tok.num_experts == 3
+    assert hasattr(tok, "intrapulse_expert")
+    assert hasattr(tok, "model_expert")
+    out = tok(torch.randn(1, 2, 64))
+    aux = tok.pop_moe_aux()
+    assert len(aux) == 1
+    assert aux[0].gate_weights.shape[-1] == 3
+    assert torch.isfinite(out["tokens"]).all()
+
+
 def test_phase_plugin_is_opt_in_and_changes_tokens() -> None:
     torch.manual_seed(0)
     iq = torch.randn(2, 2, 64)
-    off = TimeFreqTokenizer(TimeFreqTokenizerConfig(d_model=16, patch_size=8, stem_channels=8, freq_bands=4, phase_plugin=False))
-    on = TimeFreqTokenizer(TimeFreqTokenizerConfig(d_model=16, patch_size=8, stem_channels=8, freq_bands=4, phase_plugin=True))
+    off = TimeFreqTokenizer(
+        TimeFreqTokenizerConfig(d_model=16, patch_size=8, stem_channels=8, freq_bands=4, phase_plugin=False)
+    )
+    on = TimeFreqTokenizer(
+        TimeFreqTokenizerConfig(d_model=16, patch_size=8, stem_channels=8, freq_bands=4, phase_plugin=True)
+    )
     assert off.phase_proj is None
     assert on.phase_proj is not None
     with torch.no_grad():
         on.stem.weight.copy_(off.stem.weight)
         on.stem.bias.copy_(off.stem.bias)
-        for a, b in zip(on.time_branches, off.time_branches):
-            a.weight.copy_(b.weight)
-            if a.bias is not None and b.bias is not None:
-                a.bias.copy_(b.bias)
-        on.time_fuse.weight.copy_(off.time_fuse.weight)
-        on.time_fuse.bias.copy_(off.time_fuse.bias)
+        for src, dst in (
+            (off.intrapulse_expert, on.intrapulse_expert),
+            (off.model_expert, on.model_expert),
+        ):
+            for a, b in zip(dst.branches, src.branches):
+                a.weight.copy_(b.weight)
+            dst.fuse.weight.copy_(src.fuse.weight)
+            dst.fuse.bias.copy_(src.fuse.bias)
         on.freq_proj.weight.copy_(off.freq_proj.weight)
         on.freq_proj.bias.copy_(off.freq_proj.bias)
-        on.gate.weight.copy_(off.gate.weight)
-        on.gate.bias.copy_(off.gate.bias)
         if on.physics_proj is not None and off.physics_proj is not None:
             on.physics_proj.weight.copy_(off.physics_proj.weight)
             on.physics_proj.bias.copy_(off.physics_proj.bias)
+        on.moe_fusion.gate.router.weight.copy_(off.moe_fusion.gate.router.weight)
+        on.moe_fusion.gate.router.bias.copy_(off.moe_fusion.gate.router.bias)
         on.norm.weight.copy_(off.norm.weight)
         on.norm.bias.copy_(off.norm.bias)
     out_off = off(iq)
@@ -83,7 +104,6 @@ def test_freq_tokens_use_bilateral_fftshift_bands() -> None:
 
     b_pos = bands(z_pos)
     b_neg = bands(z_neg)
-    # fftshift 后低频在中间：正频偏右半，负频偏左半
     assert b_pos[n_bands // 2 :].sum() > b_pos[: n_bands // 2].sum()
     assert b_neg[: n_bands // 2].sum() > b_neg[n_bands // 2 :].sum()
 
@@ -91,9 +111,7 @@ def test_freq_tokens_use_bilateral_fftshift_bands() -> None:
     iq_pos = torch.stack([z_pos.real, z_pos.imag], dim=0).unsqueeze(0)
     iq_neg = torch.stack([z_neg.real, z_neg.imag], dim=0).unsqueeze(0)
     with torch.no_grad():
-        # isolate freq path contribution via identical time stem noise-free tones of equal |z|
         out_pos = tok(iq_pos.expand(1, 2, patch))
         out_neg = tok(iq_neg.expand(1, 2, patch))
     assert out_pos["tokens"].shape == out_neg["tokens"].shape
     assert not torch.allclose(out_pos["tokens"], out_neg["tokens"], atol=1e-5)
-
