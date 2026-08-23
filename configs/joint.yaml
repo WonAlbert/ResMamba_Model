@@ -4,7 +4,8 @@ rfdata_root: /root/autodl-tmp/ResMamba_Signal_Model/dataset
 iq_normalize: none
 sequence_packing: true
 mix_strategy: token_share
-combine_then_pack: true
+combine_then_pack: false
+homogeneous_batch: true
 balanced_sampling: false
 balanced_sampling_strategy: length_bucket
 token_budget: 4096
@@ -38,8 +39,8 @@ lambda_recon: 0.0
 modulation_contrastive_weight: 0.25
 emitter_contrastive_weight: 0.25
 supervised_clustering: false
-cluster_utilization_weight: 0.02
-cluster_balance_mix: 0.35
+cluster_utilization_weight: 0.15
+cluster_balance_mix: 0.7
 cluster_sinkhorn_epsilon: 0.1
 cluster_consistency_weight: 1.0
 use_dataset_bias: false
@@ -47,6 +48,8 @@ train_encoder: false
 train_decoder: false
 train_heads: true
 skip_recon: true
+# 与阶段二/三一致：调制/个体用下游紧凑标签
+compact_task_labels: true
 unfreeze_tokenizer_last: true
 loraplus_lr_ratio: 16
 r_attn: 16

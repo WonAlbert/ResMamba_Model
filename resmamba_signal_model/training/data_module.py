@@ -547,6 +547,8 @@ def build_train_batch_sampler(
             num_batches=int(num_batches),
             seed=int(seed),
             lengths=lengths,
+            source_groups=train_cfg.get("source_groups"),
+            family_quotas=train_cfg.get("family_quotas"),
         )
     enabled = bool(train_cfg.get("balanced_sampling", False))
     strategy = resolve_balanced_sampling_strategy(

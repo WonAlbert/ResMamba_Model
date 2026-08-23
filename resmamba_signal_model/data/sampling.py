@@ -615,6 +615,128 @@ def n_tokens_for_length(length: int, patch_size: int) -> int:
     return max(1, (int(length) + int(patch_size) - 1) // int(patch_size))
 
 
+DEFAULT_FAMILY_QUOTAS: dict[str, float] = {
+    "tx_comm": 0.40,
+    "ld_radar": 0.35,
+    "radcom": 0.25,
+}
+
+DEFAULT_SOURCE_GROUPS: dict[str, list[str]] = {
+    "ld_radar": ["radchar", "radar_mod15", "cjr_mix"],
+    "tx_comm": ["rml2016_*", "xidian14", "panoradio_hf"],
+    "radcom": ["radcom_awgn", "radcom_dynamic", "radcom_ota"],
+}
+
+
+def h5_dataset_stem(h5_name: str) -> str:
+    stem = str(h5_name)
+    for suffix in ("_train.h5", "_val.h5", "_test.h5"):
+        if stem.endswith(suffix):
+            return stem[: -len(suffix)]
+    return stem.rsplit(".", 1)[0]
+
+
+def stem_matches_pattern(stem: str, pattern: str) -> bool:
+    pat = str(pattern).strip()
+    if pat.endswith("*"):
+        return stem.startswith(pat[:-1])
+    return stem == pat
+
+
+def resolve_dataset_family(stem: str, source_groups: dict[str, list[str]]) -> str | None:
+    for family, patterns in source_groups.items():
+        for pattern in patterns:
+            if stem_matches_pattern(stem, str(pattern)):
+                return str(family)
+    return None
+
+
+def sqrt_size_weight(segment_size: int) -> float:
+    return float(np.sqrt(max(int(segment_size), 1)))
+
+
+@dataclass(frozen=True)
+class HomogeneousSamplingPlan:
+    """族配额 + 族内 sqrt(N) 权重；用于 HomogeneousTokenBudgetSampler 与测试断言。"""
+
+    families: tuple[str, ...]
+    family_weights: tuple[float, ...]
+    segment_family: tuple[str, ...]
+    within_family_segment_weights: tuple[tuple[float, ...], ...]
+
+    def family_for_segment_index(self, segment_index: int) -> str:
+        return self.segment_family[int(segment_index)]
+
+
+def build_homogeneous_sampling_plan(
+    segments: list[_DatasetSegment],
+    *,
+    source_groups: dict[str, list[str]] | None = None,
+    family_quotas: dict[str, float] | None = None,
+) -> HomogeneousSamplingPlan:
+    groups = dict(source_groups or DEFAULT_SOURCE_GROUPS)
+    quotas = dict(family_quotas or DEFAULT_FAMILY_QUOTAS)
+
+    segment_family: list[str] = []
+    for seg in segments:
+        family = resolve_dataset_family(h5_dataset_stem(seg.h5_name), groups)
+        segment_family.append(family if family is not None else "_unmapped")
+
+    families_present = sorted({family for family in segment_family if family != "_unmapped"})
+    if not families_present:
+        families_present = sorted({family for family in segment_family})
+
+    family_weights_map: dict[str, float] = {}
+    for family in families_present:
+        if family in quotas:
+            family_weights_map[family] = float(quotas[family])
+        elif family == "_unmapped":
+            family_weights_map[family] = 0.0
+        else:
+            family_weights_map[family] = 0.0
+
+    assigned = sum(family_weights_map.get(family, 0.0) for family in families_present if family in quotas)
+    unmapped_families = [family for family in families_present if family not in quotas]
+    if unmapped_families:
+        remainder = max(0.0, 1.0 - assigned)
+        share = remainder / len(unmapped_families) if unmapped_families else 0.0
+        for family in unmapped_families:
+            family_weights_map[family] = share
+    elif assigned > 0:
+        scale = 1.0 / assigned
+        for family in families_present:
+            if family in family_weights_map:
+                family_weights_map[family] *= scale
+
+    active_families = [family for family in families_present if any(fam == family for fam in segment_family)]
+    families: list[str] = []
+    family_weights: list[float] = []
+    within_family_weights: list[list[float]] = []
+    for family in active_families:
+        seg_indices = [i for i, fam in enumerate(segment_family) if fam == family]
+        if not seg_indices:
+            continue
+        weights = [sqrt_size_weight(segments[i].size) for i in seg_indices]
+        if sum(weights) <= 0:
+            continue
+        families.append(family)
+        family_weights.append(max(family_weights_map.get(family, 0.0), 0.0))
+        within_family_weights.append(weights)
+
+    if not families:
+        raise ValueError("build_homogeneous_sampling_plan: 无有效 segment / family 映射")
+
+    if sum(family_weights) <= 0:
+        family_weights = [1.0] * len(families)
+
+    return HomogeneousSamplingPlan(
+        families=tuple(families),
+        family_weights=tuple(family_weights),
+        segment_family=tuple(segment_family),
+        within_family_segment_weights=tuple(tuple(row) for row in within_family_weights),
+    )
+
+
 def pool_sample_lengths(pool: RFDataPoolDataset) -> list[int]:
     lengths: list[int] = []
     for sub in pool.datasets:
@@ -892,7 +1014,7 @@ def plan_fixed_token_budget_batches(
 
 
 class HomogeneousTokenBudgetSampler(Sampler[list[int]]):
-    """每个 batch 仅来自同一 H5 子数据集：先均匀抽一个 segment，再按 token_budget 组 batch。
+    """每个 batch 仅来自同一 H5 子数据集：先按族配额抽族，再按 sqrt(N_train) 抽 segment，再按 token_budget 组 batch。
 
     文件身份只用于采样，不得进入模型 batch。
     """
@@ -906,6 +1028,8 @@ class HomogeneousTokenBudgetSampler(Sampler[list[int]]):
         num_batches: int | None = None,
         seed: int | None = None,
         lengths: list[int] | None = None,
+        source_groups: dict[str, list[str]] | None = None,
+        family_quotas: dict[str, float] | None = None,
     ) -> None:
         if token_budget < 1:
             raise ValueError(f"token_budget 必须 >= 1，当前 {token_budget}")
@@ -921,9 +1045,29 @@ class HomogeneousTokenBudgetSampler(Sampler[list[int]]):
             num_batches if num_batches is not None else max(1, (total_tokens + token_budget - 1) // token_budget)
         )
         self._seed = seed
+        self._plan = build_homogeneous_sampling_plan(
+            self._segments,
+            source_groups=source_groups,
+            family_quotas=family_quotas,
+        )
+        self._family_segment_indices: list[list[int]] = []
+        for family in self._plan.families:
+            self._family_segment_indices.append(
+                [i for i, fam in enumerate(self._plan.segment_family) if fam == family]
+            )
+
+    @property
+    def sampling_plan(self) -> HomogeneousSamplingPlan:
+        return self._plan
 
     def __len__(self) -> int:
         return self._num_batches
+
+    def _pick_segment_index(self, rng: random.Random) -> int:
+        family_i = rng.choices(range(len(self._plan.families)), weights=self._plan.family_weights, k=1)[0]
+        seg_indices = self._family_segment_indices[family_i]
+        seg_weights = self._plan.within_family_segment_weights[family_i]
+        return int(rng.choices(seg_indices, weights=seg_weights, k=1)[0])
 
     def __iter__(self) -> Iterator[list[int]]:
         rng = random.Random(self._seed)
@@ -934,7 +1078,7 @@ class HomogeneousTokenBudgetSampler(Sampler[list[int]]):
             orders.append(order)
         pos = [0] * len(self._segments)
         for _ in range(self._num_batches):
-            seg_i = rng.randrange(len(self._segments))
+            seg_i = self._pick_segment_index(rng)
             order = orders[seg_i]
             n = len(order)
             batch: list[int] = []

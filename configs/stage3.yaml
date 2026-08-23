@@ -3,8 +3,13 @@ model_config: configs/model.yaml
 rfdata_root: /root/autodl-tmp/ResMamba_Signal_Model/dataset
 iq_normalize: none
 sequence_packing: true
+# 当前 stage2 best 仍为 AttnPool；与 init-from 对齐，避免冻结的随机 GatingPool
+encoder_pool_type: attn_pool
+model:
+  encoder_pool_type: attn_pool
 mix_strategy: token_share
-combine_then_pack: true
+combine_then_pack: false
+homogeneous_batch: true
 balanced_sampling: false
 balanced_sampling_strategy: length_bucket
 token_budget: 4096
@@ -37,6 +42,8 @@ train_encoder: false
 train_decoder: false
 train_heads: true
 skip_recon: true
+# 与阶段二一致：调制/个体用下游紧凑标签（非全库命名空间）
+compact_task_labels: true
 loraplus_lr_ratio: 16
 r_attn: 16
 r_mamba: 8
@@ -89,21 +96,58 @@ profiles:
       lora_alpha_mamba: 2
       loraplus_lr_ratio: 16
     require_mamba_kernel: false
+    compact_task_labels: false
   modulation:
     task: modulation
     checkpoint_monitor: val/f1_modulation
     checkpoint_mode: max
     task_pools:
       classification: [downstream_modulation_train, downstream_modulation_val]
+  radar_modulation:
+    task: modulation
+    checkpoint_monitor: val/f1_modulation
+    checkpoint_mode: max
+    compact_task_labels: true
+    modulation_downstream_datasets: [radchar]
+    tasks:
+      - modulation
+    task_pools:
+      classification: [downstream_radar_modulation_train, downstream_radar_modulation_val]
   emitter:
     task: emitter
     checkpoint_monitor: val/acc_emitter
     checkpoint_mode: max
+    # 与 stage2 compact=250 对齐（adsb2=0..99, wisig=100..249）；勿开全库 440
+    compact_task_labels: true
+    encoder_pool_type: attn_pool
+    model:
+      encoder_pool_type: attn_pool
+    # 个体 250 类 + 冻结 z_enc 天花板低：放开 stage2 已训 UTI/AttnPool，加大 LoRA 与步数
+    learning_rate: 5.0e-4
+    heads_lr: 2.0e-4
+    warmup_steps: 100
+    epochs: 30
+    steps_per_epoch: 200
+    token_budget: 8192
+    early_stopping_patience: 5
+    train_task_interface: true
+    train_encoder_pool: true
+    z_probe_weight: 0.25
+    emitter_contrastive_weight: 0.5
+    r_attn: 32
+    r_mamba: 16
+    lora_alpha_attn: 32
+    lora_alpha_mamba: 16
+    peft:
+      r_attn: 32
+      r_mamba: 16
+      lora_alpha_attn: 32
+      lora_alpha_mamba: 16
     task_pools:
       emitter: [downstream_emitter_train, downstream_emitter_val]
   clustering:
     task: clustering
-    checkpoint_monitor: val/nmi
+    checkpoint_monitor: val/nmi_within_domain
     checkpoint_mode: max
     task_pools:
       clustering: [clustering_train, clustering_val]
