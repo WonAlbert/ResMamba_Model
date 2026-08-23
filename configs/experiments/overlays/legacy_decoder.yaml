@@ -1,3 +1,0 @@
-# 旧 skip/FiLM 解码器，对照默认查询 decoder
-model:
-  legacy_decoder_reconstruction: true

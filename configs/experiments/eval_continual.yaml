@@ -1,4 +1,0 @@
-_base_: ../continual.yaml
-sota_gate:
-  window: D_eval
-  job: eval_continual

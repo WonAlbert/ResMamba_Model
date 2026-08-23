@@ -1,9 +1,0 @@
-# 60–72h 开集：复用 stage2 验证日志中的 val/osr_*
-_base_: ../stage2.yaml
-sota_gate:
-  window: D_eval
-  job: eval_openset
-  metrics: [val/osr_auroc, val/osr_aupr, val/osr_fpr95]
-absorb_unknown: false
-epochs: 4
-steps_per_epoch: 400

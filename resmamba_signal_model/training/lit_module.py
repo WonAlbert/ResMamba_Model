@@ -401,7 +401,6 @@ class SignalLitModule(_Base):
     def refresh_continual_teacher(self) -> None:
         need = (
             float(self.train_cfg.get("distill_weight", 0.0) or 0.0) > 0
-            or float(self.train_cfg.get("uti_replay_weight", 0.0) or 0.0) > 0
             or str(self.train_cfg.get("replay_strategy", "class_center")).lower() in ("class_center", "center", "exemplar", "icarl")
         )
         if not need:
@@ -460,7 +459,7 @@ class SignalLitModule(_Base):
             return bool(explicit)
         return any(
             float(self.loss_weights.get(name, 0.0) or 0.0) > 0.0
-            for name in ("latent", "uti_pooled", "uti_token", "uti_query")
+            for name in ("latent",)
         )
 
     def _ensure_ema_teacher(self) -> None:
@@ -488,9 +487,6 @@ class SignalLitModule(_Base):
         teacher_out = teacher.forward_unmasked(batch)
         outputs["teacher_z"] = teacher_out.get("z_general", teacher_out["z"])
         outputs["teacher_h"] = teacher_out.get("h_general", teacher_out.get("patch_h"))
-        outputs["teacher_pooled"] = teacher_out.get("uti_pooled")
-        outputs["teacher_tokens"] = teacher_out.get("uti_tokens")
-        outputs["teacher_query"] = teacher_out.get("uti_query")
         return outputs
 
     def on_fit_start(self) -> None:
@@ -588,13 +584,8 @@ class SignalLitModule(_Base):
         # 分任务：每个 source/task 独立算 loss，再按需汇总；单任务时 total 即该任务 loss。
         per_task_totals: dict[str, torch.Tensor] = {}
         replay_sources = {str(x) for x in (self.train_cfg.get("active_replay_sources") or [])}
-        uti_replay_weight = float(self.train_cfg.get("uti_replay_weight", 0.0) or 0.0)
         distill_weight = float(self.train_cfg.get("distill_weight", 0.0) or 0.0)
-        need_teacher = (
-            self.training
-            and self.distill_teacher is not None
-            and (distill_weight > 0 or uti_replay_weight > 0)
-        )
+        need_teacher = self.training and self.distill_teacher is not None and distill_weight > 0
         for name, sub in sources.items():
             task = self._task_for_source(name, sub)
             if hasattr(self.model, "set_active_task"):
@@ -626,11 +617,6 @@ class SignalLitModule(_Base):
                     )
                     if teacher_logits is not None:
                         outputs["teacher_logits"] = teacher_logits.detach()
-                if is_replay and uti_replay_weight > 0:
-                    teacher_pooled = t_out.get("task_pooled", t_out.get("uti_pooled"))
-                    if teacher_pooled is not None:
-                        outputs["teacher_pooled"] = teacher_pooled.detach()
-                        outputs["replay_uti"] = True
             registry = getattr(self.model, "prototype_registry", None)
             embed = outputs.get("task_pooled", outputs.get("cluster_embedding"))
             assign = outputs.get("cluster_probs")
@@ -675,7 +661,6 @@ class SignalLitModule(_Base):
                 distill_temperature=float(self.train_cfg.get("distill_temperature", 2.0)),
                 distill_confidence=float(self.train_cfg.get("distill_confidence", 0.5)),
                 prototype_anchor_weight=float(self.train_cfg.get("prototype_anchor_weight", 0.0)),
-                uti_replay_weight=uti_replay_weight,
                 z_probe_weight=float(self.train_cfg.get("z_probe_weight", 1.0)),
                 emitter_label_smoothing=float(self.train_cfg.get("emitter_label_smoothing", 0.0)),
                 cluster_utilization_weight=float(self.train_cfg.get("cluster_utilization_weight", 0.15)),
@@ -1190,7 +1175,7 @@ class SignalLitModule(_Base):
 def build_lit_module(cfg: SignalModelConfig, train_cfg: dict[str, Any], *, stage: str, mix: DynamicRatioScheduler | None) -> SignalLitModule:
     payload = {name: getattr(cfg, name) for name in SignalModelConfig.__dataclass_fields__ if name != "tokenizer"}
     payload["build_task_heads"] = stage != "pretrain"
-    payload["build_task_interface"] = True
+    payload["build_task_interface"] = False
     payload["build_prototype_registry"] = stage != "pretrain"
     payload["build_adapters"] = stage in ("stage3", "joint", "continual")
     payload["build_shared_adapter"] = stage in ("joint", "continual")

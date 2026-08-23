@@ -245,7 +245,7 @@ def build_class_center_replay_memory(
         batch = collate(samples)
         batch = _to_device(batch, device)
         out = teacher(batch, mode="task", task=task)
-        pooled = out.get("task_pooled", out.get("uti_pooled"))
+        pooled = out.get("task_pooled")
         if pooled is None:
             continue
         labels = _labels_from_batch(batch, task=task, catalog=catalog)

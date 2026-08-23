@@ -1,6 +1,0 @@
-_base_:
-  - ../pretrain.yaml
-  - overlays/enc1.yaml
-sota_gate:
-  window: B_ablation
-  job: abl_enc1_pretrain

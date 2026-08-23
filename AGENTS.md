@@ -89,7 +89,7 @@ pytest -q
 - **变长**：`sequence_packing=true`；全阶段 `HomogeneousTokenBudgetSampler`（每 batch 单一 H5）+ `combine_then_pack: false`；`L < 16` 报错；`L > 8192` 重叠切块。
 - **多域**：预训练 `domain: 0`（`build_task_interface=false`，无 UTI / GRL 路径）。下游可选 `z_contrastive` 等同任务对比，预训练无 InfoNCE。
 
-预训练损失（见 `configs/pretrain.yaml`）：`L_mae + λ_phys + λ_structure + λ_vicreg(z_enc) + λ_vicreg_token(h_enc)` 等；`view_div` / `uti_*` / `moe` 权重为 0。族配额采样见 `source_groups` / `family_quotas`。
+预训练损失（见 `configs/pretrain.yaml`）：`L_mae + λ_phys + λ_structure + λ_vicreg(z_enc) + λ_vicreg_token(h_enc)` 等。族配额采样见 `source_groups` / `family_quotas`。
 
 ## 配置索引
 

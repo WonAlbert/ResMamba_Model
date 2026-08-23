@@ -1,6 +1,0 @@
-# 0–8h 有效性基线 stage2：冻结骨干探测
-_base_: ../stage2.yaml
-sota_gate:
-  window: A_validity
-  job: validity_stage2
-  fail_fast: true

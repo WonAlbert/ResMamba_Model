@@ -35,12 +35,11 @@ __all__ = [
     "latent_prediction_loss",
     "vicreg_loss",
     "vicreg_token_loss",
-    "view_decorrelation_loss",
-    "mae_reconstruction_loss",
     "modulation_hierarchical_metric_loss",
     "moe_load_balance_loss",
     "negcos_temperature",
     "physics_constraint_loss",
+    "mae_reconstruction_loss",
     "RECON_MONITOR_WEIGHTS",
     "resolve_recon_mask",
     "reconstruction_monitor_loss",
@@ -50,7 +49,6 @@ __all__ = [
     "structure_preserving_loss",
     "supervised_contrastive_loss",
     "unsupervised_clustering_loss",
-    "uti_readout_consistency_loss",
     "weighted_pretrain_loss",
 ]
 
@@ -626,54 +624,6 @@ def vicreg_token_loss(
     )
 
 
-def view_decorrelation_loss(views: list[torch.Tensor]) -> torch.Tensor:
-    """UTI 视图 pooled 向量间余弦去相关。"""
-    valid = [F.normalize(v.float(), dim=-1) for v in views if v is not None and v.ndim == 2 and v.shape[0] >= 2]
-    if len(valid) < 2:
-        ref = valid[0] if valid else torch.tensor(0.0)
-        return ref.new_tensor(0.0)
-    total = valid[0].new_tensor(0.0)
-    pairs = 0
-    for i in range(len(valid)):
-        for j in range(i + 1, len(valid)):
-            sim = (valid[i] * valid[j]).sum(dim=-1).square().mean()
-            total = total + sim
-            pairs += 1
-    return total / max(pairs, 1)
-
-
-def view_vicreg_loss(outputs: dict[str, Any], *, var_weight: float = 10.0, cov_weight: float = 0.5) -> torch.Tensor:
-    views = []
-    for name in ("semantic", "source", "context"):
-        z = outputs.get(f"z_{name}")
-        if z is not None:
-            views.append(z)
-    if not views:
-        ref = outputs.get("z_enc")
-        return ref.new_tensor(0.0) if torch.is_tensor(ref) else torch.tensor(0.0)
-    total = views[0].new_tensor(0.0)
-    for z in views:
-        total = total + vicreg_loss(z, var_weight=var_weight, cov_weight=cov_weight, inv_weight=0.0)
-    return total / len(views)
-
-
-def uti_readout_consistency_loss(
-    student: torch.Tensor,
-    teacher: torch.Tensor | None = None,
-    *,
-    mask: torch.Tensor | None = None,
-    pred: torch.Tensor | None = None,
-    target: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """pooled/token/query 与 EMA teacher 余弦对齐；缺 teacher 时记 0（不再回退成重建，避免与 structure_time 重复）。"""
-    del pred, target
-    if teacher is not None and student is not None:
-        return _clamp_loss(_cosine_latent(student, teacher, mask))
-    if student is not None and student.numel():
-        return student.new_tensor(0.0)
-    return torch.tensor(0.0)
-
-
 def moe_load_balance_loss(outputs: dict[str, Any]) -> torch.Tensor:
     """聚合 tokenizer / encoder / decoder MoE 负载均衡损失。"""
     lb = outputs.get("moe_load_balance")
@@ -776,37 +726,6 @@ def foundation_pretrain_losses(
                 var_weight=float(outputs.get("vicreg_var_weight", 25.0) or 25.0),
                 cov_weight=float(outputs.get("vicreg_cov_weight", 1.0) or 1.0),
             )
-    if _need("view_div"):
-        view_vecs = [outputs.get(f"z_{name}") for name in ("semantic", "source", "context")]
-        div = view_decorrelation_loss([v for v in view_vecs if v is not None])
-        vv = view_vicreg_loss(outputs)
-        losses["view_div"] = div + vv
-    if _need("moe"):
-        losses["moe"] = moe_load_balance_loss(outputs)
-    if _need("uti_pooled"):
-        student_p = outputs.get("uti_pooled")
-        if student_p is None:
-            losses["uti_pooled"] = pred.new_tensor(0.0)
-        else:
-            losses["uti_pooled"] = uti_readout_consistency_loss(student_p, outputs.get("teacher_pooled"))
-    if _need("uti_token"):
-        student_t = outputs.get("uti_tokens")
-        if student_t is None:
-            losses["uti_token"] = pred.new_tensor(0.0)
-        else:
-            losses["uti_token"] = uti_readout_consistency_loss(
-                student_t,
-                outputs.get("teacher_tokens"),
-                mask=outputs.get("target_mask", outputs.get("patch_mask")),
-            )
-    if _need("uti_query"):
-        student_q = outputs.get("uti_query")
-        query_mask = resolve_recon_mask(outputs, "target")
-        losses["uti_query"] = uti_readout_consistency_loss(
-            student_q if student_q is not None else pred,
-            outputs.get("teacher_query"),
-            mask=query_mask,
-        )
     return losses
 
 
@@ -822,7 +741,7 @@ def reconstruction_monitor_loss(
     parts: dict[str, torch.Tensor],
     weights: dict[str, float] | None = None,
 ) -> torch.Tensor:
-    """由已算好的分项拼重建监控标量（不进 domain / structure_phase / UTI）。"""
+    """由已算好的分项拼重建监控标量（不进 domain / structure_phase）。"""
     active = {k: float(v) for k, v in (weights or RECON_MONITOR_WEIGHTS).items() if float(v) > 0.0}
     if not active:
         active = dict(RECON_MONITOR_WEIGHTS)
@@ -879,7 +798,6 @@ def downstream_task_loss(
     distill_temperature: float = 2.0,
     distill_confidence: float = 0.5,
     prototype_anchor_weight: float = 0.0,
-    uti_replay_weight: float = 0.0,
     z_probe_weight: float = 1.0,
     emitter_label_smoothing: float = 0.0,
     cluster_utilization_weight: float = 0.15,
@@ -1055,11 +973,4 @@ def downstream_task_loss(
         )
         parts["prototype_anchor"] = anchor
         loss = loss + float(prototype_anchor_weight) * anchor
-    if uti_replay_weight > 0 and outputs.get("replay_uti"):
-        student_pooled = _first_present(outputs, "task_pooled", "uti_pooled")
-        teacher_pooled = outputs.get("teacher_pooled")
-        if student_pooled is not None and teacher_pooled is not None:
-            replay = uti_readout_consistency_loss(student_pooled, teacher_pooled)
-            parts["uti_replay"] = replay
-            loss = loss + float(uti_replay_weight) * replay
     return loss, parts

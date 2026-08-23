@@ -52,9 +52,6 @@ loss_weights:
   latent: 0.0
   vicreg: 0.5
   vicreg_token: 0.2
-  # train.py 不构建 UTI；view_div / uti_* 保留键名兼容旧 ckpt 日志，权重为 0
-  view_div: 0.0
-  moe: 0.0
 ema_teacher: false
 ema_momentum: 0.999
 supervised_clustering: false

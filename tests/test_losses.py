@@ -90,24 +90,6 @@ def test_prediction_mae_loss_scaled_to_ce_magnitude() -> None:
     assert abs(float(loss2) - float(raw) * PREDICTION_MAE_LOSS_SCALE) < 1e-5
 
 
-def test_uti_replay_loss_aligns_pooled_features() -> None:
-    student = torch.randn(4, 16)
-    teacher = student + 0.25
-    outputs = {
-        "z": student,
-        "task_pooled": student,
-        "teacher_pooled": teacher,
-        "replay_uti": True,
-        "task_logits": torch.randn(4, 3),
-    }
-    batch = {"mod_label_id": torch.tensor([0, 1, 2, 0])}
-    loss_off, parts_off = downstream_task_loss(outputs, batch, "modulation", uti_replay_weight=0.0)
-    loss_on, parts_on = downstream_task_loss(outputs, batch, "modulation", uti_replay_weight=0.5)
-    assert "uti_replay" not in parts_off
-    assert float(parts_on["uti_replay"]) > 0.0
-    assert float(loss_on) > float(loss_off)
-
-
 def test_prediction_uses_suffix_mask_when_mae_mask_empty() -> None:
     pred = torch.zeros(2, 4, 2, 4)
     target = torch.ones_like(pred)
@@ -191,35 +173,6 @@ def test_structure_phase_only_for_complex_pair() -> None:
     assert float(no_phase["structure_phase"]) == 0.0
     assert float(no_phase["structure_time"]) > 0.0
     assert float(no_phase["structure_spectrum"]) > 0.0
-
-
-def test_uti_query_without_teacher_is_zero_not_recon_fallback() -> None:
-    from resmamba_signal_model.training.losses import reconstruction_monitor_loss
-
-    pred = torch.zeros(2, 4, 2, 4)
-    target = torch.ones_like(pred)
-    mask = torch.ones(2, 4, dtype=torch.bool)
-    losses = foundation_pretrain_losses(
-        {
-            "recon_norm": pred,
-            "patch_targets_norm": target,
-            "mae_pred": pred,
-            "patch_targets": target,
-            "mae_mask": mask,
-            "span_mask": mask,
-            "target_mask": mask,
-            "uti_query": torch.randn(2, 4, 8),
-            "global_phys_pred": torch.zeros(2, 5),
-            "global_phys_target": torch.zeros(2, 5),
-        },
-        include={"mae", "impute", "structure", "uti_query"},
-    )
-    assert float(losses["uti_query"]) == 0.0
-    assert float(losses["structure_time"]) > 0.0
-    recon = reconstruction_monitor_loss(losses)
-    assert float(recon) == pytest.approx(
-        float(losses["mae"] + 0.2 * losses["impute"] + 0.2 * losses["structure"])
-    )
 
 
 def test_clustering_train_loss_ignores_global_label_id() -> None:

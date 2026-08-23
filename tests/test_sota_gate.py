@@ -111,25 +111,6 @@ def test_metrics_table_mean_std_and_split_scopes() -> None:
     assert "n/a" in format_mean_std({"mean": float("nan"), "std": float("nan"), "n": 0})
 
 
-def test_experiment_yaml_overlays_load() -> None:
-    enc1 = load_yaml_config(ROOT / "configs/experiments/abl_enc1_pretrain.yaml")
-    assert enc1["model"]["encoder_mamba_layers"] == 1
-    mae = load_yaml_config(ROOT / "configs/experiments/abl_mae_only_pretrain.yaml")
-    assert mae["loss_weights"]["latent"] == 0.0
-    assert mae["loss_weights"]["mae"] == 1.0
-    z = load_yaml_config(ROOT / "configs/experiments/abl_z_general_stage2.yaml")
-    assert z["model"]["use_specialist_views"] is False
-    phase = load_yaml_config(ROOT / "configs/experiments/abl_phase_on_pretrain.yaml")
-    assert phase["model"]["phase_plugin"] is True
-    lr = load_yaml_config(ROOT / "configs/experiments/abl_low_rank_stage2.yaml")
-    assert lr["model"]["low_rank_prototype"] is True
-    bidir = load_yaml_config(ROOT / "configs/experiments/abl_bidir_share_pretrain.yaml")
-    assert bidir["model"]["share_bidirectional_weights"] is True
-    tiny = load_yaml_config(ROOT / "configs/experiments/validity_pretrain.yaml", profile="tiny")
-    assert tiny["synthetic"] is True
-    assert tiny["model_config"] == "configs/model_tiny.yaml"
-
-
 def test_confirm_slot_rewrites_config_from_selected_json() -> None:
     jobs = filter_jobs(build_gate_jobs(), job_ids=["confirm_slot_a_pretrain"])
     planned = plan_commands(jobs, root=ROOT)

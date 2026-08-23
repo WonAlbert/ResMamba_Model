@@ -1,6 +1,0 @@
-_base_:
-  - ../stage2.yaml
-  - overlays/enc3.yaml
-sota_gate:
-  window: B_ablation
-  job: abl_enc3_stage2

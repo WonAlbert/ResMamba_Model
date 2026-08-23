@@ -38,27 +38,21 @@ def _batch(n: int = 4, length: int = 64) -> dict[str, torch.Tensor]:
     }
 
 
-def test_pretrain_three_objectives_and_uti_readouts() -> None:
+def test_pretrain_objectives_and_z_enc() -> None:
     torch.manual_seed(0)
     model = _tiny()
     model.train()
     batch = _batch()
     out = model(batch, mode="pretrain")
-    assert "uti_pooled" in out and "uti_tokens" in out and "uti_query" in out
     assert "z_enc" in out and "z_recon" in out
-    assert out["uti_pooled"].shape[0] == 4
-    # latent 对齐 decoder 重建读出；vicreg 作用在 encoder 池化
     out["teacher_z"] = out["z_recon"].detach() + 0.01
     out["teacher_h"] = out.get("h_recon", out["h_general"]).detach()
-    out["teacher_pooled"] = out["uti_pooled"].detach()
-    out["teacher_tokens"] = out["uti_tokens"].detach()
-    out["teacher_query"] = out["uti_query"].detach()
     losses = foundation_pretrain_losses(
         out,
         batch,
-        include={"mae", "structure", "latent", "vicreg", "uti_pooled", "uti_token", "uti_query"},
+        include={"mae", "structure", "latent", "vicreg"},
     )
-    for key in ("mae", "structure", "latent", "vicreg", "uti_pooled", "uti_token", "uti_query"):
+    for key in ("mae", "structure", "latent", "vicreg"):
         assert key in losses
         assert torch.isfinite(losses[key])
     assert float(losses["structure"].detach()) > 0.0
@@ -86,14 +80,14 @@ def test_pretrain_mae_reuses_visible_encode_for_z_enc() -> None:
     calls: list[tuple[bool, bool]] = []
     orig = model._encode_tokens
 
-    def _count(tokens, visible, patch_mask):
+    def _count(tokens, visible, patch_mask, **kwargs):
         calls.append(
             (
                 bool((visible == patch_mask).all().item()),
                 int(visible.sum().item()),
             )
         )
-        return orig(tokens, visible, patch_mask)
+        return orig(tokens, visible, patch_mask, **kwargs)
 
     model._encode_tokens = _count  # type: ignore[method-assign]
     out = model(_batch(n=2, length=64), mode="pretrain")

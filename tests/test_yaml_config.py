@@ -63,12 +63,6 @@ def test_stage_yaml_profiles() -> None:
     assert joint["peft"]["shared_lora"] is False
     assert joint.get("unfreeze_tokenizer_last") is False
 
-def test_sota_gate_experiment_yaml_inherits_pretrain() -> None:
-    cfg = load_yaml_config("configs/experiments/validity_pretrain.yaml")
-    assert cfg["mix_strategy"] == "token_share"
-    assert cfg["sota_gate"]["window"] == "A_validity"
-
-
 def test_unknown_profile() -> None:
     with pytest.raises(ValueError, match="未知 profile"):
         load_yaml_config("configs/pretrain.yaml", profile="missing")
@@ -83,6 +77,6 @@ def test_resolve_lr_default() -> None:
 
 def test_pretrain_recipe_allows_longer_training() -> None:
     cfg = load_yaml_config("configs/pretrain.yaml")
-    assert cfg["epochs"] == 30
+    assert cfg["epochs"] == 50
     assert cfg["early_stopping_patience"] == 8
     assert float(cfg["early_stopping_min_delta"]) == pytest.approx(0.001)

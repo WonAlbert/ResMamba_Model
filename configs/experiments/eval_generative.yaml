@@ -1,5 +1,0 @@
-# 60–72h 生成：同一 yaml，由 --task prediction|imputation 选择
-_base_: ../stage3.yaml
-sota_gate:
-  window: D_eval
-  job: eval_generative

@@ -96,8 +96,6 @@ def test_same_iq_forged_labels_ids_yield_identical_pretrain_outputs() -> None:
     out1 = model(forged, mode="pretrain")
     for key in ("z", "recon_norm"):
         assert torch.allclose(out0[key], out1[key], atol=1.0e-5, rtol=1.0e-5), key
-    if out0.get("uti_pooled") is not None and out1.get("uti_pooled") is not None:
-        assert torch.allclose(out0["uti_pooled"], out1["uti_pooled"], atol=1.0e-5, rtol=1.0e-5)
     cleaned = pretrain_collate_firewall(forged)
     for key in (
         "mod_label_id",

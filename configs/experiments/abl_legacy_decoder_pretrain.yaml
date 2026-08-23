@@ -1,6 +1,0 @@
-_base_:
-  - ../pretrain.yaml
-  - overlays/legacy_decoder.yaml
-sota_gate:
-  window: B_ablation
-  job: abl_legacy_decoder_pretrain

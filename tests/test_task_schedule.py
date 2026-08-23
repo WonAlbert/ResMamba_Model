@@ -181,7 +181,6 @@ def test_schedule_callback_sets_replay_and_refreshes_teacher() -> None:
             {"task": "ld_model", "epochs": 2},
         ],
         "replay_mix_ratio": 0.15,
-        "uti_replay_weight": 0.25,
         "min_ratio": 0.05,
     }
     dm = SignalDataModule(cfg, stage="stage2")

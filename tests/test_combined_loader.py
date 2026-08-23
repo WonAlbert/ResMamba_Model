@@ -153,6 +153,21 @@ def test_combined_loader_hides_leafspec_deprecation() -> None:
     assert leftover == []
 
 
+def test_silence_third_party_hides_lightning_num_workers_hint() -> None:
+    from lightning.fabric.utilities.warnings import PossibleUserWarning
+
+    silence_third_party_warnings()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.warn(
+            "The 'train_dataloader' does not have many workers which may be a bottleneck. "
+            "Consider increasing the value of the `num_workers` argument` to `num_workers=207` "
+            "in the `DataLoader` to improve performance.",
+            PossibleUserWarning,
+        )
+    leftover = [str(item.message) for item in caught if "does not have many workers" in str(item.message)]
+    assert leftover == []
+
+
 def test_as_source_map_uses_stamped_name_and_hint() -> None:
     from resmamba_signal_model.training.lit_module import _as_source_map
 

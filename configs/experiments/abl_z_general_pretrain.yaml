@@ -1,6 +1,0 @@
-_base_:
-  - ../pretrain.yaml
-  - overlays/z_general.yaml
-sota_gate:
-  window: B_ablation
-  job: abl_z_general_pretrain

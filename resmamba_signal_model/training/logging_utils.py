@@ -13,14 +13,28 @@ _LEAFSPEC_DEPRECATION = (
     r"`isinstance\(treespec, LeafSpec\)` is deprecated, "
     r"use `isinstance\(treespec, TreeSpec\) and treespec\.is_leaf\(\)` instead"
 )
+_LIGHTNING_FEW_DATALOADER_WORKERS = (
+    r"The '.*' does not have many workers which may be a bottleneck\. "
+    r"Consider increasing the value of the `num_workers` argument` to `num_workers=\d+` "
+    r"in the `DataLoader` to improve performance\."
+)
 
 
 def silence_third_party_warnings() -> None:
-    """Hide a Lightning+PyTorch CombinedLoader deprecation we cannot fix locally."""
+    """Hide third-party noise we cannot fix locally (tiny/CI num_workers=0 is intentional)."""
     warnings.filterwarnings(
         "ignore",
         message=_LEAFSPEC_DEPRECATION,
         category=FutureWarning,
+    )
+    try:
+        from lightning.fabric.utilities.warnings import PossibleUserWarning
+    except ImportError:
+        PossibleUserWarning = UserWarning  # type: ignore[misc, assignment]
+    warnings.filterwarnings(
+        "ignore",
+        message=_LIGHTNING_FEW_DATALOADER_WORKERS,
+        category=PossibleUserWarning,
     )
 
 

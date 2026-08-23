@@ -173,4 +173,3 @@ def test_pretrain_ignores_dataset_id_in_decoder_condition() -> None:
     out1 = model(batch1, mode="pretrain")
     assert torch.allclose(out0["z"], out1["z"], atol=1.0e-5, rtol=1.0e-5)
     assert torch.allclose(out0["recon_norm"], out1["recon_norm"], atol=1.0e-5, rtol=1.0e-5)
-    assert torch.allclose(out0["uti_pooled"], out1["uti_pooled"], atol=1.0e-5, rtol=1.0e-5)

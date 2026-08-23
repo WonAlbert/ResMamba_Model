@@ -1,6 +1,0 @@
-_base_:
-  - ../pretrain.yaml
-  - overlays/phase_on.yaml
-sota_gate:
-  window: B_ablation
-  job: abl_phase_on_pretrain

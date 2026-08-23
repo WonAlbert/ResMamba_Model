@@ -1,3 +1,0 @@
-# encoder 1 层
-model:
-  encoder_mamba_layers: 1

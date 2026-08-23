@@ -1,8 +1,0 @@
-# 28–60h 优胜配置 A：B 窗口结束后由 selected.json 指出应对齐的 overlay。
-# 占位默认等于有效性基线，不能当作已经选定的 SOTA 配置。
-_base_: ../pretrain.yaml
-sota_gate:
-  window: C_confirm
-  job: confirm_slot_a_pretrain
-  slot: a
-  seeds: [0, 1, 2]
