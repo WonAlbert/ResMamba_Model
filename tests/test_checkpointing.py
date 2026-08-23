@@ -93,6 +93,7 @@ def test_aggregate_specialist_geomean() -> None:
         "val/f1_modulation": torch.tensor(0.8),
         "val/acc_emitter": 0.5,
         "val/nmi": 0.6,
+        "val/nmi_within_domain": 0.25,
         "val/mse_prediction": 0.1,
         "val/mse_imputation": 0.1,
     }

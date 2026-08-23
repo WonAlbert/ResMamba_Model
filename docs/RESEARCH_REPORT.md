@@ -206,7 +206,7 @@ UTI 三条读出同时训练：`uti_pooled` / `uti_token` / `uti_query`。已知
 跳过项未削弱有效性断言：
 
 - `tests/test_mamba_kernel.py` 的 CUDA smoke：本机无 `mamba_ssm` CUDA kernel。
-- `tests/test_val_subset.py`：`open_real_data` 不在 `downstream_modulation_val` 配置中。
+- `tests/test_val_subset.py`：`radar_mod15` 不在 `downstream_modulation_val` 配置中。
 
 已通过的有效性相关测试包括（非穷尽）：`test_model_no_leakage`、`test_clustering_train_loss_ignores_global_label_id`、`test_wisig_group_split`、`test_train_sampler_fields_are_label_firewall`、`test_pretrain_three_objectives_and_uti_readouts`、`test_prototype_namespaces_do_not_mix`、`test_real_h5_slice`（rml2016_04c）。
 

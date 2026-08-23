@@ -71,9 +71,9 @@ def test_foundation_forward_and_losses() -> None:
     losses = foundation_pretrain_losses(mae, batch)
     assert losses
     assert all(torch.isfinite(v) for v in losses.values())
-    mod = model(batch, mode="task", task="modulation")
-    assert "modulation_logits" in mod
-    clu = model(batch, mode="task", task="clustering")
+    mod = model(batch, mode="task", task="tx_modulation")
+    assert "tx_modulation_logits" in mod or "task_logits" in mod
+    clu = model(batch, mode="task", task="ld_clustering")
     assert "cluster_logits" in clu
     pred = model(batch, mode="task", task="prediction")
     assert pred["mae_pred"].shape[2:] == (2, cfg.patch_size)

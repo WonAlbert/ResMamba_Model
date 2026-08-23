@@ -48,7 +48,7 @@ def test_zeroing_modulation_shared_does_not_change_emitter() -> None:
     assert torch.allclose(before["emitter_logits"], after["emitter_logits"])
 
 
-def test_remap_legacy_shared_copies_to_both_and_drops_old() -> None:
+def test_remap_legacy_shared_drops_old_keys() -> None:
     weight = torch.ones(4, 4)
     state = {
         "recognition_heads.shared.1.weight": weight,
@@ -57,21 +57,16 @@ def test_remap_legacy_shared_copies_to_both_and_drops_old() -> None:
     }
     remapped = remap_legacy_recognition_shared(state)
     assert "recognition_heads.shared.1.weight" not in remapped
-    assert torch.equal(remapped["recognition_heads.shared_modulation.1.weight"], weight)
-    assert torch.equal(remapped["recognition_heads.shared_emitter.1.weight"], weight)
     assert "encoder.layers.0.weight" in remapped
 
 
-def test_remap_does_not_overwrite_existing_split_keys() -> None:
+def test_remap_task_heads_maps_modulation_to_tx() -> None:
     legacy = torch.ones(2)
-    kept = torch.full((2,), 7.0)
     state = {
-        "recognition_heads.shared.0.weight": legacy,
-        "recognition_heads.shared_modulation.0.weight": kept,
+        "modulation_head.shared.0.weight": legacy,
     }
-    remapped = remap_legacy_recognition_shared(state)
-    assert torch.equal(remapped["recognition_heads.shared_modulation.0.weight"], kept)
-    assert torch.equal(remapped["recognition_heads.shared_emitter.0.weight"], legacy)
+    remapped = remap_task_head_checkpoints(state)
+    assert torch.equal(remapped["tx_modulation_head.shared.0.weight"], legacy)
 
 
 def test_modulation_head_is_independent_of_emitter_structure() -> None:
@@ -109,19 +104,17 @@ def test_default_heads_use_low_rank_prototype() -> None:
     section.update(
         {
             "build_task_heads": True,
-            "build_task_interface": True,
+            "build_task_interface": False,
             "require_mamba_kernel": False,
             "allow_fallback_mamba": True,
         }
     )
     model = SignalFoundationModel(SignalModelConfig.from_dict(section))
-    assert model.modulation_head.classifier.low_rank_prototype
-    assert model.emitter_head.classifier.low_rank_prototype
-    assert model.modulation_head.classifier.weight.shape[-1] == 64
-    assert getattr(model, "emitter_fingerprint", None) is None
-    assert not any(n.startswith("fp_head.") for n in model.emitter_head.state_dict())
+    assert model.tx_modulation_head.classifier.low_rank_prototype
+    assert model.ld_model_head.classifier.low_rank_prototype
+    assert model.tx_modulation_head.classifier.weight.shape[-1] == 64
     feat = torch.randn(2, model.cfg.d_model)
-    logits = model.emitter_head(feat)["emitter_logits"]
+    logits = model.ld_model_head(feat)["task_logits"]
     assert logits.shape == (2, model.cfg.num_emitters)
 
 

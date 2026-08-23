@@ -4,7 +4,9 @@
 
 ## 项目一句话
 
-任务无关的射频 I/Q 基础模型：联合能量 RevIN（`joint_energy`）→ 时频 Tokenizer → Encoder（5×BiMamba2 + 1×RoPE MemoryTransformer；MAE 可见 token 池化 `z_enc`）→ SharedDecoder（1×Mamba-2 + skip / 物理 FiLM + `amp_aux`；`z_recon`）→ UTI 多视图。主类：`SignalFoundationModel` / `SignalModelConfig`（包名 `resmamba_signal_model`）。
+任务无关的射频 I/Q 基础模型：联合能量 RevIN（`joint_energy`）→ 内容路由 MoE Tokenizer/Encoder → Encoder（`z_enc`）→ SharedDecoder（预训练 MAE）→ 下游六任务独立头（`z_enc` → TaskAdapter → head）。主类：`SignalFoundationModel` / `SignalModelConfig`（包名 `resmamba_signal_model`）。
+
+下游六任务：`ld_intrapulse` / `ld_model` / `tx_modulation` / `ld_clustering` / `tx_clustering` / `prediction`。
 
 ## Agent 工作约定
 
@@ -36,14 +38,12 @@ pytest -q
 
 | 阶段 | 命令要点 | 冻结策略 |
 |------|----------|----------|
-| 一 预训练 | `--stage pretrain --config configs/pretrain.yaml` | 全量训练骨干 |
-| 二 LP 探测 | `--stage stage2 --config configs/stage2.yaml --init-from <pretrain>/ckpts/best.ckpt` | 冻结骨干；只训 UTI + 任务头；截断反传 |
-| 三 单任务适配 | `--stage stage3 --task <name> --config configs/stage3.yaml --init-from <stage2>/best.ckpt` | Hybrid-LoRA+ / TaskAdapter / 当前任务头 |
-| 三 联合 | `--stage joint --config configs/joint.yaml` + 多个 `--adapter-dir` | 联合 PEFT；可解冻 tokenizer 尾部 |
+| 一 预训练 | `--stage pretrain --config configs/pretrain.yaml` | 全量训练骨干 + UTI（`view_div`） |
+| 二 LP 探测 | `--stage stage2 --config configs/stage2.yaml --init-from <pretrain>/ckpts/best.ckpt` | 冻结骨干；只训**当前任务头**（+ 可选 `z_enc` 线性探针）；截断反传 |
+| 三 单任务适配 | `--stage stage3 --task <name> --config configs/stage3.yaml --init-from <stage2>/best.ckpt` | 该任务 Hybrid-LoRA+ + TaskAdapter + 头 |
+| 三 联合 | `--stage joint --config configs/joint.yaml` + `--adapter-dir` | 各任务 LoRA/Adapter/头 + **仅** `SharedTaskAdapter` |
 
-冒烟：任意阶段加 `--profile tiny --synthetic`。日志：`runs/experiments/<run>/`（`config.yaml`、`train.log`、`tb/`、`csv/`、`ckpts/`）。
-
-旧入口 `--stage downstream` 仍可用，但不作为验收主路径。
+冒烟：任意阶段加 `--profile tiny --synthetic`。日志：`runs/experiments/<run>/`。
 
 ### 常用命令摘要
 
@@ -51,42 +51,38 @@ pytest -q
 python scripts/train.py --stage pretrain --config configs/pretrain.yaml
 python scripts/train.py --stage stage2 --config configs/stage2.yaml \
   --init-from runs/experiments/<pretrain>/ckpts/best.ckpt
-python scripts/train.py --stage stage3 --task modulation --config configs/stage3.yaml \
+python scripts/train.py --stage stage3 --task tx_modulation --config configs/stage3.yaml \
   --init-from runs/experiments/<stage2>/ckpts/best.ckpt
-python scripts/train.py --stage stage3 --task emitter --init-from runs/experiments/<stage2>/ckpts/best.ckpt
-python scripts/infer.py --task modulation --checkpoint runs/experiments/<run>/ckpts/best.ckpt \
-  --model-config configs/model.yaml --datasets rml2016_10a
+python scripts/train.py --stage joint --config configs/joint.yaml \
+  --init-from runs/experiments/<stage2>/ckpts/best.ckpt
 ```
 
-## 验收第一标准（硬门控）
+## 验收（当前）
 
-在**完成阶段一预训练**之后，用正式配置（非 tiny / 非 synthetic）评估。未达标则阶段二/三工作视为未通过，不得宣称下游成功或 SOTA。
+**Tiny 全流程冒烟**（实现验收，非正式 acc 门控）：
 
-### 阶段二（仅训练任务头 / 冻结骨干）
+```bash
+python scripts/smoke_forward.py
+python scripts/train.py --stage pretrain --profile tiny --synthetic
+python scripts/train.py --stage stage2 --profile tiny --synthetic
+python scripts/train.py --stage stage3 --task ld_intrapulse --profile tiny --synthetic
+python scripts/train.py --stage stage3 --task ld_model --profile tiny --synthetic
+python scripts/train.py --stage stage3 --task tx_modulation --profile tiny --synthetic
+python scripts/train.py --stage stage3 --task ld_clustering --profile tiny --synthetic
+python scripts/train.py --stage stage3 --task tx_clustering --profile tiny --synthetic
+python scripts/train.py --stage stage3 --task prediction --profile tiny --synthetic
+python scripts/train.py --stage joint --profile tiny --synthetic
+pytest -q
+```
 
-条件：`--stage stage2`，骨干冻结；训 UTI + 任务头；并训 **`z_general` 线性探针**（指标 `val/acc_{task}_z`，用于验收通用表征，不替代主头）。截断反传；从预训练 `best.ckpt` 初始化。
-
-| 任务 | 指标 | 阈值 |
-|------|------|------|
-| 调制分类（modulation） | val accuracy | **≥ 80%** |
-| 个体分类（emitter） | val accuracy | **≥ 70%** |
-
-### 阶段三（进一步微调适配）
-
-条件：在阶段二 checkpoint 上做 `--stage stage3`（Hybrid-LoRA+ 等），再测同一验证协议。
-
-| 任务 | 相对阶段二 | 要求 |
-|------|------------|------|
-| 调制分类 | 相对提升 | **≥ 10%**（`(acc₃ − acc₂) / acc₂ ≥ 0.10`；例：阶段二 80% → 阶段三 ≥ **88%**） |
-| 个体分类 | 相对提升 | **≥ 10%**（同上；例：阶段二 70% → 阶段三 ≥ **77%**） |
-
-记录方式：在对应 `runs/experiments/<run>/` 保留 `train.log` / 监控指标与 `ckpts/best.ckpt`；对比时写明 stage2 / stage3 的 run 名与准确率数值。提升按**相对比例**计算（相对阶段二 acc 提升不少于 10%），**不是**绝对加 10 个百分点。
+正式宽度 acc 门控待预训练跑满后在 `docs/sota_gate.md` 更新；勿再引用旧 modulation/emitter 阈值。
 
 ## 架构要点（改模型时勿破坏）
 
-- **Encoder**：`M-M-M-M-M-T`；预训练 `encode_visible_only`（MAE）；可见 token AttnPool → **`z_enc` / `h_enc`**（分类身份；`z_general`/`z` 别名指向此处；复用 MAE encode，不二次全序列）；无 mask / 下游 encode 时对全有效 patch 池化；超长序列 chunk 均值记忆 + RoPE。
+- **Encoder**：`M-M-M-M-M-T`；预训练 `encode_visible_only`（MAE）；可见 token **GatingPool**（默认；`encoder_pool_type: attn_pool` 可切回 AttnPool）→ **`z_enc` / `h_enc`**（分类身份；`z_general`/`z` 别名指向此处；默认 L2 归一化；复用 MAE encode，不二次全序列）；无 mask / 下游 encode 时对全有效 patch 池化；超长序列 chunk 均值记忆 + RoPE。
 - **Decoder**：恰好 1 层 `DecoderBlock`；token 通路重建；`[DEC]` + AttnPool → **`z_recon`**（重建/物理 readout，不作分类身份）。
-- **UTI**：semantic = 低秩残差(`z_enc`)；source = 去均值 token 池化；context = 慢衰减池化（非三份 `adapter(decoder_z)`）。
+- **下游**：冻结 `z_enc` → 可选 TaskAdapter → 任务私有头；**不**经共享 UTI。联合阶段仅新增 `SharedTaskAdapter`（不解冻 tokenizer 尾部 / 无 `shared_lora`）。
+- **UTI**：仅预训练 `view_div` 等；下游路径禁用。
 - **Tokenizer**：共享 stem + 多尺度时域 + 复数双侧频谱分带（`fft` + `fftshift` 后再均分）；无 dataset/task token。
 - **归一化**：模型内 `revin_scale_mode: joint_energy`（I/Q 共享 Winsorized RMS；`amp_aux` 旁路绝对功率进 Decoder FiLM / 物理读出，不进 `z_enc`）。Loader 保持 `iq_normalize: none`。
 - **物理约束**：patch 级 log_power / PAPR / IQ 相关 / 方差比 / 谱质心（`fftfreq`）；绝对 `log_power` 由 `log_power_rel + log_scale` 还原。软约束 SmoothL1 + 硬约束能量投影。分类在归一化表征空间，重建在 RevIN denorm 后。

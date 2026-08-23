@@ -7,14 +7,8 @@ import torch.nn.functional as F
 
 from resmamba_signal_model.models.heads import PrototypeClusteringHead
 from resmamba_signal_model.models.prototypes import CONTENT_NAMESPACE, DEVICE_NAMESPACE, PrototypeRegistry
-from resmamba_signal_model.training.continual import (
-    absorb_unknown_embeddings,
-    apply_continual_freeze,
-    confidence_masked_distillation_loss,
-    continual_parameter_budget,
-    old_prototype_anchor_loss,
-)
-from resmamba_signal_model.training.losses import negcos_temperature
+from resmamba_signal_model.training.continual import absorb_unknown_embeddings, old_prototype_anchor_loss
+from resmamba_signal_model.training.losses import confidence_masked_distillation_loss, negcos_temperature
 from resmamba_signal_model.models.model import SignalFoundationModel, SignalModelConfig
 from resmamba_signal_model.models.peft import PeftConfig, inject_hybrid_lora
 from resmamba_signal_model.training.freeze import apply_stage_freeze
@@ -124,19 +118,25 @@ def _tiny(**kwargs) -> SignalFoundationModel:
     return SignalFoundationModel(SignalModelConfig(**payload))
 
 
-def test_continual_freeze_uses_shared_adapter_not_per_task_lora() -> None:
-    model = _tiny()
+def test_clustering_head_honors_clustering_num_prototypes() -> None:
+    model = _tiny(num_prototypes=8, clustering_num_prototypes=128)
+    assert model.ld_clustering_head is not None
+    assert model.ld_clustering_head.prototypes.shape[0] == 128
+    assert model.ld_clustering_head.namespace == "ld_clustering"
+
+
+def test_joint_freeze_uses_shared_adapter_not_shared_lora() -> None:
+    from resmamba_signal_model.models.task_interface import DEFAULT_TASKS
+
+    model = _tiny(task_names=DEFAULT_TASKS)
     inject_hybrid_lora(
         model,
-        ["modulation", "emitter"],
-        PeftConfig(r_attn=2, r_mamba=2, lora_alpha_attn=2, lora_alpha_mamba=2, shared_lora=True),
+        list(DEFAULT_TASKS),
+        PeftConfig(r_attn=2, r_mamba=2, lora_alpha_attn=2, lora_alpha_mamba=2, shared_lora=False),
     )
-    apply_stage_freeze(model, "continual")
-    budget = continual_parameter_budget(model)
-    assert budget["has_shared_adapter"]
-    assert budget["per_task_lora"] == []
+    apply_stage_freeze(model, "joint", train_cfg={})
     names = {n for n, p in model.named_parameters() if p.requires_grad}
     assert any(n.startswith("shared_adapter.") for n in names)
     assert any(n.startswith("prototype_registry.") for n in names)
-    assert any(n.startswith("emitter_head.") for n in names)
-    assert not any("lora_A.modulation" in n for n in names)
+    assert any(n.startswith("ld_intrapulse_head.") for n in names)
+    assert not any("lora_A.shared" in n for n in names)

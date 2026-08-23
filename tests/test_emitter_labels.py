@@ -11,13 +11,12 @@ from resmamba_signal_model.training.emitter_labels import (
 )
 
 
-def test_emitter_downstream_datasets_wisig_primary() -> None:
+LEGACY_EMITTER_DATASETS = ["wisig", "adsb2"]
+
+
+def test_emitter_downstream_datasets_empty_without_legacy_section() -> None:
     datasets = load_emitter_downstream_datasets(config_path=Path("configs/datasets.yaml"))
-    assert datasets[0] == "wisig"
-    assert datasets == ["wisig", "adsb2"]
-    assert "wifi150" not in datasets
-    assert "communication_emitters" not in datasets
-    assert "radar_emitters" not in datasets
+    assert datasets == []
 
 
 def test_filter_emitter_downstream_pool() -> None:
@@ -36,7 +35,7 @@ def test_global_emitter_label_map_counts() -> None:
     if not (root / "label_maps.json").is_file():
         return
 
-    label_map = build_global_emitter_label_map(root)
+    label_map = build_global_emitter_label_map(root, dataset_names=LEGACY_EMITTER_DATASETS)
     assert label_map.num_emitters == 250
     assert label_map.offsets[6] == 0
     assert label_map.offsets[11] == 100
@@ -50,6 +49,18 @@ def test_global_emitter_labels_avoid_collision() -> None:
     emitter_id = torch.tensor([5, 5, 5], dtype=torch.long)
     labels = global_emitter_labels(dataset_id, emitter_id, lookup)
     assert labels.tolist() == [5, 105, -1]
+
+
+def test_global_emitter_labels_cuda_index_cpu_lookup() -> None:
+    """batch 在 GPU、lookup 在 CPU 时不应因设备不一致崩溃。"""
+    if not torch.cuda.is_available():
+        return
+    lookup = torch.tensor([-1, -1, -1, -1, -1, -1, 0, -1, -1, -1, -1, 100], dtype=torch.long)
+    dataset_id = torch.tensor([6, 11], dtype=torch.long, device="cuda")
+    emitter_id = torch.tensor([5, 5], dtype=torch.long, device="cuda")
+    labels = global_emitter_labels(dataset_id, emitter_id, lookup)
+    assert labels.device.type == "cuda"
+    assert labels.tolist() == [5, 105]
 
 
 def test_global_emitter_labels_invalid_dataset() -> None:
@@ -70,3 +81,22 @@ def test_emitter_dataset_class_mask_wisig_adsb2() -> None:
     assert int(mask[6].sum()) == 100
     assert int(mask[11].sum()) == 150
     assert not bool(torch.equal(mask[6], mask[11]))
+
+
+def test_emitter_dataset_class_mask_compact() -> None:
+    root = Path(__file__).resolve().parents[1] / "dataset"
+    if not (root / "label_maps.json").is_file():
+        return
+    mask = build_emitter_dataset_class_mask(
+        root,
+        num_emitters=250,
+        num_datasets=32,
+        compact=True,
+        train_cfg={"emitter_downstream_datasets": LEGACY_EMITTER_DATASETS},
+    )
+    assert mask is not None
+    assert mask.shape == (32, 250)
+    assert int(mask[6].sum()) == 100
+    assert int(mask[11].sum()) == 150
+    assert bool(mask[6, 0:100].all())
+    assert bool(mask[11, 100:250].all())

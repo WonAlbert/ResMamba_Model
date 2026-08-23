@@ -1,6 +1,10 @@
 from resmamba_signal_model.training.pool_filters import (
     filter_excluded_dataset_pool,
-    load_downstream_modulation_datasets,
+    load_clustering_comm_datasets,
+    load_clustering_radar_datasets,
+    load_downstream_comm_modulation_datasets,
+    load_downstream_radar_modulation_datasets,
+    load_downstream_radar_model_datasets,
     load_downstream_shared_datasets,
     load_excluded_datasets,
     load_pretrain_datasets,
@@ -15,11 +19,8 @@ def test_load_excluded_datasets() -> None:
 def test_load_pretrain_datasets() -> None:
     datasets = load_pretrain_datasets()
     assert datasets == [
-        "electromagnetic_0926",
-        "open_real_data",
-        "radar_emitters",
-        "xidian14",
-        "panoradio_hf",
+        "radar_mod15",
+        "radchar",
         "radcom_awgn",
         "radcom_dynamic",
         "radcom_ota",
@@ -27,27 +28,52 @@ def test_load_pretrain_datasets() -> None:
         "rml2016_04c",
         "rml2016_10a",
         "rml2016_10b",
-        "wisig",
-        "adsb2",
+        "xidian14",
+        "panoradio_hf",
     ]
+    assert "radchar" in datasets
     assert "communication_emitters" not in datasets
+    assert "electromagnetic_0926" not in datasets
+    assert "wisig" not in datasets
+    assert "adsb2" not in datasets
+    assert "radar_emitters" not in datasets
     assert "rml2018_1a" not in datasets
     assert "wifi150" not in datasets
 
 
-def test_load_downstream_modulation_datasets() -> None:
-    datasets = load_downstream_modulation_datasets()
+def test_load_downstream_comm_modulation_datasets() -> None:
+    datasets = load_downstream_comm_modulation_datasets()
     assert datasets == ["rml2016_04c", "rml2016_10a", "rml2016_10b"]
+
+
+def test_load_downstream_radar_model_datasets() -> None:
+    datasets = load_downstream_radar_model_datasets()
+    assert datasets == ["radar_mod15", "cjr_mix"]
+
+
+def test_load_downstream_radar_modulation_datasets() -> None:
+    datasets = load_downstream_radar_modulation_datasets()
+    assert datasets == ["radchar"]
+
+
+def test_load_clustering_pools() -> None:
+    radar = load_clustering_radar_datasets()
+    comm = load_clustering_comm_datasets()
+    assert radar == ["radar_mod15", "cjr_mix", "radchar"]
+    assert comm == ["rml2016_04c", "rml2016_10a", "rml2016_10b", "xidian14", "panoradio_hf"]
 
 
 def test_load_downstream_shared_datasets() -> None:
     datasets = load_downstream_shared_datasets()
     assert datasets == [
-        "adsb2",
+        "cjr_mix",
+        "panoradio_hf",
+        "radar_mod15",
+        "radchar",
         "rml2016_04c",
         "rml2016_10a",
         "rml2016_10b",
-        "wisig",
+        "xidian14",
     ]
 
 

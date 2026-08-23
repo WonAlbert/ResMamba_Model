@@ -5,6 +5,7 @@ from resmamba_signal_model.training.selection import (
     resolve_selection_metric_name,
     specialist_relative_geomean,
 )
+import pytest
 
 
 def test_emitter_default_selection_metric() -> None:
@@ -59,6 +60,20 @@ def test_multitask_geomean_is_unweighted() -> None:
     )
     assert details["score"] == score
     assert 0.4 < score < 0.81
+
+
+def test_clustering_selects_within_domain_nmi() -> None:
+    assert resolve_selection_metric_name({}, stage="stage2", task="clustering") == "nmi_within_domain"
+    assert resolve_checkpoint_monitor_name({}, stage="stage3", task="clustering") == "val/nmi_within_domain"
+    assert resolve_checkpoint_monitor_name(
+        {"selection_metric": "mean_nmi"},
+        stage="stage3",
+        task="clustering",
+    ) == "val/nmi_within_domain"
+    fallback = compute_selection_score({"nmi": 0.4}, "nmi_within_domain")
+    assert fallback == pytest.approx(0.4)
+    primary = compute_selection_score({"nmi": 0.4, "nmi_within_domain": 0.2}, "mean_nmi")
+    assert primary == pytest.approx(0.2)
 
 
 def test_stage2_default_checkpoint_monitor_name() -> None:

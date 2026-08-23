@@ -9,6 +9,7 @@ sys.path.insert(0, str(ROOT))
 import torch
 
 from resmamba_signal_model.models.model import SignalFoundationModel, SignalModelConfig
+from resmamba_signal_model.training.freeze import apply_stage_freeze
 
 
 def _ci_cfg(**kwargs) -> SignalModelConfig:
@@ -29,6 +30,7 @@ def _ci_cfg(**kwargs) -> SignalModelConfig:
         num_emitters=16,
         num_prototypes=8,
         build_task_heads=True,
+        build_task_interface=False,
         train_encoder=True,
         train_decoder=True,
         train_heads=True,
@@ -49,73 +51,43 @@ def make_batch() -> dict[str, torch.Tensor]:
         "dataset_id": torch.tensor([0, 1, 2, 2]),
         "mod_label_id": torch.tensor([3, 3, 4, 4]),
         "emitter_id": torch.tensor([9, 9, 10, 11]),
+        "canonical_mod_label_id": torch.tensor([3, 3, 4, 4]),
     }
 
 
 def test_truncate_backward_blocks_encoder_grads() -> None:
     model = SignalFoundationModel(_ci_cfg())
-    model.truncate_backward = True
-    model.skip_recon = True
+    apply_stage_freeze(model, "stage2", task="tx_modulation", train_cfg={"truncate_backward": True, "skip_recon": True})
     model.train()
-    for param in model.encoder.parameters():
-        param.requires_grad = True
-    for param in model.encoder_pool.parameters():
-        param.requires_grad = True
-    out = model(make_batch(), mode="task", task="modulation")
-    out["modulation_logits"].sum().backward()
+    out = model(make_batch(), mode="task", task="tx_modulation")
+    logits = out.get("task_logits")
+    if logits is None:
+        logits = out.get("tx_modulation_logits")
+    logits.sum().backward()
     for param in model.encoder.parameters():
         assert param.grad is None
-    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.modulation_head.parameters())
-    assert any(p.grad is not None for p in model.task_interface.parameters())
-    # encoder 权重无梯度；encoder_pool 在 detach(h_enc) 上重算，可读出可训
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.tx_modulation_head.parameters())
     assert not out["h_enc"].requires_grad
-    assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in model.encoder_pool.parameters())
 
 
-def test_truncate_backward_trains_view_adapters() -> None:
-    """stage2 截断反传时，UTI specialist view adapters 仍必须收到梯度。"""
+def test_truncate_backward_trains_head_not_encoder_pool() -> None:
     model = SignalFoundationModel(_ci_cfg())
-    model.truncate_backward = True
-    model.skip_recon = True
+    apply_stage_freeze(model, "stage2", task="ld_model", train_cfg={"truncate_backward": True, "skip_recon": True})
     model.train()
-    for param in model.parameters():
-        param.requires_grad = False
-    for param in model.task_interface.parameters():
-        param.requires_grad = True
-    for param in model.modulation_head.parameters():
-        param.requires_grad = True
+    out = model(make_batch(), mode="task", task="ld_model")
+    out["task_logits"].sum().backward()
     for param in model.encoder_pool.parameters():
-        param.requires_grad = True
-    out = model(make_batch(), mode="task", task="modulation")
-    out["modulation_logits"].sum().backward()
-    adapter_grads = [
-        param.grad
-        for param in model.task_interface.view_adapters.parameters()
-        if param.requires_grad
-    ]
-    assert adapter_grads
-    assert any(grad is not None and float(grad.abs().sum()) > 0.0 for grad in adapter_grads)
-    assert out["z_semantic"].requires_grad
+        assert param.grad is None
+    assert any(p.grad is not None for p in model.ld_model_head.parameters())
 
 
-def test_truncate_backward_trains_emitter_head_not_encoder() -> None:
+def test_truncate_backward_ld_model_head_not_encoder() -> None:
     model = SignalFoundationModel(_ci_cfg())
-    model.truncate_backward = True
-    model.skip_recon = True
+    apply_stage_freeze(model, "stage2", task="ld_model", train_cfg={"truncate_backward": True, "skip_recon": True})
     model.train()
-    for param in model.parameters():
-        param.requires_grad = False
-    for param in model.emitter_head.parameters():
-        param.requires_grad = True
-    for param in model.task_interface.parameters():
-        param.requires_grad = True
-    out = model(make_batch(), mode="task", task="emitter")
-    out["emitter_logits"].sum().backward()
+    out = model(make_batch(), mode="task", task="ld_model")
+    out["task_logits"].sum().backward()
     for param in model.encoder.parameters():
         assert param.grad is None
-    assert any(
-        p.grad is not None and float(p.grad.abs().sum()) > 0
-        for p in model.emitter_head.parameters()
-    )
-    assert "emitter_fingerprint" not in out
+    assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in model.ld_model_head.parameters())
     assert "task_pooled" in out

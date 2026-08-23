@@ -9,6 +9,7 @@ sys.path.insert(0, str(ROOT))
 import torch
 
 from resmamba_signal_model.models.heads import (
+    ClassificationHead,
     EmitterHead,
     ImputationHead,
     ModulationHead,
@@ -25,6 +26,7 @@ from resmamba_signal_model.models.task_interface import (
     TaskSpec,
     UniversalTaskInterface,
     UniversalTaskInterfaceV2,
+    default_task_spec,
 )
 from resmamba_signal_model.models.model import SignalFoundationModel, SignalModelConfig
 
@@ -36,10 +38,10 @@ def test_uti_shapes_and_task_film() -> None:
     patch_h = torch.randn(3, 5, 32)
     mask = torch.ones(3, 5, dtype=torch.bool)
     mask[0, -1] = False
-    feat = uti(z, patch_h, mask, "modulation")
+    feat = uti(z, patch_h, mask, "ld_intrapulse")
     assert feat.pooled.shape == (3, 32)
     assert feat.tokens.shape == (3, 5, 32)
-    other = uti(z, patch_h, mask, "emitter")
+    other = uti(z, patch_h, mask, "ld_model")
     assert not torch.allclose(feat.pooled, other.pooled)
 
 
@@ -61,20 +63,11 @@ def test_remap_to_task_heads_and_legacy() -> None:
     weight = torch.ones(4, 4)
     state = {
         "recognition_heads.shared.1.weight": weight,
-        "recognition_heads.modulation.weight": torch.ones(3, 8),
+        "modulation_head.classifier.weight": torch.ones(3, 8),
     }
     remapped = remap_task_head_checkpoints(state)
     assert "recognition_heads.shared.1.weight" not in remapped
-    assert "modulation_head.shared.1.weight" in remapped
-    assert "emitter_head.shared.1.weight" in remapped
-    assert "modulation_head.classifier.weight" in remapped
-    again = remap_legacy_recognition_shared({"recognition_heads.shared.0.weight": torch.ones(2)})
-    assert "recognition_heads.shared_modulation.0.weight" in again
-    copied = remap_recognition_heads_to_task_heads(
-        {"recognition_heads.shared_emitter.0.weight": torch.ones(2), "keep": torch.zeros(1)}
-    )
-    assert "emitter_head.shared.0.weight" in copied
-    assert "keep" in copied
+    assert "tx_modulation_head.classifier.weight" in remapped
 
 
 def test_register_task_on_model() -> None:
@@ -91,12 +84,13 @@ def test_register_task_on_model() -> None:
         dropout=0.0,
         p_trunc=0.0,
         build_task_heads=True,
+        build_task_interface=True,
         build_adapters=True,
         num_task_types=8,
     )
     model = SignalFoundationModel(cfg)
-    register_task("sonar", ModulationHead)
-    head = model.register_task("sonar", ModulationHead, num_mod_classes=4, dropout=0.0, use_dataset_bias=False)
+    register_task("sonar", ClassificationHead)
+    head = model.register_task("sonar", ClassificationHead, num_classes=4, dropout=0.0, use_dataset_bias=False)
     assert "sonar" in model.task_interface.task_to_id
     assert "sonar" in model.task_adapters
     assert head is model.extra_task_heads["sonar"]
@@ -108,15 +102,15 @@ def test_domain_prompt_changes_condition_without_backbone_tokens() -> None:
         d_model=32,
         rank=8,
         dropout=0.0,
-        task_names=("modulation",),
+        task_names=("tx_modulation",),
         domain_prompt_size=6,
         num_datasets=4,
     )
     z = torch.randn(2, 32)
     tokens = torch.randn(2, 5, 32)
     mask = torch.ones(2, 5, dtype=torch.bool)
-    base = uti(z, tokens, mask, "modulation")
-    shifted = uti(z, tokens, mask, "modulation", metadata={"dataset_id": torch.tensor([1, 2])})
+    base = uti(z, tokens, mask, "tx_modulation")
+    shifted = uti(z, tokens, mask, "tx_modulation", metadata={"dataset_id": torch.tensor([1, 2])})
     assert shifted.pooled.shape == base.pooled.shape
     assert not torch.allclose(base.pooled, shifted.pooled)
 
@@ -165,7 +159,7 @@ def test_emitter_pooled_tracks_z_enc_not_chance_collapse() -> None:
     z = torch.randn(5, 32)
     tokens = torch.randn(5, 6, 32)
     mask = torch.ones(5, 6, dtype=torch.bool)
-    feat = uti(z, tokens, mask, "emitter")
+    feat = uti(z, tokens, mask, "ld_model")
     cos = torch.nn.functional.cosine_similarity(feat.pooled, z, dim=-1).mean()
     assert float(cos.detach()) > 0.2
     assert float((feat.pooled - feat.pooled.mean(dim=0)).detach().norm(dim=-1).mean()) > 0.05
@@ -207,7 +201,7 @@ def test_uti_v2_parameter_budget_and_legacy_switch() -> None:
     z = torch.randn(2, 32)
     tokens = torch.randn(2, 4, 32)
     mask = torch.ones(2, 4, dtype=torch.bool)
-    assert legacy(z, tokens, mask, "modulation").pooled.shape == (2, 32)
+    assert legacy(z, tokens, mask, "ld_intrapulse").pooled.shape == (2, 32)
     old_keys = ("stem.", "task_embed.", "film.", "token_pool.", "fuse.")
     old_state = {
         key: value.clone()
@@ -223,3 +217,9 @@ def test_uti_v2_parameter_budget_and_legacy_switch() -> None:
     restored.load_state_dict(old_state, strict=False)
     for key, value in old_state.items():
         assert torch.equal(restored.state_dict()[key], value)
+
+
+def test_ld_clustering_uses_source_view() -> None:
+    spec = default_task_spec("ld_clustering")
+    assert spec.view == "source"
+    assert spec.invariant_views == ()

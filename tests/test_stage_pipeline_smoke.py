@@ -10,6 +10,7 @@ import torch
 
 from resmamba_signal_model.models.model import SignalFoundationModel, SignalModelConfig
 from resmamba_signal_model.models.peft import PeftConfig, inject_hybrid_lora
+from resmamba_signal_model.models.task_interface import DEFAULT_TASKS
 from resmamba_signal_model.training.data_module import SignalDataModule
 from resmamba_signal_model.training.freeze import apply_stage_freeze
 from resmamba_signal_model.training.lit_module import SignalLitModule
@@ -33,6 +34,7 @@ def _cfg() -> SignalModelConfig:
         num_emitters=32,
         num_prototypes=8,
         build_task_heads=True,
+        task_names=DEFAULT_TASKS,
     )
 
 
@@ -52,8 +54,10 @@ def _train_cfg(stage: str) -> dict:
         "weight_decay": 0.0,
         "lambda_recon": 0.0,
         "loraplus_lr_ratio": 16,
-        "task": "modulation" if stage == "stage3" else None,
+        "task": "ld_intrapulse" if stage == "stage3" else None,
         "loss_weights": {"physical": 0.0, "domain": 0.0},
+        "truncate_backward": True,
+        "skip_recon": True,
     }
 
 
@@ -80,7 +84,7 @@ def _fit(stage: str, model: SignalFoundationModel, train_cfg: dict, tmp_path: Pa
 
 def test_stage2_tiny_smoke(tmp_path: Path) -> None:
     model = SignalFoundationModel(_cfg())
-    apply_stage_freeze(model, "stage2", train_cfg={"truncate_backward": True, "skip_recon": True})
+    apply_stage_freeze(model, "stage2", task="tx_modulation", train_cfg={"truncate_backward": True, "skip_recon": True})
     _fit("stage2", model, _train_cfg("stage2"), tmp_path)
 
 
@@ -88,10 +92,10 @@ def test_stage3_tiny_smoke(tmp_path: Path) -> None:
     cfg = _cfg()
     cfg.build_adapters = True
     model = SignalFoundationModel(cfg)
-    inject_hybrid_lora(model, ["modulation"], PeftConfig(r_attn=2, r_mamba=2, lora_alpha_attn=2, lora_alpha_mamba=2))
-    apply_stage_freeze(model, "stage3", task="modulation", train_cfg={})
+    inject_hybrid_lora(model, ["ld_intrapulse"], PeftConfig(r_attn=2, r_mamba=2, lora_alpha_attn=2, lora_alpha_mamba=2))
+    apply_stage_freeze(model, "stage3", task="ld_intrapulse", train_cfg={})
     train_cfg = _train_cfg("stage3")
-    train_cfg["synthetic_sources"] = ["classification"]
+    train_cfg["synthetic_sources"] = ["ld_intrapulse"]
     _fit("stage3", model, train_cfg, tmp_path)
 
 
@@ -102,9 +106,9 @@ def test_joint_tiny_smoke(tmp_path: Path) -> None:
     model = SignalFoundationModel(cfg)
     inject_hybrid_lora(
         model,
-        ["modulation", "emitter", "clustering", "prediction", "imputation"],
-        PeftConfig(r_attn=2, r_mamba=2, lora_alpha_attn=2, lora_alpha_mamba=2, shared_lora=True),
+        list(DEFAULT_TASKS),
+        PeftConfig(r_attn=2, r_mamba=2, lora_alpha_attn=2, lora_alpha_mamba=2, shared_lora=False),
     )
     apply_stage_freeze(model, "joint", train_cfg={})
     _fit("joint", model, _train_cfg("joint"), tmp_path)
-    assert any(p.requires_grad for n, p in model.named_parameters() if n.startswith("tokenizer.time_fuse"))
+    assert any(p.requires_grad for n, p in model.named_parameters() if n.startswith("shared_adapter."))

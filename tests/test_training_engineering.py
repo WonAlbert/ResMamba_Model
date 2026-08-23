@@ -128,17 +128,18 @@ def test_label_columns_passthrough_collate_and_merge() -> None:
         stage="stage2",
     )
     dm.setup()
-    batch = next(iter(dm._loaders(dm._val_sets, train=False)["classification"]))
+    batch = next(iter(dm._loaders(dm._val_sets, train=False)[dm.source_names[0]]))
     assert "canonical_mod_label_id" in batch
     assert "global_emitter_id" in batch
     assert torch.is_tensor(batch["canonical_mod_label_id"])
-    assert builtin_spec("modulation").label_field == "canonical_mod_label_id"
-    assert builtin_spec("emitter").label_field == "global_emitter_id"
+    assert builtin_spec("tx_modulation").label_field == "canonical_mod_label_id"
+    assert builtin_spec("ld_model").label_field == "global_emitter_id"
 
+    second_key = dm.source_names[1] if len(dm.source_names) > 1 else dm.source_names[0]
     merged = merge_source_batches(
         {
-            "classification": batch,
-            "emitter": next(iter(dm._loaders(dm._val_sets, train=False)["emitter"])),
+            dm.source_names[0]: batch,
+            second_key: next(iter(dm._loaders(dm._val_sets, train=False)[second_key])),
         }
     )
     assert "canonical_mod_label_id" in merged
@@ -156,9 +157,8 @@ def test_infer_task_label_tensor_uses_canonical_and_global_emitter() -> None:
         "emitter_id": torch.tensor([0, 1]),
         "global_label_id": torch.tensor([100, 101]),
     }
-    assert infer_script.task_label_tensor("modulation", batch).tolist() == [3, 4]
-    assert infer_script.task_label_tensor("emitter", batch).tolist() == [10, 11]
-    assert infer_script.TASK_DATASETS["emitter"] == ["wisig", "adsb2"]
+    assert infer_script.task_label_tensor("tx_modulation", batch).tolist() == [3, 4]
+    assert infer_script.task_label_tensor("ld_model", batch).tolist() == [10, 11]
 
 
 def test_configure_optimizers_uses_build_lr_scheduler() -> None:
@@ -202,8 +202,9 @@ def test_clustering_train_loader_attaches_physical_view2() -> None:
         stage="stage2",
     )
     dm.setup()
-    assert "clustering" in dm._train_sets
-    batch = next(iter(dm._loaders(dm._train_sets, train=True)["clustering"]))
+    cluster_key = next((k for k in dm._train_sets if "clustering" in k), dm.source_names[0])
+    assert cluster_key in dm._train_sets
+    batch = next(iter(dm._loaders(dm._train_sets, train=True)[cluster_key]))
     assert "view2" in batch
     iq = batch["iq"]
     view2 = batch["view2"]
@@ -213,18 +214,18 @@ def test_clustering_train_loader_attaches_physical_view2() -> None:
     else:
         assert len(view2) == len(iq)
         assert not torch.equal(view2[0], iq[0])
-    val_batch = next(iter(dm._loaders(dm._val_sets, train=False)["clustering"]))
+    val_batch = next(iter(dm._loaders(dm._val_sets, train=False)[cluster_key]))
     assert "view2" not in val_batch
 
 
 def test_train_sampler_fields_are_label_firewall() -> None:
     from resmamba_signal_model.training.data_module import train_sampler_label_fields
 
-    for task in ("modulation", "emitter", "clustering", "prediction", None):
+    for task in ("tx_modulation", "ld_model", "ld_clustering", "prediction", None):
         fields = train_sampler_label_fields(task)
         assert "global_label_id" not in fields
-    assert train_sampler_label_fields("modulation")[0] == "canonical_mod_label_id"
-    assert train_sampler_label_fields("emitter")[0] == "global_emitter_id"
+    assert train_sampler_label_fields("tx_modulation")[0] == "canonical_mod_label_id"
+    assert train_sampler_label_fields("ld_model")[0] == "global_emitter_id"
 
 
 def test_continual_sessions_and_osr_metrics() -> None:

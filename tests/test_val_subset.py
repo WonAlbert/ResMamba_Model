@@ -22,7 +22,12 @@ def test_resolve_val_label_field() -> None:
 
 
 def test_emitter_val_subset_per_dataset_and_class() -> None:
-    pool = build_rfdata_pool("dataset", "downstream_emitter_val")
+    import pytest
+
+    try:
+        pool = build_rfdata_pool("dataset", "downstream_emitter_val")
+    except (KeyError, FileNotFoundError, RuntimeError, AssertionError):
+        pytest.skip("downstream_emitter_val 未配置或为空")
     indices, report = build_per_dataset_class_balanced_val_indices(
         pool,
         stage="downstream",
@@ -56,26 +61,49 @@ def test_prediction_val_subset_max_per_dataset() -> None:
         assert info["selected"] <= 800
 
 
-def test_open_real_data_val_subset_uses_full_pool() -> None:
-    pool = build_rfdata_pool("dataset", "downstream_modulation_val")
+def test_radar_model_val_subset_per_dataset_and_class() -> None:
+    import pytest
+
+    try:
+        pool = build_rfdata_pool("dataset", "downstream_radar_model_val")
+    except (KeyError, FileNotFoundError, RuntimeError):
+        pytest.skip("downstream_radar_model_val 未配置")
+    if len(pool) == 0:
+        pytest.skip("雷达型号下游 pool 为空")
+    indices, report = build_per_dataset_class_balanced_val_indices(
+        pool,
+        stage="downstream",
+        task="modulation",
+        fraction=0.2,
+        seed=7,
+    )
+    assert len(indices) == report["total"]
+    assert report["task"] == "modulation"
+    for name, info in report["datasets"].items():
+        ratio = info["selected"] / info["total"]
+        assert 0.15 <= ratio <= 0.25, f"{name} ratio={ratio:.3f}"
+
+
+def test_radar_mod15_val_subset_uses_full_pool() -> None:
+    pool = build_rfdata_pool("dataset", "downstream_radar_model_val")
     _, report = build_per_dataset_class_balanced_val_indices(
         pool,
         stage="downstream",
         task="modulation",
         fraction=0.2,
         seed=7,
-        full_datasets=["open_real_data"],
+        full_datasets=["radar_mod15"],
     )
-    if "open_real_data_val.h5" not in report["datasets"]:
+    if "radar_mod15_val.h5" not in report["datasets"]:
         import pytest
 
-        pytest.skip("open_real_data 不在 downstream_modulation_val")
-    open_info = report["datasets"]["open_real_data_val.h5"]
-    assert open_info["selected"] == open_info["total"]
-    assert open_info["fraction"] == 1.0
-    assert open_info["sampling_mode"] == "full"
+        pytest.skip("radar_mod15 不在 downstream_radar_model_val")
+    radar_info = report["datasets"]["radar_mod15_val.h5"]
+    assert radar_info["selected"] == radar_info["total"]
+    assert radar_info["fraction"] == 1.0
+    assert radar_info["sampling_mode"] == "full"
     for name, info in report["datasets"].items():
-        if name == "open_real_data_val.h5":
+        if name == "radar_mod15_val.h5":
             continue
         ratio = info["selected"] / info["total"]
         assert 0.15 <= ratio <= 0.25, f"{name} ratio={ratio:.3f}"

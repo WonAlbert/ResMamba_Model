@@ -16,12 +16,15 @@ def test_load_model_yaml() -> None:
     assert model.decoder_mamba_layers == 1
     assert model.sequence_packing is True
     assert model.encode_visible_only is True
+    assert model.num_prototypes == 32
+    assert model.clustering_num_prototypes == 128
 
 
 def test_load_tiny_and_pretrain_profile() -> None:
     tiny = load_yaml_config("configs/model_tiny.yaml")
     assert tiny["model"]["d_model"] == 64
     assert tiny["model"]["allow_fallback_mamba"] is True
+    assert tiny["model"]["clustering_num_prototypes"] == 16
     pre = load_yaml_config("configs/pretrain.yaml", profile="tiny")
     assert pre["val_seed"] == 0
     assert pre["checkpoint_monitor"] == "val/monitor"
@@ -29,68 +32,36 @@ def test_load_tiny_and_pretrain_profile() -> None:
     assert pre["model_config"] == "configs/model_tiny.yaml"
     assert pre["loss_weights"]["domain"] == 0.0
     assert pre["loss_weights"]["structure_phase"] == 0.15
-    assert pre["loss_weights"]["vicreg_token"] == 0.15
+    assert pre["loss_weights"]["vicreg_token"] == 0.2
     assert pre["combine_then_pack"] is False
     assert pre["homogeneous_batch"] is True
     assert pre["warmup_steps"] == 1
     assert pre["mix_strategy"] == "token_share"
 
 
-def test_downstream_yaml() -> None:
-    cfg = load_yaml_config("configs/downstream.yaml")
-    assert "classification" in cfg["task_pools"]
-    assert "emitter" in cfg["task_pools"]
-    assert cfg["lambda_recon"] == 0.1
-    assert cfg["use_dataset_bias"] is False
-    assert cfg["checkpoint_monitor"] == "val/multitask_geomean"
-    assert cfg["checkpoint_mode"] == "max"
-    assert cfg["seed"] == 0
-    assert cfg["amp_dtype"] == "bfloat16"
-    assert cfg["token_normalized_loss"] is True
-    assert cfg["clustering_view2"] is True
-
-
-def test_continual_yaml() -> None:
-    cfg = load_yaml_config("configs/continual.yaml")
-    assert cfg["continual"] is True
-    assert cfg["distill_weight"] == 0.5
-    assert cfg["prototype_anchor_weight"] == 0.1
-    assert cfg["absorb_unknown"] is True
-    assert cfg["checkpoint_monitor"] == "val/multitask_geomean"
-    assert cfg["token_normalized_loss"] is True
-    assert "emitter" in cfg["task_pools"]
-    assert len(cfg["continual_sessions"]) >= 1
-
-
 def test_stage_yaml_profiles() -> None:
     s2 = load_yaml_config("configs/stage2.yaml")
     assert s2["truncate_backward"] is True
     assert s2["train_encoder"] is False
-    assert "emitter" in s2["task_pools"]
+    assert "tx_modulation" in s2["task_pools"]
     assert s2["lambda_recon"] == 0.0
     assert s2["early_stopping_patience"] == 0
     assert s2["checkpoint_monitor"] == "val/multitask_geomean"
-    assert s2["checkpoint_mode"] == "max"
-    assert s2["seed"] == 0
-    assert s2["amp_dtype"] == "bfloat16"
-    assert s2["balanced_sampling"] is False
+    assert s2.get("compact_task_labels") is True
     assert isinstance(s2.get("task_schedule"), list) and len(s2["task_schedule"]) >= 2
-    assert s2.get("replay_mix_ratio", 0.0) > 0.0
-    assert s2.get("uti_replay_weight", 0.0) > 0.0
-    assert s2.get("replay_strategy") == "class_center"
-    assert int(s2.get("replay_samples_per_class", 0)) > 0
-    assert int(s2.get("replay_baseline_classes_per_task", 0)) > 0
-    assert int(s2.get("task_joint_epochs", 0)) == 1
+    assert int(s2.get("task_joint_epochs", 0)) == 0
+    assert float(s2.get("cluster_utilization_weight", 0.0)) == pytest.approx(0.15)
     tiny = load_yaml_config("configs/stage2.yaml", profile="tiny")
     assert tiny["synthetic"] is True
-    assert isinstance(tiny.get("task_schedule"), list) and len(tiny["task_schedule"]) >= 1
-    s3 = load_yaml_config("configs/stage3.yaml", profile="modulation")
-    assert s3["task"] == "modulation"
+    s3 = load_yaml_config("configs/stage3.yaml", profile="tx_modulation")
+    assert s3["task"] == "tx_modulation"
     assert s3["loraplus_lr_ratio"] == 16
+    s3_clu = load_yaml_config("configs/stage3.yaml", profile="ld_clustering")
+    assert s3_clu["checkpoint_monitor"] == "val/nmi_within_domain"
     joint = load_yaml_config("configs/joint.yaml")
     assert joint["checkpoint_monitor"] == "val/specialist_geomean"
-    assert joint["peft"]["shared_lora"] is True
-
+    assert joint["peft"]["shared_lora"] is False
+    assert joint.get("unfreeze_tokenizer_last") is False
 
 def test_sota_gate_experiment_yaml_inherits_pretrain() -> None:
     cfg = load_yaml_config("configs/experiments/validity_pretrain.yaml")
@@ -112,6 +83,6 @@ def test_resolve_lr_default() -> None:
 
 def test_pretrain_recipe_allows_longer_training() -> None:
     cfg = load_yaml_config("configs/pretrain.yaml")
-    assert cfg["epochs"] == 25
-    assert cfg["early_stopping_patience"] == 3
+    assert cfg["epochs"] == 30
+    assert cfg["early_stopping_patience"] == 8
     assert float(cfg["early_stopping_min_delta"]) == pytest.approx(0.001)

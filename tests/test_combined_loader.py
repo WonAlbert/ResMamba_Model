@@ -182,13 +182,13 @@ def test_stage2_val_loader_stamps_source_and_task() -> None:
         stage="stage2",
     )
     dm.setup()
-    assert "emitter" in dm._val_sets
+    assert "ld_model" in dm._val_sets
     loaders = dm._loaders(dm._val_sets, train=False)
-    batch = next(iter(loaders["emitter"]))
-    assert batch["source_name"][0] == "emitter"
-    assert batch["task"] == "emitter"
-    cls_batch = next(iter(loaders["classification"]))
-    assert cls_batch["task"] == "modulation"
+    batch = next(iter(loaders["ld_model"]))
+    assert batch["source_name"][0] == "ld_model"
+    assert batch["task"] == "ld_model"
+    cls_batch = next(iter(loaders["tx_modulation"]))
+    assert cls_batch["task"] == "tx_modulation"
     assert "canonical_mod_label_id" in cls_batch
     assert "global_emitter_id" in cls_batch
     assert dm.val_source_names == list(dm._val_sets)

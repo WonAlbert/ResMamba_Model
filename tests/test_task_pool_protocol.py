@@ -40,7 +40,7 @@ def test_finalize_task_pools_maps_train_test_val(tmp_path: Path) -> None:
     h5 = tmp_path / "h5"
     h5.mkdir()
     mod_labels = np.array([0, 1, 0, 1, 0, 1], dtype=np.int32)
-    emitter_labels = np.array([0, 1, 2, 0, 1, 2], dtype=np.int32)
+    radar_labels = np.array([0, 1, 2, 0, 1, 2], dtype=np.int32)
     for split, value in (("train", 1.0), ("val", 2.0), ("test", 3.0)):
         _write_h5(
             h5 / f"rml2016_04c_{split}.h5",
@@ -52,12 +52,12 @@ def test_finalize_task_pools_maps_train_test_val(tmp_path: Path) -> None:
             value=value,
         )
         _write_h5(
-            h5 / f"wisig_{split}.h5",
+            h5 / f"radar_mod15_{split}.h5",
             n=6,
-            task_id=1,
-            dataset_id=11,
-            field="emitter_id",
-            labels=emitter_labels,
+            task_id=0,
+            dataset_id=10,
+            field="mod_label_id",
+            labels=radar_labels,
             value=value,
         )
         _write_h5(
@@ -82,17 +82,19 @@ def test_finalize_task_pools_maps_train_test_val(tmp_path: Path) -> None:
     finalize_task_pools(ctx)
     pools = ctx.maps["task_pools"]
     assert "rml2016_04c_train.h5" in pools["pretrain_train"]
-    assert "wisig_train.h5" in pools["pretrain_train"]
-    assert "electromagnetic_0926_train.h5" in pools["pretrain_train"]
+    assert "radar_mod15_train.h5" in pools["pretrain_train"]
+    assert "electromagnetic_0926_train.h5" not in pools["pretrain_train"]
     assert "communication_emitters_train.h5" not in pools["pretrain_train"]
+    assert pools["downstream_comm_modulation_train"] == ["rml2016_04c_test.h5"]
+    assert pools["downstream_comm_modulation_val"] == ["rml2016_04c_val.h5"]
+    assert pools["downstream_radar_model_train"] == ["radar_mod15_test.h5"]
+    assert pools["downstream_radar_model_val"] == ["radar_mod15_val.h5"]
     assert pools["downstream_modulation_train"] == ["rml2016_04c_test.h5"]
-    assert pools["downstream_modulation_val"] == ["rml2016_04c_val.h5"]
-    assert pools["downstream_emitter_train"] == ["wisig_test.h5"]
-    assert pools["downstream_emitter_val"] == ["wisig_val.h5"]
-    assert "rml2016_04c_train.h5" not in pools["downstream_modulation_train"]
-    assert "wisig_train.h5" not in pools["downstream_emitter_train"]
-    assert "rml2016_04c_test.h5" in pools["clustering_train"]
-    assert "wisig_val.h5" in pools["clustering_val"]
+    assert pools["downstream_emitter_train"] == []
+    assert "rml2016_04c_train.h5" not in pools["downstream_comm_modulation_train"]
+    assert "radar_mod15_train.h5" not in pools["downstream_radar_model_train"]
+    assert "rml2016_04c_test.h5" in pools["clustering_comm_train"]
+    assert "radar_mod15_val.h5" in pools["clustering_radar_val"]
 
 
 def test_ensure_missing_test_splits_carves_only_missing(tmp_path: Path) -> None:
@@ -100,7 +102,7 @@ def test_ensure_missing_test_splits_carves_only_missing(tmp_path: Path) -> None:
     h5.mkdir()
     labels = np.array([0, 0, 0, 0, 0, 1, 1, 1, 1, 1], dtype=np.int32)
     _write_h5(
-        h5 / "open_real_data_train.h5",
+        h5 / "radar_mod15_train.h5",
         n=10,
         task_id=0,
         dataset_id=10,
@@ -108,7 +110,7 @@ def test_ensure_missing_test_splits_carves_only_missing(tmp_path: Path) -> None:
         labels=labels,
     )
     _write_h5(
-        h5 / "open_real_data_val.h5",
+        h5 / "radar_mod15_val.h5",
         n=4,
         task_id=0,
         dataset_id=10,
@@ -142,17 +144,17 @@ def test_ensure_missing_test_splits_carves_only_missing(tmp_path: Path) -> None:
         labels=np.array([10, 11, 12], dtype=np.int32),
         value=3.0,
     )
-    val_before = (h5 / "open_real_data_val.h5").read_bytes()
+    val_before = (h5 / "radar_mod15_val.h5").read_bytes()
     wisig_test_before = (h5 / "wisig_test.h5").read_bytes()
     ctx = Context(tmp_path)
     stats = ensure_missing_test_splits(ctx, seed=20260822, frac=0.2)
-    assert "open_real_data" in stats
+    assert "radar_mod15" in stats
     assert "wisig" not in stats
-    assert (h5 / "open_real_data_test.h5").is_file()
-    assert (h5 / "open_real_data_val.h5").read_bytes() == val_before
+    assert (h5 / "radar_mod15_test.h5").is_file()
+    assert (h5 / "radar_mod15_val.h5").read_bytes() == val_before
     assert (h5 / "wisig_test.h5").read_bytes() == wisig_test_before
-    with h5py.File(h5 / "open_real_data_train.h5", "r") as train, h5py.File(
-        h5 / "open_real_data_test.h5", "r"
+    with h5py.File(h5 / "radar_mod15_train.h5", "r") as train, h5py.File(
+        h5 / "radar_mod15_test.h5", "r"
     ) as test:
         n_train = int(train["iq"].shape[0])
         n_test = int(test["iq"].shape[0])

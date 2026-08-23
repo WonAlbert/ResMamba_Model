@@ -78,21 +78,21 @@ def test_datamodule_replay_subset_limits_train_indices() -> None:
         "val_batches": 1,
         "num_workers": 0,
         "patch_size": 8,
-        "tasks": ["modulation", "emitter"],
+        "tasks": ["tx_modulation", "ld_model"],
         "task_pools": {
-            "classification": ["a", "b"],
-            "emitter": ["c", "d"],
+            "tx_modulation": ["a", "b"],
+            "ld_model": ["c", "d"],
         },
         "replay_strategy": "class_center",
         "min_ratio": 0.05,
     }
     dm = SignalDataModule(cfg, stage="stage2")
     dm.setup()
-    dm.set_active_train_filter(["emitter"], replay_sources=["classification"])
-    dm.update_replay_memory({"classification": [1, 3, 5]})
-    dataset, lengths = dm._train_dataset_and_lengths("classification", dm._train_sets["classification"], train=True)
+    dm.set_active_train_filter(["ld_model"], replay_sources=["tx_modulation"])
+    dm.update_replay_memory({"tx_modulation": [1, 3, 5]})
+    dataset, lengths = dm._train_dataset_and_lengths("tx_modulation", dm._train_sets["tx_modulation"], train=True)
     assert isinstance(dataset, Subset)
-    assert list(lengths) == [dm._train_lengths["classification"][i] for i in (1, 3, 5)]
-    full, full_lengths = dm._train_dataset_and_lengths("emitter", dm._train_sets["emitter"], train=True)
-    assert full is dm._train_sets["emitter"]
-    assert full_lengths == dm._train_lengths["emitter"]
+    assert list(lengths) == [dm._train_lengths["tx_modulation"][i] for i in (1, 3, 5)]
+    full, full_lengths = dm._train_dataset_and_lengths("ld_model", dm._train_sets["ld_model"], train=True)
+    assert full is dm._train_sets["ld_model"]
+    assert full_lengths == dm._train_lengths["ld_model"]

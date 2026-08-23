@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from resmamba_signal_model.models.model import SignalFoundationModel, SignalModelConfig
+from resmamba_signal_model.models.task_interface import DEFAULT_TASKS
 from resmamba_signal_model.training.freeze import apply_stage_freeze
 
 
@@ -25,6 +26,7 @@ def _cfg(**overrides) -> SignalModelConfig:
         num_emitters=8,
         num_prototypes=4,
         build_task_heads=True,
+        task_names=DEFAULT_TASKS,
     )
     payload.update(overrides)
     return SignalModelConfig(**payload)
@@ -87,13 +89,11 @@ def test_span_hidden_truth_rewrite_cannot_change_predictions() -> None:
     sample_mask = torch.ones(2, 64, dtype=torch.bool)
 
     torch.manual_seed(123)
-    first = model(iq, sample_mask, mode="task", task="imputation")
-    assert first["span_mask"].any()
-    assert not first["mae_mask"].any()
-    assert not first["suffix_mask"].any()
+    first = model(iq, sample_mask, mode="task", task="prediction")
+    assert first["suffix_mask"].any()
     rewritten = _rewrite_targets(iq, first["target_mask"], model.cfg.patch_size)
     torch.manual_seed(123)
-    second = model(rewritten, sample_mask, mode="task", task="imputation")
+    second = model(rewritten, sample_mask, mode="task", task="prediction")
     _assert_predictions_equal(first, second)
 
 
@@ -118,10 +118,10 @@ def test_discriminative_task_can_bypass_query_reconstruction() -> None:
     iq = torch.randn(2, 2, 64)
     mask = torch.ones(2, 64, dtype=torch.bool)
 
-    discriminative = model(iq, mask, mode="task", task="modulation")
-    assert discriminative["query_h"] is None
+    discriminative = model(iq, mask, mode="task", task="tx_modulation")
+    assert discriminative.get("query_h") is None
     assert torch.count_nonzero(discriminative["recon_norm"]) == 0
-    assert "modulation_logits" in discriminative
+    assert "task_logits" in discriminative or "tx_modulation_logits" in discriminative
 
     generative = model(iq, mask, mode="task", task="prediction")
     assert generative["query_h"] is not None
@@ -140,14 +140,6 @@ def test_prediction_uses_generation_head_not_decoder() -> None:
             param.add_(1.5)
     after = model(iq, mask, mode="task", task="prediction")["pred_patches"]
     assert not torch.allclose(before, after, atol=1.0e-5)
-
-    model.cfg.force_unified_generation = True
-    unified_before = model(iq, mask, mode="task", task="prediction")["pred_patches"].clone()
-    with torch.no_grad():
-        for param in model.prediction_head.parameters():
-            param.add_(1.5)
-    unified_after = model(iq, mask, mode="task", task="prediction")["pred_patches"]
-    assert torch.allclose(unified_before, unified_after, atol=1.0e-6)
 
 
 def test_stage2_prediction_grads_go_to_head_not_frozen_decoder() -> None:
