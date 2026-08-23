@@ -41,7 +41,6 @@ replay_baseline_classes_per_task: 11
 replay_memory_total_exemplars: 0
 replay_scan_max_samples: 4096
 replay_scan_token_budget: 2048
-uti_replay_weight: 0.0
 absorb_unknown: false
 lambda_recon: 0.0
 z_probe_weight: 0.5

@@ -4,7 +4,7 @@
 
 ## 项目一句话
 
-任务无关的射频 I/Q 基础模型：联合能量 RevIN（`joint_energy`）→ 内容路由 MoE Tokenizer/Encoder → Encoder（`z_enc`）→ SharedDecoder（预训练 MAE）→ 下游六任务独立头（`z_enc` → TaskAdapter → head）。主类：`SignalFoundationModel` / `SignalModelConfig`（包名 `resmamba_signal_model`）。
+任务无关的射频 I/Q 基础模型：联合能量 RevIN（`joint_energy`）→ task/family 硬路由 MoE Tokenizer/Encoder → Encoder（`z_enc`）→ SharedDecoder（预训练 MAE）→ 下游六任务独立头（`z_enc` → TaskAdapter → head）。主类：`SignalFoundationModel` / `SignalModelConfig`（包名 `resmamba_signal_model`）。
 
 下游六任务：`ld_intrapulse` / `ld_model` / `tx_modulation` / `ld_clustering` / `tx_clustering` / `prediction`。
 
@@ -38,7 +38,7 @@ pytest -q
 
 | 阶段 | 命令要点 | 冻结策略 |
 |------|----------|----------|
-| 一 预训练 | `--stage pretrain --config configs/pretrain.yaml` | 全量训练骨干 + MoE 负载均衡 |
+| 一 预训练 | `--stage pretrain --config configs/pretrain.yaml` | 全量训练骨干；`build_task_interface=false`（无 UTI） |
 | 二 LP 探测 | `--stage stage2 --config configs/stage2.yaml --init-from <pretrain>/ckpts/best.ckpt` | 冻结骨干；只训**当前任务头**（+ 可选 `z_enc` 线性探针）；截断反传 |
 | 三 单任务适配 | `--stage stage3 --task <name> --config configs/stage3.yaml --init-from <stage2>/best.ckpt` | 该任务 Hybrid-LoRA+ + TaskAdapter + 头 |
 | 三 联合 | `--stage joint --config configs/joint.yaml` + `--adapter-dir` | 各任务 LoRA/Adapter/头 + **仅** `SharedTaskAdapter` |
@@ -81,15 +81,15 @@ pytest -q
 
 - **Encoder**：`M-M-M-M-M-T`；预训练 `encode_visible_only`（MAE）；可见 token **GatingPool**（默认；`encoder_pool_type: attn_pool` 可切回 AttnPool）→ **`z_enc` / `h_enc`**（分类身份；`z_general`/`z` 别名指向此处；默认 L2 归一化；复用 MAE encode，不二次全序列）；无 mask / 下游 encode 时对全有效 patch 池化；超长序列 chunk 均值记忆 + RoPE。
 - **Decoder**：恰好 1 层 `DecoderBlock`；token 通路重建；`[DEC]` + AttnPool → **`z_recon`**（重建/物理 readout，不作分类身份）。
-- **下游**：冻结 `z_enc` → 可选 TaskAdapter → 任务私有头；**不**经共享 UTI。联合阶段仅新增 `SharedTaskAdapter`（不解冻 tokenizer 尾部 / 无 `shared_lora`）。
-- **UTI**：仅预训练 `view_div` 等；下游路径禁用。
-- **Tokenizer**：共享 stem + 多尺度时域 + 复数双侧频谱分带（`fft` + `fftshift` 后再均分）；无 dataset/task token。
+- **下游**：冻结 `z_enc` → 可选 TaskAdapter → 任务私有头；**不**构建 / 不经过 UTI（`train.py` 设 `build_task_interface=false`）。联合阶段仅新增 `SharedTaskAdapter`（不解冻 tokenizer 尾部 / 无 `shared_lora`）。
+- **MoE**：三路专家（`ld_intrapulse` / `ld_model` / `tx_modulation`）；预训练按 H5 stem、下游按 task 名硬路由（非内容 gate）。
+- **Tokenizer**：共享 stem + 三路专家分支 + 复数双侧频谱分带；无 dataset/task token。
 - **归一化**：模型内 `revin_scale_mode: joint_energy`（I/Q 共享 Winsorized RMS；`amp_aux` 旁路绝对功率进 Decoder FiLM / 物理读出，不进 `z_enc`）。Loader 保持 `iq_normalize: none`。
 - **物理约束**：patch 级 log_power / PAPR / IQ 相关 / 方差比 / 谱质心（`fftfreq`）；绝对 `log_power` 由 `log_power_rel + log_scale` 还原。软约束 SmoothL1 + 硬约束能量投影。分类在归一化表征空间，重建在 RevIN denorm 后。
-- **变长**：`sequence_packing=true`；预训练 `HomogeneousTokenBudgetSampler`（每 batch 单一 H5）+ `combine_then_pack: false`；`TokenBudgetSampler` 用于其它阶段；`L < 16` 报错；`L > 8192` 重叠切块。
-- **多域**：Domain GRL **只**约束 UTI 声明不变的低秩视图（默认 `semantic`），梯度不进入 `z_enc`；预训练默认关闭 domain 损失。跨域对比学习仅在下游标签可对齐时启用（如调制 contrastive），预训练无 InfoNCE。
+- **变长**：`sequence_packing=true`；全阶段 `HomogeneousTokenBudgetSampler`（每 batch 单一 H5）+ `combine_then_pack: false`；`L < 16` 报错；`L > 8192` 重叠切块。
+- **多域**：预训练 `domain: 0`（`build_task_interface=false`，无 UTI / GRL 路径）。下游可选 `z_contrastive` 等同任务对比，预训练无 InfoNCE。
 
-预训练损失（默认权重见 `configs/pretrain.yaml`）：`L_mae + λ_phys + λ_moe + …`（`view_div` / `uti_*` 默认关闭）。族配额 Homogeneous 采样见 `source_groups` / `family_quotas`。
+预训练损失（见 `configs/pretrain.yaml`）：`L_mae + λ_phys + λ_structure + λ_vicreg(z_enc) + λ_vicreg_token(h_enc)` 等；`view_div` / `uti_*` / `moe` 权重为 0。族配额采样见 `source_groups` / `family_quotas`。
 
 ## 配置索引
 
@@ -101,10 +101,8 @@ pytest -q
 | `configs/stage2.yaml` | 冻结骨干 LP 探测 |
 | `configs/stage3.yaml` | 单任务 Hybrid-LoRA+ |
 | `configs/joint.yaml` | 联合 PEFT |
-| `configs/downstream.yaml` | 旧下游入口 |
 | `configs/datasets.yaml` | 数据池白名单 |
 | `configs/val_subset.yaml` | 验证子集 |
-| `configs/experiments/` | 消融 / 门控实验 overlay |
 
 ## 代码树（源码与配置；不含 dataset / runs）
 
@@ -125,8 +123,7 @@ ResMamba_Signal_Model/
 │   ├── downstream.yaml
 │   ├── continual.yaml
 │   ├── datasets.yaml
-│   ├── val_subset.yaml
-│   └── experiments/          # 消融、validity、eval、overlays
+│   └── val_subset.yaml
 ├── docs/
 │   ├── RESEARCH_REPORT.md
 │   └── sota_gate.md
