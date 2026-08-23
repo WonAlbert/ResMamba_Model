@@ -1,9 +1,8 @@
-# 阶段三 3a：单任务 Hybrid-LoRA+ + TaskAdapter + 该任务头
+# 阶段三：单任务 Hybrid-LoRA+ + TaskAdapter + 该任务头
 model_config: configs/model.yaml
 rfdata_root: /root/autodl-tmp/ResMamba_Signal_Model/dataset
 iq_normalize: none
 sequence_packing: true
-# 当前 stage2 best 仍为 AttnPool；与 init-from 对齐，避免冻结的随机 GatingPool
 encoder_pool_type: attn_pool
 model:
   encoder_pool_type: attn_pool
@@ -35,14 +34,11 @@ lr_schedule: warmup_cosine
 lr_min_ratio: 0.1
 token_normalized_loss: true
 lambda_recon: 0.0
-modulation_contrastive_weight: 0.25
-emitter_contrastive_weight: 0.25
 use_dataset_bias: false
 train_encoder: false
 train_decoder: false
 train_heads: true
 skip_recon: true
-# 与阶段二一致：调制/个体用下游紧凑标签（非全库命名空间）
 compact_task_labels: true
 loraplus_lr_ratio: 16
 r_attn: 16
@@ -62,17 +58,19 @@ loss_weights:
   physical: 0.0
   domain: 0.0
 tasks:
-  - modulation
-  - emitter
-  - clustering
+  - ld_intrapulse
+  - ld_model
+  - tx_modulation
+  - ld_clustering
+  - tx_clustering
   - prediction
-  - imputation
 task_pools:
-  classification: [downstream_modulation_train, downstream_modulation_val]
-  emitter: [downstream_emitter_train, downstream_emitter_val]
-  clustering: [clustering_train, clustering_val]
-  prediction: [downstream_prediction_train, downstream_prediction_val]
-  imputation: [downstream_prediction_train, downstream_prediction_val]
+  ld_intrapulse: [downstream_radar_modulation_train, downstream_radar_modulation_val]
+  ld_model: [downstream_radar_model_train, downstream_radar_model_val]
+  tx_modulation: [downstream_comm_modulation_train, downstream_comm_modulation_val]
+  ld_clustering: [clustering_radar_train, clustering_radar_val]
+  tx_clustering: [clustering_comm_train, clustering_comm_val]
+  prediction: [prediction_train, prediction_val]
 profiles:
   tiny:
     model_config: configs/model_tiny.yaml
@@ -97,69 +95,27 @@ profiles:
       loraplus_lr_ratio: 16
     require_mamba_kernel: false
     compact_task_labels: false
-  modulation:
-    task: modulation
-    checkpoint_monitor: val/f1_modulation
+  ld_intrapulse:
+    task: ld_intrapulse
+    checkpoint_monitor: val/f1_ld_intrapulse
     checkpoint_mode: max
-    task_pools:
-      classification: [downstream_modulation_train, downstream_modulation_val]
-  radar_modulation:
-    task: modulation
-    checkpoint_monitor: val/f1_modulation
+  ld_model:
+    task: ld_model
+    checkpoint_monitor: val/acc_ld_model
     checkpoint_mode: max
-    compact_task_labels: true
-    modulation_downstream_datasets: [radchar]
-    tasks:
-      - modulation
-    task_pools:
-      classification: [downstream_radar_modulation_train, downstream_radar_modulation_val]
-  emitter:
-    task: emitter
-    checkpoint_monitor: val/acc_emitter
+  tx_modulation:
+    task: tx_modulation
+    checkpoint_monitor: val/f1_tx_modulation
     checkpoint_mode: max
-    # 与 stage2 compact=250 对齐（adsb2=0..99, wisig=100..249）；勿开全库 440
-    compact_task_labels: true
-    encoder_pool_type: attn_pool
-    model:
-      encoder_pool_type: attn_pool
-    # 个体 250 类 + 冻结 z_enc 天花板低：放开 stage2 已训 UTI/AttnPool，加大 LoRA 与步数
-    learning_rate: 5.0e-4
-    heads_lr: 2.0e-4
-    warmup_steps: 100
-    epochs: 30
-    steps_per_epoch: 200
-    token_budget: 8192
-    early_stopping_patience: 5
-    train_task_interface: true
-    train_encoder_pool: true
-    z_probe_weight: 0.25
-    emitter_contrastive_weight: 0.5
-    r_attn: 32
-    r_mamba: 16
-    lora_alpha_attn: 32
-    lora_alpha_mamba: 16
-    peft:
-      r_attn: 32
-      r_mamba: 16
-      lora_alpha_attn: 32
-      lora_alpha_mamba: 16
-    task_pools:
-      emitter: [downstream_emitter_train, downstream_emitter_val]
-  clustering:
-    task: clustering
+  ld_clustering:
+    task: ld_clustering
     checkpoint_monitor: val/nmi_within_domain
     checkpoint_mode: max
-    task_pools:
-      clustering: [clustering_train, clustering_val]
+  tx_clustering:
+    task: tx_clustering
+    checkpoint_monitor: val/nmi_within_domain
+    checkpoint_mode: max
   prediction:
     task: prediction
     checkpoint_monitor: val/mse_prediction
     checkpoint_mode: min
-    task_pools:
-      prediction: [downstream_prediction_train, downstream_prediction_val]
-  imputation:
-    task: imputation
-    checkpoint_monitor: val/mse_imputation
-    checkpoint_mode: min
-    task_pools:
-      imputation: [downstream_prediction_train, downstream_prediction_val]

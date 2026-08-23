@@ -117,11 +117,15 @@ def pretrain_collate_firewall(batch: dict[str, Any]) -> dict[str, Any]:
 
 # 训练 sampler 不得使用 global_label_id（仅 val 聚类指标）。
 TRAIN_SAMPLER_LABEL_FIELDS: dict[str, tuple[str, ...]] = {
-    "modulation": ("canonical_mod_label_id", "mod_label_id"),
+    "ld_intrapulse": ("canonical_mod_label_id", "mod_label_id"),
+    "ld_model": ("global_emitter_id", "emitter_id"),
+    "tx_modulation": ("canonical_mod_label_id", "mod_label_id"),
+    "ld_clustering": ("dataset_id",),
+    "tx_clustering": ("dataset_id",),
+    "prediction": ("dataset_id",),
     "classification": ("canonical_mod_label_id", "mod_label_id"),
     "emitter": ("global_emitter_id", "emitter_id"),
     "clustering": ("dataset_id",),
-    "prediction": ("dataset_id",),
     "imputation": ("dataset_id",),
 }
 
@@ -177,15 +181,18 @@ class SyntheticIQDataset(Dataset):
         n_datasets: int = 4,
         seed: int = 0,
         source_id: int = 0,
+        task: str | None = None,
     ) -> None:
         self.n = int(n)
         self.lengths = tuple(int(x) for x in lengths)
         self.n_datasets = int(n_datasets)
         self.source_id = int(source_id)
+        self.task = str(task) if task else None
         g = torch.Generator().manual_seed(seed + source_id)
         self._len_idx = torch.randint(0, len(self.lengths), (self.n,), generator=g)
         self._ds = torch.randint(0, self.n_datasets, (self.n,), generator=g)
         self._mod = torch.randint(0, 8, (self.n,), generator=g)
+        self._model = torch.randint(0, 12, (self.n,), generator=g)
 
     def class_labels(self) -> list[int]:
         return [int(self._ds[i]) * 100000 + int(self._mod[i]) for i in range(self.n)]
@@ -196,26 +203,29 @@ class SyntheticIQDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, Any]:
         length = self.lengths[int(self._len_idx[idx])]
         mod_id = int(self._mod[idx])
-        emitter_id = int(self._mod[idx])
+        model_id = int(self._model[idx])
+        ds_id = int(self._ds[idx])
         iq = torch.randn(2, length)
-        return {
+        item: dict[str, Any] = {
             "iq": iq,
             "values": iq,
             "length": length,
-            "dataset_id": int(self._ds[idx]),
+            "dataset_id": ds_id,
             "task_type_id": 0,
             "mod_label_id": mod_id,
             "canonical_mod_label_id": mod_id,
-            "emitter_id": emitter_id,
-            "global_emitter_id": emitter_id,
+            "model_label_id": model_id,
+            "emitter_id": mod_id,
+            "global_emitter_id": mod_id,
             "source_label_id": -1,
-            "global_label_id": int(self._ds[idx]) * 100000 + mod_id,
+            "global_label_id": ds_id * 100000 + mod_id,
             "modality_id": "rf",
             "receiver_id": MISSING_METADATA,
             "session_id": MISSING_METADATA,
             "channel_id": MISSING_METADATA,
             "capture_id": MISSING_METADATA,
         }
+        return item
 
 
 def merge_source_batches(batches: dict[str, Any] | list[Any]) -> dict[str, Any]:
@@ -797,36 +807,31 @@ class SignalDataModule(LightningDataModule):
             if self.stage in ("stage2", "joint"):
                 default_names = [spec.source for spec in catalog.specs]
             elif self.stage == "stage3":
-                task = str(self.train_cfg.get("task") or "modulation")
+                task = str(self.train_cfg.get("task") or "ld_intrapulse")
                 spec = catalog.get(task)
                 default_names = [spec.source if spec is not None else TASK_TO_SOURCE.get(task, task)]
-            elif self.stage == "downstream":
-                default_names = [spec.source for spec in catalog.specs] or [
-                    "classification",
-                    "clustering",
-                    "prediction",
-                    "imputation",
-                ]
             else:
                 default_names = ["src_a", "src_b"]
             names = list(self.train_cfg.get("synthetic_sources") or default_names)
             self.source_names = names
             synth_seed = int(self.train_cfg.get("seed", 0))
+            source_to_task = {spec.source: spec.name for spec in catalog.specs}
             for i, name in enumerate(names):
+                task_name = source_to_task.get(name)
                 self._train_sets[name] = SyntheticIQDataset(
-                    n=64, lengths=(128, 256, 512), source_id=i, seed=synth_seed
+                    n=64, lengths=(128, 256, 512), source_id=i, seed=synth_seed, task=task_name
                 )
                 self._val_sets[name] = SyntheticIQDataset(
-                    n=16, lengths=(128, 256), source_id=100 + i, seed=synth_seed
+                    n=16, lengths=(128, 256), source_id=100 + i, seed=synth_seed, task=task_name
                 )
                 self._train_lengths[name] = [
                     int(self._train_sets[name][j]["length"]) for j in range(len(self._train_sets[name]))
                 ]
             self.mix = DynamicRatioScheduler(
-            self.source_names,
-            min_ratio=float(self.train_cfg.get("min_ratio", 0.05)),
-            value_clip=float(self.train_cfg.get("mix_value_clip", 2.0)),
-        )
+                self.source_names,
+                min_ratio=float(self.train_cfg.get("min_ratio", 0.05)),
+                value_clip=float(self.train_cfg.get("mix_value_clip", 2.0)),
+            )
             self._build_val_plans()
             return
 
@@ -855,10 +860,12 @@ class SignalDataModule(LightningDataModule):
             self._val_sets = {"pretrain": val_pool}
         else:
             task_pools = self.train_cfg.get("task_pools") or {
-                "classification": ("downstream_modulation_train", "downstream_modulation_val"),
-                "clustering": ("clustering_train", "clustering_val"),
-                "prediction": ("downstream_prediction_train", "downstream_prediction_val"),
-                "imputation": ("downstream_prediction_train", "downstream_prediction_val"),
+                "ld_intrapulse": ("downstream_radar_modulation_train", "downstream_radar_modulation_val"),
+                "ld_model": ("downstream_radar_model_train", "downstream_radar_model_val"),
+                "tx_modulation": ("downstream_comm_modulation_train", "downstream_comm_modulation_val"),
+                "ld_clustering": ("clustering_radar_train", "clustering_radar_val"),
+                "tx_clustering": ("clustering_comm_train", "clustering_comm_val"),
+                "prediction": ("prediction_train", "prediction_val"),
             }
             catalog = resolve_task_catalog(self.train_cfg)
             if self.stage == "stage3":
@@ -867,7 +874,7 @@ class SignalDataModule(LightningDataModule):
                 keep = spec.source if spec is not None else TASK_TO_SOURCE.get(task, task)
                 if keep and keep in task_pools:
                     task_pools = {keep: task_pools[keep]}
-            elif self.stage in ("stage2", "downstream", "joint") and not self.train_cfg.get("task_schedule"):
+            elif self.stage in ("stage2", "joint") and not self.train_cfg.get("task_schedule"):
                 # 无 task_schedule 时，``tasks:`` / ``--tasks`` 只加载对应源，避免名存实亡的混训。
                 keep_sources = {spec.source for spec in catalog.specs}
                 if keep_sources:
@@ -938,9 +945,12 @@ class SignalDataModule(LightningDataModule):
                 seed = self.val_seed
                 sampler = None
             task_name = self._task_for_loader_name(name)
+            task_kind = None
+            if task_name and task_name in resolve_task_catalog(self.train_cfg).by_name:
+                task_kind = resolve_task_catalog(self.train_cfg).kind(task_name)
             attach_view2 = bool(
                 train
-                and task_name == "clustering"
+                and task_kind == "clustering"
                 and bool(self.train_cfg.get("clustering_view2", True))
             )
             pin_memory = self.pin_memory and not (workers > 0 and persistent)

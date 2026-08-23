@@ -13,14 +13,11 @@ from resmamba_signal_model.models.backbone import HybridEncoder
 from resmamba_signal_model.models.decoder import AttentionPooling, SharedDecoder, build_sequence_pool
 from resmamba_signal_model.models.domain import DomainDiscriminator, GradientReversal
 from resmamba_signal_model.models.heads import (
-    EmitterHead,
-    ImputationHead,
-    ModulationHead,
+    ClassificationHead,
     PredictionHead,
     PrototypeClusteringHead,
-    RecognitionHeads,
     TASK_HEAD_REGISTRY,
-    apply_emitter_dataset_mask,
+    apply_dataset_class_mask,
     remap_task_head_checkpoints,
     register_task as register_task_head,
 )
@@ -31,6 +28,7 @@ from resmamba_signal_model.models.revin import RevIN, RevINStats, clip_normalize
 from resmamba_signal_model.models.signal_adapter import SignalAdapterRegistry, SignalSpec
 from resmamba_signal_model.models.task_interface import (
     DEFAULT_TASKS,
+    TaskFeatures,
     TaskSpec,
     UniversalTaskInterface,
     default_task_spec,
@@ -280,12 +278,12 @@ class SignalFoundationModel(nn.Module):
         self.task_interface: UniversalTaskInterface | None = None
         self.task_adapters: nn.ModuleDict | None = None
         self.shared_adapter: SharedTaskAdapter | None = None
-        self.modulation_head: ModulationHead | None = None
-        self.emitter_head: EmitterHead | None = None
-        self.clustering_head: PrototypeClusteringHead | None = None
+        self.ld_intrapulse_head: ClassificationHead | None = None
+        self.ld_model_head: ClassificationHead | None = None
+        self.tx_modulation_head: ClassificationHead | None = None
+        self.ld_clustering_head: PrototypeClusteringHead | None = None
+        self.tx_clustering_head: PrototypeClusteringHead | None = None
         self.prediction_head: PredictionHead | None = None
-        self.imputation_head: ImputationHead | None = None
-        self.recognition_heads: RecognitionHeads | None = None
         self.extra_task_heads = nn.ModuleDict()
         self.z_linear_probes = nn.ModuleDict()
         self.prototype_registry: PrototypeRegistry | None = None
@@ -296,8 +294,7 @@ class SignalFoundationModel(nn.Module):
         self._active_task: str | None = None
         self._negcos_temperature: float | None = None
         task_names = tuple(cfg.task_names) or DEFAULT_TASKS
-        need_uti = bool(cfg.build_task_heads or cfg.build_task_interface)
-        if need_uti:
+        if cfg.build_task_interface:
             task_specs: dict[str, TaskSpec | dict[str, Any]] = {}
             for name in task_names:
                 if name in cfg.task_specs:
@@ -317,13 +314,12 @@ class SignalFoundationModel(nn.Module):
                 domain_prompt_size=int(getattr(cfg, "domain_prompt_size", 6) or 6),
                 num_datasets=max(int(cfg.num_datasets), 2),
             )
-            if cfg.build_task_heads:
-                for name in task_names:
-                    self._attach_task_head(name, self._make_task_head(name))
-                    kind = self.task_kind(name)
-                    if kind in ("classification", "emitter"):
-                        n_cls = int(cfg.num_emitters if kind == "emitter" else cfg.num_mod_classes)
-                        self.z_linear_probes[name] = nn.Linear(cfg.d_model, n_cls)
+        if cfg.build_task_heads:
+            for name in task_names:
+                self._attach_task_head(name, self._make_task_head(name))
+                if self.task_kind(name) == "classification":
+                    n_cls = self._num_classes_for_task(name)
+                    self.z_linear_probes[name] = nn.Linear(cfg.d_model, n_cls)
         if cfg.build_adapters:
             self.task_adapters = nn.ModuleDict(
                 {name: TaskAdapter(cfg.d_model, down_dim=cfg.adapter_down_dim) for name in task_names}
@@ -367,9 +363,14 @@ class SignalFoundationModel(nn.Module):
         if self.prototype_registry is not None:
             for param in self.prototype_registry.parameters():
                 param.requires_grad = train_heads
-        if self.recognition_heads is not None:
-            for param in self.recognition_heads.parameters():
-                param.requires_grad = train_heads
+
+    def _num_classes_for_task(self, name: str) -> int:
+        kinds = getattr(self.cfg, "task_kinds", None) or {}
+        if name == "ld_model":
+            return int(getattr(self.cfg, "num_ld_model_classes", None) or self.cfg.num_emitters)
+        if name in ("ld_intrapulse", "tx_modulation") or kinds.get(name) == "classification":
+            return int(self.cfg.num_mod_classes)
+        return int(self.cfg.num_mod_classes)
 
     def sample_mae_mask_strategy(self) -> str:
         probs = dict(getattr(self.cfg, "mae_mask_probs", None) or {})
@@ -386,10 +387,10 @@ class SignalFoundationModel(nn.Module):
         kinds = getattr(self.cfg, "task_kinds", None) or {}
         if name in kinds:
             return normalize_kind(kinds[name])
-        if name in ("modulation",):
-            return "classification"
-        if name in ("emitter", "clustering", "prediction", "imputation"):
-            return name
+        if name in ("ld_clustering", "tx_clustering"):
+            return "clustering"
+        if name == "prediction":
+            return "prediction"
         return "classification"
 
     def _make_task_head(self, name: str, head_cls: type[nn.Module] | None = None, **head_kwargs: Any) -> nn.Module:
@@ -397,29 +398,20 @@ class SignalFoundationModel(nn.Module):
         cls = head_cls or TASK_HEAD_REGISTRY.get(name)
         if cls is None:
             cls = {
-                "classification": ModulationHead,
-                "emitter": EmitterHead,
+                "classification": ClassificationHead,
                 "clustering": PrototypeClusteringHead,
                 "prediction": PredictionHead,
-                "imputation": ImputationHead,
             }[kind]
         kwargs = dict(head_kwargs)
         kwargs.setdefault("d_model", self.cfg.d_model)
         head_rank = bool(getattr(self.cfg, "low_rank_prototype", False))
         prototype_rank = int(getattr(self.cfg, "prototype_rank", 64) or 64)
-        if cls is ModulationHead:
-            kwargs.setdefault("num_mod_classes", self.cfg.num_mod_classes)
+        if cls is ClassificationHead:
+            kwargs.setdefault("num_classes", self._num_classes_for_task(name))
             kwargs.setdefault("dropout", self.cfg.dropout)
             kwargs.setdefault("num_datasets", self.cfg.num_datasets)
             kwargs.setdefault("use_dataset_bias", self.cfg.use_dataset_bias)
-            if name != "modulation":
-                kwargs.setdefault("logits_key", f"{name}_logits")
-            if head_rank:
-                kwargs.setdefault("low_rank_prototype", True)
-                kwargs.setdefault("prototype_rank", prototype_rank)
-        elif cls is EmitterHead:
-            kwargs.setdefault("num_emitters", self.cfg.num_emitters)
-            kwargs.setdefault("dropout", self.cfg.dropout)
+            kwargs.setdefault("logits_key", f"{name}_logits")
             if head_rank:
                 kwargs.setdefault("low_rank_prototype", True)
                 kwargs.setdefault("prototype_rank", prototype_rank)
@@ -431,7 +423,10 @@ class SignalFoundationModel(nn.Module):
             if head_rank:
                 kwargs.setdefault("low_rank_prototype", True)
                 kwargs.setdefault("prototype_rank", prototype_rank)
-        elif cls in (PredictionHead, ImputationHead):
+            head = cls(**kwargs)
+            head.namespace = "tx_clustering" if name == "tx_clustering" else "ld_clustering"
+            return head
+        elif cls in (PredictionHead,):
             kwargs.setdefault("patch_size", self.cfg.patch_size)
             kwargs.setdefault("dropout", self.cfg.dropout)
             if head_rank:
@@ -449,7 +444,7 @@ class SignalFoundationModel(nn.Module):
 
     def iter_task_heads(self) -> list[nn.Module]:
         heads: list[nn.Module] = []
-        for attr in ("modulation_head", "emitter_head", "clustering_head", "prediction_head", "imputation_head"):
+        for attr in BUILTIN_HEAD_ATTR.values():
             module = getattr(self, attr, None)
             if isinstance(module, nn.Module):
                 heads.append(module)
@@ -473,17 +468,15 @@ class SignalFoundationModel(nn.Module):
         **head_kwargs: Any,
     ) -> nn.Module:
         """冻结骨干时只训 UTI 新行 + TaskAdapter + 新头。"""
-        register_task_head(name, head_cls or TASK_HEAD_REGISTRY.get(name, ModulationHead))
+        register_task_head(name, head_cls or TASK_HEAD_REGISTRY.get(name, ClassificationHead))
         if self.task_interface is None:
-            raise RuntimeError("register_task 需要 build_task_heads=True")
+            raise RuntimeError("register_task 需要 build_task_interface=True")
         kinds = dict(getattr(self.cfg, "task_kinds", None) or {})
         if name not in kinds and head_cls is not None:
             kinds[name] = {
-                ModulationHead: "classification",
-                EmitterHead: "emitter",
+                ClassificationHead: "classification",
                 PrototypeClusteringHead: "clustering",
                 PredictionHead: "prediction",
-                ImputationHead: "imputation",
             }.get(head_cls, "classification")
             self.cfg.task_kinds = kinds
         if task_spec is None:
@@ -699,8 +692,8 @@ class SignalFoundationModel(nn.Module):
         rfdata_root: str | Any = None,
         mask: torch.Tensor | None = None,
     ) -> None:
-        """个体头按数据集掩码分类，避免 ADSB 类干扰 WiSig。"""
-        head = getattr(self, "emitter_head", None)
+        """ld_model 头按数据集掩码分类（radar_mod15 / cjr_mix 类空间不同）。"""
+        head = getattr(self, "ld_model_head", None)
         if head is None or not hasattr(head, "set_dataset_class_mask"):
             return
         if mask is None:
@@ -1504,6 +1497,31 @@ class SignalFoundationModel(nn.Module):
             return True
         return not bool(getattr(self.cfg, "force_unified_generation", False))
 
+    def _downstream_features(
+        self,
+        z_enc: torch.Tensor,
+        h_enc: torch.Tensor,
+        patch_mask: torch.Tensor,
+        task: str,
+    ) -> TaskFeatures:
+        kind = self.task_kind(task)
+        readout = "token" if kind == "prediction" else "pooled"
+        features = TaskFeatures(
+            pooled=z_enc,
+            tokens=h_enc,
+            mask=patch_mask,
+            readout=readout,
+        )
+        shared = self.shared_adapter
+        if self.task_adapters is not None or shared is not None:
+            features = apply_task_adapters(
+                features,
+                task=task,
+                adapters=self.task_adapters,
+                shared=shared,
+            )
+        return features
+
     def forward_tasks(
         self,
         backbone_out: dict[str, Any],
@@ -1517,146 +1535,70 @@ class SignalFoundationModel(nn.Module):
         self.set_active_task(task)
         if bool(getattr(self, "truncate_backward", False)):
             out = self._refresh_encoder_identity(out)
-        patch_h = out.get("patch_h", out.get("h_dec"))
-        h_enc = out.get("h_enc", out.get("h_general", patch_h))
+        h_enc = out.get("h_enc", out.get("h_general", out.get("patch_h")))
         z_enc = out.get("z_enc", out.get("z_general", out.get("z")))
-        if self.task_interface is not None and h_enc is not None:
-            if h_enc.dim() == 3 and h_enc.shape[1] == out["patch_mask"].shape[1] + 1:
-                h_enc = h_enc[:, 1:]
-            if patch_h is not None and patch_h.dim() == 3 and patch_h.shape[1] == out["patch_mask"].shape[1] + 1:
-                patch_h = patch_h[:, 1:]
-            # truncate_backward：在 detach 的 h_enc 上重算视图，view_adapters / encoder_pool 可训。
-            view_mask = out.get("visible", out["patch_mask"])
-            if view_mask is not None:
-                view_mask = view_mask & out["patch_mask"]
-            else:
-                view_mask = out["patch_mask"]
-            view_pairs = self.task_interface.build_views(
-                z_enc, h_enc, patch_mask=view_mask
-            )
-            for view_name, (view_z, view_h) in view_pairs.items():
-                if view_name == "general":
-                    continue
-                out[f"z_{view_name}"] = view_z
-                out[f"h_{view_name}"] = view_h
-            n_tokens = out["patch_mask"].shape[1]
-            pos_dev = h_enc.device
-            pos_dtype = h_enc.dtype
-            pos = torch.linspace(0.0, 1.0, n_tokens, device=pos_dev, dtype=pos_dtype)
-            pos = pos.view(1, n_tokens, 1).expand(h_enc.shape[0], -1, -1)
-            target_coord = out.get("target_mask", torch.zeros_like(out["patch_mask"]))
-            query_coords = torch.cat([pos, target_coord.to(dtype=pos_dtype).unsqueeze(-1)], dim=-1)
-            task_metadata = out.get("task_metadata")
-            if dataset_id is not None:
-                if isinstance(task_metadata, dict):
-                    task_metadata = {**task_metadata, "dataset_id": dataset_id}
-                elif task_metadata is None:
-                    task_metadata = {"dataset_id": dataset_id}
-            features = self.task_interface(
-                z_enc,
-                h_enc,
-                view_mask,
-                task,
-                recon_norm=out.get("recon_norm"),
-                views=view_pairs,
-                metadata=task_metadata,
-                query_coords=query_coords,
-            )
-            features = apply_task_adapters(
-                features,
-                task=task,
-                adapters=self.task_adapters,
-                shared=self.shared_adapter,
-            )
-            out["task_pooled"] = features.pooled
-            out["task_tokens"] = features.tokens
-            out["task_query"] = features.query
-            out["task_readout"] = features.readout
-            head = self.get_task_head(task)
-            kind = self.task_kind(task)
-            unified_generation = kind in ("prediction", "imputation") and not self._should_use_generation_head(
-                kind, head
-            )
-            if unified_generation:
-                pred = out["recon_norm"]
-                out["pred_patches"] = pred
-                if kind == "prediction":
-                    out["prediction_patches"] = pred
-                else:
-                    out["imputation_patches"] = pred
-            elif head is not None:
-                if kind == "classification" or task == "modulation":
-                    out.update(head(features, dataset_id=dataset_id))
-                elif kind == "emitter" or task == "emitter":
-                    out.update(head(features, dataset_id=dataset_id))
-                elif kind == "clustering":
-                    ns = DEVICE_NAMESPACE
-                    out.update(
-                        head(
-                            features,
-                            registry=self.prototype_registry,
-                            namespace=ns,
-                            temperature=self._negcos_temperature,
-                        )
-                    )
-                elif kind == "imputation":
-                    out.update(head(features, span_mask=out.get("span_mask")))
-                else:
-                    out.update(head(features))
-                if self.prototype_registry is not None and kind in ("classification", "emitter"):
-                    pooled = out.get("task_pooled", features.pooled)
-                    logits = out.get("task_logits", out.get("modulation_logits", out.get("emitter_logits")))
-                    ns = DEVICE_NAMESPACE if kind == "emitter" or task == "emitter" else CONTENT_NAMESPACE
-                    if pooled is not None and logits is not None and pooled.shape[-1] == self.prototype_registry.dim:
-                        tau = float(self._negcos_temperature or 0.1)
-                        out.update(self.prototype_registry.score(ns, pooled, logits, temperature=tau))
-            if kind in ("prediction", "imputation") and "pred_patches" in out:
-                pred = out["pred_patches"]
-                n = min(pred.shape[1], out["patch_targets"].shape[1], out["patch_mask"].shape[1])
-                pred = pred[:, :n]
-                out["pred_patches"] = pred
-                out["recon_norm"] = pred
-                if unified_generation:
-                    continue_denorm = False
-                else:
-                    continue_denorm = True
-                stats = out.get("revin_stats")
-                length = int(out["iq_length"]) if "iq_length" in out else n * self.cfg.patch_size
-                if self.cfg.legacy_target_energy_projection:
-                    project_mask = out.get("target_mask", out["patch_mask"])[:, :n]
-                else:
-                    project_mask = out.get("visible", out["patch_mask"])[:, :n]
-                if continue_denorm and isinstance(stats, RevINStats):
-                    out["mae_pred"] = self._denorm_recon(
-                        pred,
-                        out["patch_targets"][:, :n],
-                        stats,
-                        length,
-                        project_mask,
-                    )
-                elif continue_denorm:
-                    out["mae_pred"] = pred
-        else:
-            if task in ("modulation", "emitter", "recognition") and self.recognition_heads is not None:
-                head_mode = "emitter" if task == "emitter" else "modulation"
-                out.update(self.recognition_heads(out["z"], dataset_id=dataset_id, heads=head_mode))
-            if task == "clustering" and self.clustering_head is not None:
+        patch_mask = out.get("patch_mask")
+        if h_enc is None or z_enc is None or patch_mask is None:
+            return out
+        if h_enc.dim() == 3 and h_enc.shape[1] == patch_mask.shape[1] + 1:
+            h_enc = h_enc[:, 1:]
+        features = self._downstream_features(z_enc, h_enc, patch_mask, task)
+        out["task_pooled"] = features.pooled
+        out["task_tokens"] = features.tokens
+        out["task_readout"] = features.readout
+        head = self.get_task_head(task)
+        kind = self.task_kind(task)
+        if head is not None:
+            if kind == "classification":
+                out.update(head(features, dataset_id=dataset_id))
+            elif kind == "clustering":
+                ns = CONTENT_NAMESPACE if task == "tx_clustering" else DEVICE_NAMESPACE
                 out.update(
-                    self.clustering_head(
-                        out["z"],
+                    head(
+                        features,
                         registry=self.prototype_registry,
-                        namespace=DEVICE_NAMESPACE,
+                        namespace=ns,
                         temperature=self._negcos_temperature,
                     )
                 )
-        kind = self.task_kind(task)
-        if task in self.z_linear_probes and kind in ("classification", "emitter"):
+            elif kind == "prediction":
+                out.update(head(features))
+            else:
+                out.update(head(features))
+            if self.prototype_registry is not None and kind == "classification":
+                pooled = out.get("task_pooled", features.pooled)
+                logits = out.get("task_logits")
+                ns = DEVICE_NAMESPACE if task == "ld_model" else CONTENT_NAMESPACE
+                if pooled is not None and logits is not None and pooled.shape[-1] == self.prototype_registry.dim:
+                    tau = float(self._negcos_temperature or 0.1)
+                    out.update(self.prototype_registry.score(ns, pooled, logits, temperature=tau))
+        if kind == "prediction" and "pred_patches" in out:
+            pred = out["pred_patches"]
+            n = min(pred.shape[1], out["patch_targets"].shape[1], patch_mask.shape[1])
+            pred = pred[:, :n]
+            out["pred_patches"] = pred
+            out["recon_norm"] = pred
+            stats = out.get("revin_stats")
+            length = int(out["iq_length"]) if "iq_length" in out else n * self.cfg.patch_size
+            project_mask = out.get("visible", patch_mask)[:, :n]
+            if isinstance(stats, RevINStats):
+                out["mae_pred"] = self._denorm_recon(
+                    pred,
+                    out["patch_targets"][:, :n],
+                    stats,
+                    length,
+                    project_mask,
+                )
+            else:
+                out["mae_pred"] = pred
+        if task in self.z_linear_probes and kind == "classification":
             z_feat = out.get("z_enc", out.get("z_general", out["z"]))
             z_feat = F.normalize(z_feat.float(), dim=-1).to(dtype=z_feat.dtype)
             probe = self.z_linear_probes[task](z_feat)
-            if kind == "emitter" or task == "emitter":
-                mask = getattr(self.emitter_head, "dataset_class_mask", None) if self.emitter_head is not None else None
-                probe = apply_emitter_dataset_mask(probe, dataset_id, mask)
+            head_module = self.get_task_head(task)
+            mask = getattr(head_module, "dataset_class_mask", None) if head_module is not None else None
+            if mask is not None:
+                probe = apply_dataset_class_mask(probe, dataset_id, mask)
             out["z_probe_logits"] = probe
         return out
 

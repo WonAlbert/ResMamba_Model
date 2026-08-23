@@ -8,29 +8,24 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 DEFAULT_TASKS: tuple[str, ...] = (
-    "modulation",
-    "emitter",
-    "clustering",
+    "ld_intrapulse",
+    "ld_model",
+    "tx_modulation",
+    "ld_clustering",
+    "tx_clustering",
     "prediction",
-    "imputation",
 )
 
 TASK_TO_SOURCE: dict[str, str] = {
-    "modulation": "classification",
-    "emitter": "emitter",
-    "clustering": "clustering",
+    "ld_intrapulse": "ld_intrapulse",
+    "ld_model": "ld_model",
+    "tx_modulation": "tx_modulation",
+    "ld_clustering": "ld_clustering",
+    "tx_clustering": "tx_clustering",
     "prediction": "prediction",
-    "imputation": "imputation",
 }
 
-SOURCE_TO_TASK: dict[str, str] = {
-    "classification": "modulation",
-    "clustering": "clustering",
-    "prediction": "prediction",
-    "imputation": "imputation",
-    "modulation": "modulation",
-    "emitter": "emitter",
-}
+SOURCE_TO_TASK: dict[str, str] = dict(TASK_TO_SOURCE)
 
 
 FAMILY_TO_ID = {
@@ -94,15 +89,17 @@ class TaskSpec:
 def default_task_spec(name: str, kind: str | None = None) -> TaskSpec:
     key = str(name)
     kind = str(kind or TASK_TO_SOURCE.get(key, "classification")).lower()
-    if key == "modulation":
+    if key in ("ld_intrapulse", "tx_modulation"):
         return TaskSpec(key, "classification", "pooled", "semantic", "rf", invariant_views=("semantic",))
-    if key == "emitter":
+    if key == "ld_model":
         return TaskSpec(key, "classification", "pooled", "source", "rf")
-    if key == "clustering":
-        return TaskSpec(key, "clustering", "pooled", "mixed", "rf", invariant_views=("semantic",))
+    if key in ("ld_clustering", "tx_clustering"):
+        return TaskSpec(key, "clustering", "pooled", "source", "rf")
+    if key == "prediction" or kind in ("prediction", "forecast"):
+        return TaskSpec(key, "generation", "token", "general", "rf")
     if key == "pretrain" or kind in ("pretrain", "mae"):
         return TaskSpec(key, "generation", "query", "general", "generic", invariant_views=("semantic",))
-    if kind in ("prediction", "imputation", "generation"):
+    if kind in ("imputation", "generation"):
         return TaskSpec(key, "generation", "query", "general", "rf" if key in DEFAULT_TASKS else "generic")
     if kind in ("sequence_regression", "regression"):
         return TaskSpec(key, "sequence_regression", "token", "general", "generic")

@@ -1,8 +1,4 @@
-# 阶段二：冻结骨干 + 截断反传，训 UTI + 五头，并训 z_enc（encoder 池化）线性探针
-# 主验收看 UTI 头；通用表征另报 val/acc_modulation_z / val/acc_emitter_z（encoder）
-# 生成任务走 Prediction/ImputationHead，不解冻 decoder / adapters
-# 默认按任务顺序训（每阶段独占 token_budget）；该阶段 train/val 都只跑当前任务
-# 调制/个体默认使用下游紧凑标签（仅任务池内实际类，非全库 256/440）
+# 阶段二：冻结骨干 + 截断反传，只训当前任务头（+ 可选 z_enc 线性探针）
 model_config: configs/model.yaml
 rfdata_root: /root/autodl-tmp/ResMamba_Signal_Model/dataset
 iq_normalize: none
@@ -25,7 +21,6 @@ amp_dtype: bfloat16
 epochs: 20
 checkpoint_monitor: val/multitask_geomean
 checkpoint_mode: max
-# 顺序训时关闭 early stop，避免前序任务阶段误杀后续 emitter/聚类
 early_stopping_patience: 0
 num_workers: 20
 prefetch_factor: 4
@@ -38,30 +33,20 @@ lr_min_ratio: 0.1
 token_normalized_loss: true
 clustering_view2: true
 distill_weight: 0.0
-distill_temperature: 2.0
-distill_confidence: 0.5
 prototype_anchor_weight: 0.0
-# 顺序训防遗忘：后序阶段混入前序任务 exemplar + UTI pooled 特征蒸馏
 replay_strategy: class_center
 replay_mix_ratio: 0.0
-# 单任务基线：每类 exemplar 数；总库容 = replay_samples_per_class * replay_baseline_classes_per_task
 replay_samples_per_class: 20
 replay_baseline_classes_per_task: 11
-# 0=按上式自动；>0 则固定总 exemplar 上限，随 replay 任务数增加而减少每类样本
 replay_memory_total_exemplars: 0
 replay_scan_max_samples: 4096
 replay_scan_token_budget: 2048
 uti_replay_weight: 0.0
 absorb_unknown: false
 lambda_recon: 0.0
-modulation_contrastive_weight: 0.05
-emitter_contrastive_weight: 0.05
-emitter_label_smoothing: 0.05
-# 直接拉齐 encoder 表征 z_enc：线性探针 + 对比；主验收仍看 UTI 头
 z_probe_weight: 0.5
 z_contrastive_weight: 0.1
 supervised_clustering: false
-# 抑制硬分配塌缩：提高 Sinkhorn 均摊与 utilization，让 128 个原型槽被用起来
 cluster_utilization_weight: 0.15
 cluster_balance_mix: 0.7
 cluster_sinkhorn_epsilon: 0.1
@@ -77,38 +62,33 @@ loss_weights:
   physical: 0.0
   domain: 0.0
 tasks:
-  - modulation
-  - emitter
-  - clustering
+  - ld_intrapulse
+  - ld_model
+  - tx_modulation
+  - ld_clustering
+  - tx_clustering
   - prediction
-  - imputation
-# 按任务顺序：调制 → 个体（加长）→ 聚类 → 预测 → 插补；总 epochs 由各段相加覆盖上方 epochs
 task_schedule:
-  - task: modulation
+  - task: ld_intrapulse
+    epochs: 15
+  - task: ld_model
+    epochs: 15
+  - task: tx_modulation
     epochs: 20
-  - task: emitter
-    epochs: 10
-  - task: clustering
+  - task: ld_clustering
+    epochs: 15
+  - task: tx_clustering
     epochs: 15
   - task: prediction
     epochs: 5
-  - task: imputation
-    epochs: 5
-# 单任务段结束后联合训练已完成任务（仅当已完成任务>=2；train+val 多源混训，不走 replay）
-task_joint_epochs: 1
-# 增加任务示例：
-# - name: sonar
-#   kind: classification
-#   source: sonar
-#   num_classes: 16
-# task_kinds:
-#   sonar: classification
+task_joint_epochs: 0
 task_pools:
-  classification: [downstream_modulation_train, downstream_modulation_val]
-  emitter: [downstream_emitter_train, downstream_emitter_val]
-  clustering: [clustering_train, clustering_val]
-  prediction: [downstream_prediction_train, downstream_prediction_val]
-  imputation: [downstream_prediction_train, downstream_prediction_val]
+  ld_intrapulse: [downstream_radar_modulation_train, downstream_radar_modulation_val]
+  ld_model: [downstream_radar_model_train, downstream_radar_model_val]
+  tx_modulation: [downstream_comm_modulation_train, downstream_comm_modulation_val]
+  ld_clustering: [clustering_radar_train, clustering_radar_val]
+  tx_clustering: [clustering_comm_train, clustering_comm_val]
+  prediction: [prediction_train, prediction_val]
 profiles:
   tiny:
     model_config: configs/model_tiny.yaml
@@ -124,47 +104,9 @@ profiles:
     learning_rate: 1.0e-3
     require_mamba_kernel: false
     compact_task_labels: false
-    task_joint_epochs: 1
-    task_schedule:
-      - task: modulation
-        epochs: 1
-      - task: emitter
-        epochs: 1
-  # 只训个体，按 val/acc_emitter 存 best（避免 multitask geomean 在后续任务阶段覆盖坏头）
-  emitter:
-    encoder_pool_type: attn_pool
-    model:
-      encoder_pool_type: attn_pool
-    compact_task_labels: true
-    checkpoint_monitor: val/acc_emitter
-    checkpoint_mode: max
-    task_joint_epochs: 0
-    # 加快收敛：对比/探针加权 + 短 warmup + 头略高 LR（对齐历史 ~32% run）
-    learning_rate: 1.5e-3
-    heads_lr: 2.0e-3
-    warmup_steps: 100
-    emitter_contrastive_weight: 0.2
-    z_contrastive_weight: 0.15
-    z_probe_weight: 0.5
-    emitter_label_smoothing: 0.02
-    task_schedule:
-      - task: emitter
-        epochs: 10
-    task_pools:
-      emitter: [downstream_emitter_train, downstream_emitter_val]
-    tasks:
-      - emitter
-  radar_modulation:
-    task: modulation
-    checkpoint_monitor: val/f1_modulation
-    checkpoint_mode: max
-    compact_task_labels: true
-    modulation_downstream_datasets: [radchar]
     task_joint_epochs: 0
     task_schedule:
-      - task: modulation
-        epochs: 20
-    tasks:
-      - modulation
-    task_pools:
-      classification: [downstream_radar_modulation_train, downstream_radar_modulation_val]
+      - task: ld_intrapulse
+        epochs: 1
+      - task: tx_modulation
+        epochs: 1

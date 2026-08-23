@@ -9,16 +9,6 @@ import torch.nn.functional as F
 from resmamba_signal_model.models.task_interface import TaskFeatures
 
 LEGACY_RECOGNITION_SHARED = "recognition_heads.shared"
-SHARED_MODULATION_PREFIX = "recognition_heads.shared_modulation"
-SHARED_EMITTER_PREFIX = "recognition_heads.shared_emitter"
-
-_RECOGNITION_TO_TASK_HEAD: tuple[tuple[str, str], ...] = (
-    ("recognition_heads.shared_modulation.", "modulation_head.shared."),
-    ("recognition_heads.modulation.", "modulation_head.classifier."),
-    ("recognition_heads.modulation_dataset_bias.", "modulation_head.dataset_bias."),
-    ("recognition_heads.shared_emitter.", "emitter_head.shared."),
-    ("recognition_heads.emitter.", "emitter_head.classifier."),
-)
 
 
 def _shared_residual_mlp(
@@ -47,30 +37,23 @@ def _shared_residual_mlp(
 
 
 def remap_legacy_recognition_shared(state: dict[str, Any]) -> dict[str, Any]:
-    """将旧 checkpoint 的 ``recognition_heads.shared.*`` 映射到任务专属层。
-
-    若目标 key 已存在（拼接 init / 新权重），保留已有值，不覆盖。
-    """
+    """旧 checkpoint 的 ``recognition_heads.shared.*`` 不再映射到新头；仅删除遗留键。"""
     remapped = dict(state)
-    legacy_keys = [
-        key
-        for key in state
-        if key == LEGACY_RECOGNITION_SHARED or key.startswith(LEGACY_RECOGNITION_SHARED + ".")
-    ]
-    for key in legacy_keys:
-        suffix = key[len(LEGACY_RECOGNITION_SHARED) :]
-        for prefix in (SHARED_MODULATION_PREFIX, SHARED_EMITTER_PREFIX):
-            new_key = f"{prefix}{suffix}"
-            if new_key not in remapped:
-                remapped[new_key] = state[key]
-        remapped.pop(key, None)
+    for key in list(state):
+        if key == LEGACY_RECOGNITION_SHARED or key.startswith(LEGACY_RECOGNITION_SHARED + "."):
+            remapped.pop(key, None)
     return remapped
 
 
 def remap_recognition_heads_to_task_heads(state: dict[str, Any]) -> dict[str, Any]:
-    """将 ``recognition_heads.*`` 映射到独立 ``modulation_head`` / ``emitter_head``。"""
+    """旧 ``modulation_head`` / ``emitter_head`` → 新任务头命名（加载 init 时兼容）。"""
     remapped = dict(state)
-    for old_prefix, new_prefix in _RECOGNITION_TO_TASK_HEAD:
+    legacy_map = (
+        ("modulation_head.", "tx_modulation_head."),
+        ("emitter_head.", "ld_model_head."),
+        ("clustering_head.", "ld_clustering_head."),
+    )
+    for old_prefix, new_prefix in legacy_map:
         for key in list(state):
             if key.startswith(old_prefix):
                 new_key = new_prefix + key[len(old_prefix) :]
@@ -247,6 +230,58 @@ class RecognitionHeads(nn.Module):
         return out
 
 
+class ClassificationHead(nn.Module):
+    """通用 Cosine 分类头；每任务独立实例。"""
+
+    def __init__(
+        self,
+        d_model: int,
+        num_classes: int,
+        dropout: float = 0.1,
+        logits_key: str | None = None,
+        num_datasets: int = 32,
+        use_dataset_bias: bool = False,
+        low_rank_prototype: bool = False,
+        prototype_rank: int = 64,
+    ) -> None:
+        super().__init__()
+        self.use_dataset_bias = use_dataset_bias
+        self.logits_key = str(logits_key or "task_logits")
+        self.shared = _shared_residual_mlp(
+            d_model, dropout, low_rank_prototype=low_rank_prototype, prototype_rank=prototype_rank
+        )
+        self.classifier = CosineClassifierHead(
+            d_model,
+            num_classes,
+            hidden_dim=d_model * 2,
+            dropout=dropout,
+            depth=2,
+            low_rank_prototype=low_rank_prototype,
+            prototype_rank=prototype_rank,
+        )
+        if use_dataset_bias:
+            self.dataset_bias = nn.Embedding(num_datasets, num_classes)
+            nn.init.zeros_(self.dataset_bias.weight)
+        self.dataset_class_mask: torch.Tensor | None = None
+
+    def set_dataset_class_mask(self, mask: torch.Tensor | None) -> None:
+        self.dataset_class_mask = mask.to(dtype=torch.bool) if mask is not None else None
+
+    def forward(
+        self,
+        features: torch.Tensor | TaskFeatures,
+        dataset_id: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        h = _as_pooled(features)
+        logits = self.classifier(h + self.shared(h))
+        if self.use_dataset_bias and dataset_id is not None:
+            dataset_id = dataset_id.long().clamp(0, self.dataset_bias.num_embeddings - 1)
+            logits = logits + self.dataset_bias(dataset_id)
+        if self.dataset_class_mask is not None:
+            logits = apply_emitter_dataset_mask(logits, dataset_id, self.dataset_class_mask)
+        return {"task_logits": logits, self.logits_key: logits}
+
+
 class ModulationHead(nn.Module):
     """浅 Cosine 分类；可选 dataset bias。消费 UTI pooled。"""
 
@@ -292,14 +327,14 @@ class ModulationHead(nn.Module):
         return out
 
 
-def apply_emitter_dataset_mask(
+def apply_dataset_class_mask(
     logits: torch.Tensor,
     dataset_id: torch.Tensor | None,
     class_mask: torch.Tensor | None,
     *,
     blocked_value: float = -1.0e4,
 ) -> torch.Tensor:
-    """按 ``dataset_id`` 只保留该数据集的个体类；全空行不掩，避免 -inf argmax。"""
+    """按 ``dataset_id`` 只保留该数据集的类；全空行不掩，避免 -inf argmax。"""
     if dataset_id is None or class_mask is None or logits.ndim != 2:
         return logits
     idx = dataset_id.long().reshape(-1)
@@ -313,6 +348,71 @@ def apply_emitter_dataset_mask(
     empty = ~allowed.any(dim=-1, keepdim=True)
     allowed = allowed | empty
     return logits.masked_fill(~allowed, logits.new_tensor(blocked_value))
+
+
+def apply_emitter_dataset_mask(
+    logits: torch.Tensor,
+    dataset_id: torch.Tensor | None,
+    class_mask: torch.Tensor | None,
+    *,
+    blocked_value: float = -1.0e4,
+) -> torch.Tensor:
+    return apply_dataset_class_mask(logits, dataset_id, class_mask, blocked_value=blocked_value)
+
+
+class ClassificationHead(nn.Module):
+    """通用 Cosine 分类头；可选 dataset bias / dataset class mask。"""
+
+    def __init__(
+        self,
+        d_model: int,
+        num_classes: int = 31,
+        dropout: float = 0.1,
+        num_datasets: int = 32,
+        use_dataset_bias: bool = False,
+        logits_key: str = "task_logits",
+        low_rank_prototype: bool = False,
+        prototype_rank: int = 64,
+        hidden_depth: int = 2,
+        hidden_scale: int = 2,
+    ) -> None:
+        super().__init__()
+        self.use_dataset_bias = use_dataset_bias
+        self.logits_key = str(logits_key)
+        self.num_classes = int(num_classes)
+        self.shared = _shared_residual_mlp(
+            d_model, dropout, low_rank_prototype=low_rank_prototype, prototype_rank=prototype_rank
+        )
+        self.classifier = CosineClassifierHead(
+            d_model,
+            num_classes,
+            hidden_dim=d_model * hidden_scale,
+            dropout=dropout,
+            depth=hidden_depth,
+            low_rank_prototype=low_rank_prototype,
+            prototype_rank=prototype_rank,
+        )
+        if use_dataset_bias:
+            self.dataset_bias = nn.Embedding(num_datasets, num_classes)
+            nn.init.zeros_(self.dataset_bias.weight)
+
+    def set_dataset_class_mask(self, mask: torch.Tensor | None) -> None:
+        if "dataset_class_mask" in self._buffers:
+            del self._buffers["dataset_class_mask"]
+        if mask is None:
+            return
+        self.register_buffer("dataset_class_mask", mask.to(dtype=torch.bool), persistent=False)
+
+    def forward(self, features: torch.Tensor | TaskFeatures, dataset_id: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
+        h = _as_pooled(features)
+        logits = self.classifier(h + self.shared(h))
+        logits = apply_dataset_class_mask(
+            logits, dataset_id, getattr(self, "dataset_class_mask", None)
+        )
+        if self.use_dataset_bias and dataset_id is not None:
+            dataset_id = dataset_id.long().clamp(0, self.dataset_bias.num_embeddings - 1)
+            logits = logits + self.dataset_bias(dataset_id)
+        return {"task_logits": logits, self.logits_key: logits}
 
 
 class EmitterHead(nn.Module):
@@ -372,8 +472,10 @@ class PrototypeClusteringHead(nn.Module):
         view_dropout: float = 0.1,
         low_rank_prototype: bool = False,
         prototype_rank: int = 64,
+        namespace: str = "clustering",
     ) -> None:
         super().__init__()
+        self.namespace = str(namespace)
         self.proj = MLPHead(
             d_model,
             proj_dim,
@@ -384,7 +486,6 @@ class PrototypeClusteringHead(nn.Module):
         self.prototypes = nn.Parameter(torch.randn(num_prototypes, proj_dim) * 0.02)
         self.temperature = float(temperature)
         self.view_dropout = nn.Dropout(view_dropout)
-        self.namespace = "modulation"
 
     def forward(
         self,
@@ -508,11 +609,12 @@ class ImputationHead(_PatchIQHead):
 
 
 TASK_HEAD_REGISTRY: dict[str, type[nn.Module]] = {
-    "modulation": ModulationHead,
-    "emitter": EmitterHead,
-    "clustering": PrototypeClusteringHead,
+    "ld_intrapulse": ClassificationHead,
+    "ld_model": ClassificationHead,
+    "tx_modulation": ClassificationHead,
+    "ld_clustering": PrototypeClusteringHead,
+    "tx_clustering": PrototypeClusteringHead,
     "prediction": PredictionHead,
-    "imputation": ImputationHead,
 }
 
 

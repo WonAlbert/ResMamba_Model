@@ -1,4 +1,4 @@
-# 阶段三 3b：联合训练 SharedTaskAdapter + tokenizer 尾部 + 全部 LoRA/头，合成一份 best.ckpt
+# 阶段三联合：SharedTaskAdapter + 各任务 LoRA/Adapter/头（不解冻 tokenizer 尾部）
 model_config: configs/model.yaml
 rfdata_root: /root/autodl-tmp/ResMamba_Signal_Model/dataset
 iq_normalize: none
@@ -26,7 +26,6 @@ num_workers: 4
 max_grad_norm: 1.0
 learning_rate: 2.0e-4
 heads_lr: 5.0e-5
-tokenizer_last_lr_scale: 0.1
 warmup_steps: 50
 lr_schedule: warmup_cosine
 lr_min_ratio: 0.1
@@ -36,8 +35,6 @@ distill_weight: 0.0
 prototype_anchor_weight: 0.0
 absorb_unknown: false
 lambda_recon: 0.0
-modulation_contrastive_weight: 0.25
-emitter_contrastive_weight: 0.25
 supervised_clustering: false
 cluster_utilization_weight: 0.15
 cluster_balance_mix: 0.7
@@ -48,13 +45,12 @@ train_encoder: false
 train_decoder: false
 train_heads: true
 skip_recon: true
-# 与阶段二/三一致：调制/个体用下游紧凑标签
 compact_task_labels: true
-unfreeze_tokenizer_last: true
+unfreeze_tokenizer_last: false
 loraplus_lr_ratio: 16
 r_attn: 16
 r_mamba: 8
-shared_lora: true
+shared_lora: false
 ssm_cotrain_dt_bias: false
 peft:
   r_attn: 16
@@ -63,22 +59,24 @@ peft:
   lora_alpha_mamba: 8
   loraplus_lr_ratio: 16
   ssm_cotrain_dt_bias: false
-  shared_lora: true
+  shared_lora: false
 loss_weights:
   physical: 0.0
   domain: 0.0
 tasks:
-  - modulation
-  - emitter
-  - clustering
+  - ld_intrapulse
+  - ld_model
+  - tx_modulation
+  - ld_clustering
+  - tx_clustering
   - prediction
-  - imputation
 task_pools:
-  classification: [downstream_modulation_train, downstream_modulation_val]
-  emitter: [downstream_emitter_train, downstream_emitter_val]
-  clustering: [clustering_train, clustering_val]
-  prediction: [downstream_prediction_train, downstream_prediction_val]
-  imputation: [downstream_prediction_train, downstream_prediction_val]
+  ld_intrapulse: [downstream_radar_modulation_train, downstream_radar_modulation_val]
+  ld_model: [downstream_radar_model_train, downstream_radar_model_val]
+  tx_modulation: [downstream_comm_modulation_train, downstream_comm_modulation_val]
+  ld_clustering: [clustering_radar_train, clustering_radar_val]
+  tx_clustering: [clustering_comm_train, clustering_comm_val]
+  prediction: [prediction_train, prediction_val]
 profiles:
   tiny:
     model_config: configs/model_tiny.yaml
@@ -103,5 +101,5 @@ profiles:
       lora_alpha_attn: 4
       lora_alpha_mamba: 2
       loraplus_lr_ratio: 16
-      shared_lora: true
+      shared_lora: false
     require_mamba_kernel: false

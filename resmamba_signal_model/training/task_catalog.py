@@ -10,48 +10,51 @@ KIND_ALIASES: dict[str, str] = {
     "modulation": "classification",
     "cls": "classification",
     "label": "classification",
-    "emitter": "emitter",
-    "sei": "emitter",
-    "fingerprint": "emitter",
+    "emitter": "classification",
+    "sei": "classification",
+    "fingerprint": "classification",
     "clustering": "clustering",
     "cluster": "clustering",
     "prediction": "prediction",
     "forecast": "prediction",
-    "imputation": "imputation",
-    "impute": "imputation",
+    "imputation": "prediction",
+    "impute": "prediction",
 }
 
 KIND_MASK_MODE: dict[str, str] = {
     "classification": "none",
-    "emitter": "none",
     "clustering": "none",
     "prediction": "suffix",
-    "imputation": "span",
 }
 
 KIND_MONITOR: dict[str, str] = {
     "classification": "f1",
-    "emitter": "per_dataset_macro_acc",
-    "clustering": "nmi",
+    "clustering": "nmi_within_domain",
     "prediction": "mse",
-    "imputation": "mse",
 }
 
 SOURCE_TO_BUILTIN_TASK: dict[str, str] = {
-    "classification": "modulation",
-    "emitter": "emitter",
-    "clustering": "clustering",
+    "ld_intrapulse": "ld_intrapulse",
+    "ld_model": "ld_model",
+    "tx_modulation": "tx_modulation",
+    "ld_clustering": "ld_clustering",
+    "tx_clustering": "tx_clustering",
     "prediction": "prediction",
-    "imputation": "imputation",
-    "modulation": "modulation",
+    # 兼容旧 source 键
+    "classification": "tx_modulation",
+    "emitter": "ld_model",
+    "clustering": "ld_clustering",
+    "imputation": "prediction",
+    "modulation": "tx_modulation",
 }
 
 BUILTIN_HEAD_ATTR: dict[str, str] = {
-    "modulation": "modulation_head",
-    "emitter": "emitter_head",
-    "clustering": "clustering_head",
+    "ld_intrapulse": "ld_intrapulse_head",
+    "ld_model": "ld_model_head",
+    "tx_modulation": "tx_modulation_head",
+    "ld_clustering": "ld_clustering_head",
+    "tx_clustering": "tx_clustering_head",
     "prediction": "prediction_head",
-    "imputation": "imputation_head",
 }
 
 
@@ -82,12 +85,15 @@ class TaskSpec:
         if not self.monitor:
             self.monitor = KIND_MONITOR[self.kind]
         if not self.label_field:
-            if self.kind == "emitter":
-                self.label_field = "global_emitter_id"
-            elif self.kind == "clustering":
+            if self.kind == "clustering":
                 self.label_field = "global_label_id"
             elif self.kind == "classification":
-                self.label_field = "canonical_mod_label_id"
+                if self.name == "ld_intrapulse":
+                    self.label_field = "canonical_mod_label_id"
+                elif self.name == "ld_model":
+                    self.label_field = "global_emitter_id"
+                else:
+                    self.label_field = "canonical_mod_label_id"
 
     def mask_mode(self) -> str:
         return KIND_MASK_MODE[self.kind]
@@ -104,11 +110,27 @@ class TaskSpec:
 
 def builtin_spec(name: str) -> TaskSpec:
     presets: dict[str, TaskSpec] = {
-        "modulation": TaskSpec("modulation", "classification", "classification", label_field="canonical_mod_label_id"),
-        "emitter": TaskSpec("emitter", "emitter", "emitter", label_field="global_emitter_id"),
-        "clustering": TaskSpec("clustering", "clustering", "clustering", label_field="global_label_id"),
+        "ld_intrapulse": TaskSpec(
+            "ld_intrapulse",
+            "classification",
+            "ld_intrapulse",
+            label_field="canonical_mod_label_id",
+        ),
+        "ld_model": TaskSpec(
+            "ld_model",
+            "classification",
+            "ld_model",
+            label_field="global_emitter_id",
+        ),
+        "tx_modulation": TaskSpec(
+            "tx_modulation",
+            "classification",
+            "tx_modulation",
+            label_field="canonical_mod_label_id",
+        ),
+        "ld_clustering": TaskSpec("ld_clustering", "clustering", "ld_clustering", label_field="global_label_id"),
+        "tx_clustering": TaskSpec("tx_clustering", "clustering", "tx_clustering", label_field="global_label_id"),
         "prediction": TaskSpec("prediction", "prediction", "prediction"),
-        "imputation": TaskSpec("imputation", "imputation", "imputation"),
     }
     if name not in presets:
         raise KeyError(f"不是内置任务: {name}")
@@ -158,9 +180,7 @@ def _spec_from_name(name: str, *, task_kinds: dict[str, str], task_pools: dict[s
     if kind is None and name in SOURCE_TO_BUILTIN_TASK:
         return builtin_spec(SOURCE_TO_BUILTIN_TASK[name])
     source = name
-    if name == "modulation" and "classification" in task_pools:
-        source = "classification"
-    elif name in task_pools:
+    if name in task_pools:
         source = name
     return TaskSpec(name=name, kind=normalize_kind(kind, default="classification"), source=source)
 
@@ -218,8 +238,7 @@ class TaskCatalog:
 def resolve_task_catalog(train_cfg: dict[str, Any] | None) -> TaskCatalog:
     """从训练配置解析任意数量下游任务。
 
-    优先级：``resolved_tasks`` > ``tasks`` 列表 > ``task_pools`` 键 > 内置五任务。
-    新任务可写 ``task_kinds: {sonar: classification}`` 与对应 ``task_pools``。
+    优先级：``resolved_tasks`` > ``tasks`` 列表 > ``task_pools`` 键 > 内置六任务。
     """
     train_cfg = train_cfg or {}
     task_kinds = {str(k): str(v) for k, v in dict(train_cfg.get("task_kinds") or {}).items()}
@@ -262,4 +281,12 @@ def apply_catalog_to_model_cfg(model_cfg: Any, catalog: TaskCatalog) -> Any:
     model_cfg.task_names = names
     model_cfg.task_kinds = {spec.name: spec.kind for spec in catalog.specs}
     model_cfg.num_task_types = max(int(getattr(model_cfg, "num_task_types", 8) or 8), len(names) + 4)
+    for spec in catalog.specs:
+        if spec.kind == "clustering" and spec.num_prototypes:
+            model_cfg.clustering_num_prototypes = int(spec.num_prototypes)
+        if spec.kind == "classification" and spec.num_classes:
+            if spec.name == "ld_model":
+                model_cfg.num_emitters = int(spec.num_classes)
+            else:
+                model_cfg.num_mod_classes = int(spec.num_classes)
     return model_cfg

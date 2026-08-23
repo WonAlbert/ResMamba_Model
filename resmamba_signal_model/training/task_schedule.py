@@ -185,9 +185,16 @@ class TaskScheduleCallback(Callback):
     否则会出现 allow=emitter 但 batch 仍是 classification。
     """
 
-    def __init__(self, sessions: list[dict[str, Any]], train_cfg: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        sessions: list[dict[str, Any]],
+        train_cfg: dict[str, Any],
+        *,
+        stage: str | None = None,
+    ) -> None:
         self.sessions = list(sessions)
         self.train_cfg = train_cfg
+        self.stage = str(stage or train_cfg.get("stage") or "")
         self._last_key: tuple[str, ...] | None = None
 
     def _apply(self, pl_module: Any, trainer: Any, *, epoch: int) -> None:
@@ -236,6 +243,20 @@ class TaskScheduleCallback(Callback):
                 f"tasks={tasks} sources={sources} replay={replay_sources} (train+val)",
                 flush=True,
             )
+            if (
+                not is_joint
+                and self.stage == "stage2"
+                and pl_module is not None
+                and tasks
+            ):
+                from resmamba_signal_model.training.freeze import apply_stage_freeze
+
+                apply_stage_freeze(
+                    pl_module.model,
+                    "stage2",
+                    task=tasks[0] if len(tasks) == 1 else None,
+                    train_cfg=self.train_cfg,
+                )
             if (
                 not is_joint
                 and self._last_key is not None

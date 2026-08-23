@@ -4,11 +4,23 @@ from typing import Any, Iterable
 
 import torch.nn as nn
 
-from resmamba_signal_model.models.peft import TOKENIZER_LAST_ATTRS, MultiTaskLoRALinear
+from resmamba_signal_model.models.peft import MultiTaskLoRALinear
 from resmamba_signal_model.models.task_interface import DEFAULT_TASKS
 from resmamba_signal_model.training.task_catalog import BUILTIN_HEAD_ATTR, resolve_task_catalog
 
 HEAD_MODULE_NAMES: dict[str, str] = dict(BUILTIN_HEAD_ATTR)
+
+FROZEN_DOWNSTREAM_PREFIXES: tuple[str, ...] = (
+    "tokenizer.",
+    "encoder.",
+    "decoder.",
+    "encoder_pool.",
+    "encoder_repr_norm.",
+    "revin.",
+    "input_adapters.",
+    "domain_disc.",
+    "chunk_pool.",
+)
 
 
 def _set_module_grad(module: nn.Module | None, enabled: bool) -> None:
@@ -29,6 +41,21 @@ def _iter_task_heads(model: nn.Module) -> Iterable[tuple[str, nn.Module]]:
             yield str(name), head
 
 
+def _freeze_all(model: nn.Module) -> None:
+    for param in model.parameters():
+        param.requires_grad = False
+
+
+def _unfreeze_head_for_task(model: nn.Module, task: str) -> None:
+    head = getattr(model, HEAD_MODULE_NAMES.get(task, ""), None)
+    extra = getattr(model, "extra_task_heads", None)
+    if head is None and isinstance(extra, nn.ModuleDict) and task in extra:
+        head = extra[task]
+    if head is None and hasattr(model, "get_task_head"):
+        head = model.get_task_head(task)
+    _set_module_grad(head, True)
+
+
 def apply_stage_freeze(
     model: nn.Module,
     stage: str,
@@ -36,44 +63,37 @@ def apply_stage_freeze(
     task: str | None = None,
     train_cfg: dict[str, Any] | None = None,
 ) -> None:
-    """按阶段冻结/解冻。stage2 同时打开截断反传开关。"""
+    """按阶段冻结/解冻。下游路径：z_enc → TaskAdapter → 头，不训 UTI / encoder_pool。"""
     train_cfg = train_cfg or {}
     stage = str(stage)
     model.truncate_backward = False  # type: ignore[attr-defined]
     model.skip_recon = False  # type: ignore[attr-defined]
-
-    if stage == "continual":
-        from resmamba_signal_model.training.continual import apply_continual_freeze
-
-        apply_continual_freeze(model)
-        return
 
     if stage == "pretrain":
         for param in model.parameters():
             param.requires_grad = True
         return
 
-    if stage == "downstream":
-        train_encoder = bool(train_cfg.get("train_encoder", getattr(model.cfg, "train_encoder", True)))
-        train_decoder = bool(train_cfg.get("train_decoder", getattr(model.cfg, "train_decoder", True)))
-        train_heads = bool(train_cfg.get("train_heads", getattr(model.cfg, "train_heads", True)))
-        if hasattr(model, "apply_train_flags"):
-            model.apply_train_flags(train_encoder, train_decoder, train_heads)
-        return
-
-    for param in model.parameters():
-        param.requires_grad = False
+    _freeze_all(model)
 
     if stage == "stage2":
         model.truncate_backward = bool(train_cfg.get("truncate_backward", True))  # type: ignore[attr-defined]
         model.skip_recon = bool(train_cfg.get("skip_recon", True))  # type: ignore[attr-defined]
-        _set_module_grad(getattr(model, "task_interface", None), True)
-        _set_module_grad(getattr(model, "prototype_registry", None), True)
-        _set_module_grad(getattr(model, "z_linear_probes", None), True)
-        _set_module_grad(getattr(model, "encoder_pool", None), True)
-        _set_module_grad(getattr(model, "encoder_repr_norm", None), True)
-        for _name, head in _iter_task_heads(model):
-            _set_module_grad(head, True)
+        active_tasks = list(train_cfg.get("active_train_tasks") or [])
+        if task:
+            active_tasks = [task]
+        elif not active_tasks and train_cfg.get("task"):
+            active_tasks = [str(train_cfg["task"])]
+        if not active_tasks:
+            active_tasks = list(resolve_task_catalog(train_cfg).names)
+        for t in active_tasks:
+            _unfreeze_head_for_task(model, t)
+        if bool(train_cfg.get("train_z_linear_probes", True)):
+            probes = getattr(model, "z_linear_probes", None)
+            if isinstance(probes, nn.ModuleDict):
+                for t in active_tasks:
+                    if t in probes:
+                        _set_module_grad(probes[t], True)
         return
 
     if stage == "stage3":
@@ -92,20 +112,17 @@ def apply_stage_freeze(
         adapters = getattr(model, "task_adapters", None)
         if isinstance(adapters, nn.ModuleDict) and task in adapters:
             _set_module_grad(adapters[task], True)
-        head = getattr(model, HEAD_MODULE_NAMES.get(task, ""), None)
-        extra = getattr(model, "extra_task_heads", None)
-        if head is None and isinstance(extra, nn.ModuleDict) and task in extra:
-            head = extra[task]
-        if head is None and hasattr(model, "get_task_head"):
-            head = model.get_task_head(task)
-        _set_module_grad(head, True)
+        _unfreeze_head_for_task(model, task)
+        if bool(train_cfg.get("train_z_linear_probes", False)):
+            probes = getattr(model, "z_linear_probes", None)
+            if isinstance(probes, nn.ModuleDict) and task in probes:
+                _set_module_grad(probes[task], True)
         if bool(train_cfg.get("ssm_cotrain_dt_bias") or (train_cfg.get("peft") or {}).get("ssm_cotrain_dt_bias")):
             _unfreeze_dt_bias(model)
         return
 
     if stage == "joint":
         model.skip_recon = bool(train_cfg.get("skip_recon", True))  # type: ignore[attr-defined]
-        _unfreeze_tokenizer_last(model)
         handle = getattr(model, "peft", None)
         if handle is not None:
             handle.set_trainable(model, None)
@@ -125,19 +142,7 @@ def apply_stage_freeze(
             _unfreeze_dt_bias(model)
         return
 
-    raise ValueError(f"未知 stage {stage!r}，可选: pretrain/downstream/stage2/stage3/joint/continual")
-
-
-def _unfreeze_tokenizer_last(model: nn.Module) -> None:
-    tokenizer = getattr(model, "tokenizer", None)
-    if tokenizer is None:
-        return
-    for name in TOKENIZER_LAST_ATTRS:
-        child = getattr(tokenizer, name, None)
-        if isinstance(child, nn.Module):
-            _set_module_grad(child, True)
-        elif isinstance(child, nn.Parameter):
-            child.requires_grad = True
+    raise ValueError(f"未知 stage {stage!r}，可选: pretrain/stage2/stage3/joint")
 
 
 def _unfreeze_dt_bias(model: nn.Module) -> None:
@@ -149,7 +154,6 @@ def _unfreeze_dt_bias(model: nn.Module) -> None:
 def iter_head_param_prefixes() -> tuple[str, ...]:
     return tuple(HEAD_MODULE_NAMES.values()) + (
         "extra_task_heads",
-        "recognition_heads",
         "prototype_registry",
     )
 
