@@ -12,16 +12,16 @@ pretrain:
   datasets:
     - radar_mod15             # 雷达；15 类舰载/对海雷达系统型号；型号识别
     - radchar                 # 雷达；RadChar-Small；5 类脉内调制（CPT/Barker/Poly-Barker/Frank/LFM）
-    - radcom_awgn             # 雷达+通信；RadarComm 仿真+AWGN；波形调制 + 雷达/通信场景
-    - radcom_dynamic          # 雷达+通信；RadarComm 仿真+动态信道
-    - radcom_ota              # 雷达+通信；RadarComm 2.45GHz 空口实测
+    # - radcom_awgn             # 雷达+通信；RadarComm 仿真+AWGN；波形调制 + 雷达/通信场景
+    # - radcom_dynamic          # 雷达+通信；RadarComm 仿真+动态信道
+    # - radcom_ota              # 雷达+通信；RadarComm 2.45GHz 空口实测
     - cjr_mix                 # 雷达；EM-Radar-Mix 混合仿真；9 类 infer_class
     - rml2016_04c             # 通信；11 类调制（RadioML 2016.04C）；调制样式识别
     - rml2016_10a             # 通信；11 类调制（RadioML 2016.10a）
     - rml2016_10b             # 通信；10 类调制（RadioML 2016.10b）
     - xidian14                # 通信；14 类调制识别
     - panoradio_hf            # 通信；18 类 HF 短波模式（PSK/RTTY/OLIVIA/USB 等）
-    # radchar 已接入 pretrain / downstream_radar_modulation / clustering_radar
+
     # --- 不符合当前任务范围（已注释）---
     # - electromagnetic_0926  # 通信/导航；7 类电磁信号源类型识别（ADSB/AIS/AM/FM/GPS 等）
     # - radar_emitters          # 雷达；10 部导航雷达个体（CW）；辐射源个体识别
@@ -52,23 +52,18 @@ clustering_radar:
   datasets:
     - radar_mod15
     - cjr_mix
-    - radchar                 # 雷达脉内调制；5 类
+    # - radchar                 # 雷达脉内调制；5 类
 
 clustering_comm:
   # 通信调制聚类
   datasets:
-    - rml2016_04c
     - rml2016_10a
-    - rml2016_10b
     - xidian14
-    - panoradio_hf
 
 prediction:
   # 时序波形预测
   datasets:
-    - radcom_awgn
-    - radcom_dynamic
-    - radcom_ota
+    - rml2016_10a
     - radar_mod15
 
 # --- 兼容旧配置键（勿在新任务中引用）---

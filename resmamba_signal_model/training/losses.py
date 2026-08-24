@@ -33,6 +33,7 @@ __all__ = [
     "downstream_task_loss",
     "foundation_pretrain_losses",
     "latent_prediction_loss",
+    "resolve_vicreg_gamma",
     "vicreg_loss",
     "vicreg_token_loss",
     "modulation_hierarchical_metric_loss",
@@ -555,6 +556,24 @@ def latent_prediction_loss(
     return _clamp_loss(pooled + token)
 
 
+def resolve_vicreg_gamma(gamma: Any, dim: int) -> float:
+    """把配置 ``vicreg_gamma`` 解析为 VICReg 方差下界 ``gamma``（目标 batch std）。
+
+    ``l2_unit`` / ``auto``：L2 归一化 ``z_enc`` 在 ``d`` 维单位球上每维 std ≈ ``1/√d``。
+    """
+    if isinstance(gamma, str):
+        key = gamma.strip().lower()
+        if key in ("l2_unit", "auto", "unit"):
+            return 1.0 / math.sqrt(max(int(dim), 1))
+        try:
+            return float(gamma)
+        except ValueError:
+            return 1.0 / math.sqrt(max(int(dim), 1))
+    if gamma is None:
+        return 1.0
+    return float(gamma)
+
+
 def vicreg_loss(
     z: torch.Tensor,
     teacher_z: torch.Tensor | None = None,
@@ -707,12 +726,19 @@ def foundation_pretrain_losses(
         if student is None:
             losses["vicreg"] = pred.new_tensor(0.0)
         else:
+            gamma_cfg = outputs.get("vicreg_gamma")
+            gamma = (
+                resolve_vicreg_gamma(gamma_cfg, int(student.shape[-1]))
+                if gamma_cfg is not None
+                else 1.0
+            )
             losses["vicreg"] = vicreg_loss(
                 student,
                 outputs.get("teacher_z_enc", outputs.get("teacher_z")),
                 var_weight=float(outputs.get("vicreg_var_weight", 25.0) or 25.0),
                 cov_weight=float(outputs.get("vicreg_cov_weight", 1.0) or 1.0),
                 inv_weight=float(outputs.get("vicreg_inv_weight", 0.0) or 0.0),
+                gamma=gamma,
             )
     if _need("vicreg_token"):
         h_enc = outputs.get("h_enc")
@@ -720,11 +746,16 @@ def foundation_pretrain_losses(
         if h_enc is None or visible is None:
             losses["vicreg_token"] = pred.new_tensor(0.0)
         else:
+            gamma_token = resolve_vicreg_gamma(
+                outputs.get("vicreg_gamma_token", 1.0),
+                int(h_enc.shape[-1]),
+            )
             losses["vicreg_token"] = vicreg_token_loss(
                 h_enc,
                 visible & outputs.get("patch_mask", visible),
                 var_weight=float(outputs.get("vicreg_var_weight", 25.0) or 25.0),
                 cov_weight=float(outputs.get("vicreg_cov_weight", 1.0) or 1.0),
+                gamma=gamma_token,
             )
     return losses
 

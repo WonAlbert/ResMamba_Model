@@ -21,9 +21,6 @@ def test_load_pretrain_datasets() -> None:
     assert datasets == [
         "radar_mod15",
         "radchar",
-        "radcom_awgn",
-        "radcom_dynamic",
-        "radcom_ota",
         "cjr_mix",
         "rml2016_04c",
         "rml2016_10a",
@@ -59,17 +56,15 @@ def test_load_downstream_radar_modulation_datasets() -> None:
 def test_load_clustering_pools() -> None:
     radar = load_clustering_radar_datasets()
     comm = load_clustering_comm_datasets()
-    assert radar == ["radar_mod15", "cjr_mix", "radchar"]
-    assert comm == ["rml2016_04c", "rml2016_10a", "rml2016_10b", "xidian14", "panoradio_hf"]
+    assert radar == ["radar_mod15", "cjr_mix"]
+    assert comm == ["rml2016_10a", "xidian14"]
 
 
 def test_load_downstream_shared_datasets() -> None:
     datasets = load_downstream_shared_datasets()
     assert datasets == [
         "cjr_mix",
-        "panoradio_hf",
         "radar_mod15",
-        "radchar",
         "rml2016_04c",
         "rml2016_10a",
         "rml2016_10b",

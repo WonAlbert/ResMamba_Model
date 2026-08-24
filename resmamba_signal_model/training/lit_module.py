@@ -538,6 +538,10 @@ class SignalLitModule(_Base):
         outputs = self.model(merged, mode="pretrain")
         if self.ema_teacher is not None:
             outputs = self._attach_ema_teacher_outputs(outputs, merged)
+        if float(self.loss_weights.get("vicreg", 0.0) or 0.0) > 0.0:
+            outputs["vicreg_gamma"] = self.train_cfg.get("vicreg_gamma", "l2_unit")
+        if float(self.loss_weights.get("vicreg_token", 0.0) or 0.0) > 0.0:
+            outputs["vicreg_gamma_token"] = self.train_cfg.get("vicreg_gamma_token", 1.0)
         weights = dict(self.loss_weights)
         weights["domain"] = float(weights.get("domain", 0.05)) * float(self.model.grl.lambd)
         total, parts = weighted_pretrain_loss(outputs, merged, weights)

@@ -20,7 +20,7 @@ seed: 0
 check_val_every_n_epoch: 1
 checkpoint_monitor: val/monitor
 checkpoint_mode: min
-early_stopping_patience: 8
+early_stopping_patience: 10
 early_stopping_min_delta: 0.001
 min_ratio: 0.05
 synthetic: false
@@ -40,6 +40,8 @@ token_normalized_loss: true
 p_trunc: 0.3
 l_min: 16
 chunk_len: 8192
+vicreg_gamma: l2_unit
+vicreg_gamma_token: 1.0
 loss_weights:
   mae: 1.0
   physical: 0.2
@@ -58,11 +60,9 @@ supervised_clustering: false
 source_groups:
   ld_radar: [radchar, radar_mod15, cjr_mix]
   tx_comm: [rml2016_*, xidian14, panoradio_hf]
-  radcom: [radcom_awgn, radcom_dynamic, radcom_ota]
 family_quotas:
-  tx_comm: 0.40
-  ld_radar: 0.35
-  radcom: 0.25
+  tx_comm: 0.55
+  ld_radar: 0.45
 profiles:
   tiny:
     model_config: configs/model_tiny.yaml

@@ -14,6 +14,7 @@ from resmamba_signal_model.training.losses import (
     sinkhorn_balanced_assignment,
     structure_preserving_loss,
     unsupervised_clustering_loss,
+    resolve_vicreg_gamma,
     vicreg_loss,
     weighted_pretrain_loss,
 )
@@ -351,6 +352,20 @@ def test_weighted_pretrain_omits_zero_weight_parts() -> None:
     assert "mae" in parts and "vicreg" in parts and "readout" in parts
     assert "domain" not in parts
     assert "latent" not in parts
+
+
+def test_vicreg_l2_unit_gamma_calibrated() -> None:
+    torch.manual_seed(0)
+    import torch.nn.functional as F
+
+    d = 640
+    z = F.normalize(torch.randn(32, d), dim=-1)
+    raw = float(vicreg_loss(z).detach())
+    gamma = resolve_vicreg_gamma("l2_unit", d)
+    calibrated = float(vicreg_loss(z, gamma=gamma).detach())
+    assert raw > 10.0
+    assert calibrated < 1.0
+    assert abs(gamma - 1.0 / (d**0.5)) < 1e-6
 
 
 def test_vicreg_not_hard_clamped_and_has_grad() -> None:
