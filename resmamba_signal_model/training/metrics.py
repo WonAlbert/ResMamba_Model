@@ -11,6 +11,7 @@ from sklearn.metrics import (
     f1_score,
     homogeneity_completeness_v_measure,
     normalized_mutual_info_score,
+    recall_score,
 )
 
 
@@ -55,6 +56,29 @@ def macro_f1(preds: torch.Tensor | np.ndarray, labels: torch.Tensor | np.ndarray
     if valid.sum() == 0:
         return 0.0
     return float(_sklearn_metric(f1_score, labels_np[valid], preds_np[valid], average="macro", zero_division=0))
+
+
+def macro_miss_rate(
+    preds: torch.Tensor | np.ndarray,
+    labels: torch.Tensor | np.ndarray,
+    mask: torch.Tensor | np.ndarray | None = None,
+) -> float:
+    """多分类宏平均漏警率：1 − macro recall（每类 one-vs-rest 漏检率再宏平均）。"""
+    preds_np = _to_numpy(preds)
+    labels_np = _to_numpy(labels)
+    valid = _valid_mask(labels_np, mask)
+    if valid.sum() == 0:
+        return 0.0
+    recall = float(
+        _sklearn_metric(
+            recall_score,
+            labels_np[valid],
+            preds_np[valid],
+            average="macro",
+            zero_division=0,
+        )
+    )
+    return float(1.0 - recall)
 
 
 def clustering_dataset_family(name: str) -> str:
@@ -122,6 +146,7 @@ def classification_epoch_scores(
     labels_np = _to_numpy(labels)
     overall_acc = accuracy(preds_np, labels_np)
     overall_f1 = macro_f1(preds_np, labels_np)
+    overall_miss = macro_miss_rate(preds_np, labels_np)
     n_valid = int(_valid_mask(labels_np).sum())
     datasets: dict[str, dict[str, float]] = {}
     if dataset_ids is not None:
@@ -138,16 +163,20 @@ def classification_epoch_scores(
             datasets[name] = {
                 "acc": accuracy(preds_np[mask], labels_np[mask]),
                 "f1": macro_f1(preds_np[mask], labels_np[mask]),
+                "miss_rate": macro_miss_rate(preds_np[mask], labels_np[mask]),
                 "n": float(n),
             }
     mean_acc = float(np.mean([row["acc"] for row in datasets.values()])) if datasets else overall_acc
     mean_f1 = float(np.mean([row["f1"] for row in datasets.values()])) if datasets else overall_f1
+    mean_miss = float(np.mean([row["miss_rate"] for row in datasets.values()])) if datasets else overall_miss
     return {
         "kind": "classification",
         "acc": overall_acc,
         "f1": overall_f1,
+        "miss_rate": overall_miss,
         "mean_acc": mean_acc,
         "mean_f1": mean_f1,
+        "mean_miss_rate": mean_miss,
         "n": float(n_valid),
         "datasets": datasets,
     }
@@ -238,6 +267,8 @@ def clustering_epoch_scores(
     preds_np = _to_numpy(preds)
     labels_np = _to_numpy(labels)
     overall = nmi_score(preds_np, labels_np)
+    merged = majority_merge_labels(preds_np, labels_np)
+    overall_acc = accuracy(merged, labels_np)
     overall_ari = ari_score(preds_np, labels_np)
     overseg = clustering_overseg_scores(preds_np, labels_np)
     n_valid = int(_valid_mask(labels_np).sum())
@@ -253,14 +284,17 @@ def clustering_epoch_scores(
             if n < 2:
                 continue
             name = dataset_display_name(did, dataset_names)
+            merged_ds = majority_merge_labels(preds_np[mask], labels_np[mask])
             row = {
                 "nmi": nmi_score(preds_np[mask], labels_np[mask]),
+                "acc": accuracy(merged_ds, labels_np[mask]),
                 "ari": ari_score(preds_np[mask], labels_np[mask]),
                 "n": float(n),
             }
             row.update(clustering_overseg_scores(preds_np[mask], labels_np[mask]))
             datasets[name] = row
     mean_nmi = float(np.mean([row["nmi"] for row in datasets.values()])) if datasets else overall
+    mean_acc = float(np.mean([row["acc"] for row in datasets.values()])) if datasets else overall_acc
     mean_ari = float(np.mean([row["ari"] for row in datasets.values()])) if datasets else overall_ari
     family_scores: dict[str, list[float]] = {"modulation": [], "emitter": []}
     for name, row in datasets.items():
@@ -270,8 +304,10 @@ def clustering_epoch_scores(
     report = {
         "kind": "clustering",
         "nmi": overall,
-        "ari": overall_ari,
+        "acc": overall_acc,
         "mean_nmi": mean_nmi,
+        "mean_acc": mean_acc,
+        "ari": overall_ari,
         "mean_ari": mean_ari,
         "n": float(n_valid),
         "datasets": datasets,
@@ -285,20 +321,20 @@ def clustering_epoch_scores(
 
 
 def reconstruction_epoch_scores(
-    overall_ssim: float,
     overall_mse: float,
+    overall_mae: float,
     n: int,
     per_dataset: dict[str, dict[str, float]] | None = None,
 ) -> dict:
     datasets = dict(per_dataset or {})
-    mean_ssim = float(np.mean([row["ssim"] for row in datasets.values()])) if datasets else float(overall_ssim)
     mean_mse = float(np.mean([row["mse"] for row in datasets.values()])) if datasets else float(overall_mse)
+    mean_mae = float(np.mean([row["mae"] for row in datasets.values()])) if datasets else float(overall_mae)
     return {
         "kind": "reconstruction",
-        "ssim": float(overall_ssim),
         "mse": float(overall_mse),
-        "mean_ssim": mean_ssim,
+        "mae": float(overall_mae),
         "mean_mse": mean_mse,
+        "mean_mae": mean_mae,
         "n": float(n),
         "datasets": datasets,
     }
@@ -361,10 +397,30 @@ def masked_patch_mse(
     mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """对 patch 重建做 masked MSE；无 mask 时对全部元素取均值。"""
+    return _masked_patch_error(pred, target, mask, squared=True)
+
+
+def masked_patch_mae(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """对 patch 重建做 masked MAE（L1）；无 mask 时对全部元素取均值。"""
+    return _masked_patch_error(pred, target, mask, squared=False)
+
+
+def _masked_patch_error(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor | None,
+    *,
+    squared: bool,
+) -> torch.Tensor:
     n = min(pred.shape[1], target.shape[1])
     pred = pred[:, :n].float()
     target = target[:, :n].float()
-    err = (pred - target).square()
+    diff = pred - target
+    err = diff.square() if squared else diff.abs()
     while err.ndim > 2:
         err = err.mean(dim=-1)
     if mask is None:
@@ -375,13 +431,18 @@ def masked_patch_mse(
     return err.sum() / denom
 
 
-def _ssim_1d_batched(x: torch.Tensor, y: torch.Tensor, window: int = 11, sigma: float = 1.5) -> torch.Tensor:
-    """``x,y`` 形状 ``[N,L]``，返回每条 1D 序列的 SSIM ``[N]``。"""
+def _iq_envelope(iq: torch.Tensor) -> torch.Tensor:
+    """``[..., 2, L]`` → ``[..., L]`` 包络 ``|I+jQ|``。"""
+    return torch.sqrt(iq[..., 0, :].float().square() + iq[..., 1, :].float().square() + 1.0e-12)
+
+
+def _ssim_1d_map(x: torch.Tensor, y: torch.Tensor, window: int = 11, sigma: float = 1.5) -> torch.Tensor:
+    """``x,y`` 形状 ``[N,L]``，返回逐点 SSIM map ``[N,L]``。"""
     x = x.float()
     y = y.float()
     length = int(x.shape[-1])
     if length < window:
-        err = (x - y).square().mean(dim=-1)
+        err = (x - y).square()
         return 1.0 - err / (err + 1.0)
     coords = torch.arange(window, device=x.device, dtype=x.dtype) - window // 2
     kernel = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
@@ -390,7 +451,10 @@ def _ssim_1d_batched(x: torch.Tensor, y: torch.Tensor, window: int = 11, sigma: 
     def filter1d(t: torch.Tensor) -> torch.Tensor:
         return F.conv1d(t.unsqueeze(1), kernel, padding=window // 2).squeeze(1)
 
-    data_range = torch.maximum((x.amax(dim=-1) - x.amin(dim=-1)).abs(), (y.amax(dim=-1) - y.amin(dim=-1)).abs()).clamp_min(1.0)
+    data_range = torch.maximum(
+        (x.amax(dim=-1) - x.amin(dim=-1)).abs(),
+        (y.amax(dim=-1) - y.amin(dim=-1)).abs(),
+    ).clamp_min(1.0e-6)
     c1 = ((0.01 * data_range) ** 2).unsqueeze(-1)
     c2 = ((0.03 * data_range) ** 2).unsqueeze(-1)
     mu_x, mu_y = filter1d(x), filter1d(y)
@@ -399,21 +463,50 @@ def _ssim_1d_batched(x: torch.Tensor, y: torch.Tensor, window: int = 11, sigma: 
     sigma_xy = filter1d(x * y) - mu_x * mu_y
     num = (2 * mu_x * mu_y + c1) * (2 * sigma_xy + c2)
     den = (mu_x ** 2 + mu_y ** 2 + c1) * (sigma_x + sigma_y + c2)
-    ssim_map = (num / den.clamp_min(1.0e-8)).clamp(-1.0, 1.0)
-    return ssim_map.mean(dim=-1)
+    return (num / den.clamp_min(1.0e-8)).clamp(-1.0, 1.0)
+
+
+def _ssim_1d_batched(x: torch.Tensor, y: torch.Tensor, window: int = 11, sigma: float = 1.5) -> torch.Tensor:
+    """``x,y`` 形状 ``[N,L]``，返回每条 1D 序列的 SSIM ``[N]``。"""
+    return _ssim_1d_map(x, y, window=window, sigma=sigma).mean(dim=-1)
 
 
 def _ssim_1d(x: torch.Tensor, y: torch.Tensor, window: int = 11, sigma: float = 1.5) -> torch.Tensor:
     return _ssim_1d_batched(x.unsqueeze(0), y.unsqueeze(0), window=window, sigma=sigma).squeeze(0)
 
 
+def _as_patch_iq(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """统一成 ``[B, P, 2, L]`` 与 patch mask ``[B, P]``。"""
+    if pred.ndim == 3 and pred.shape[1] == 2:
+        pred = pred.unsqueeze(1)
+        target = target.unsqueeze(1)
+        if mask is not None and mask.ndim == 1:
+            mask = mask.unsqueeze(1)
+    if pred.ndim != 4 or pred.shape[2] != 2:
+        raise ValueError(f"期望 pred 形状 [N,2,L] 或 [B,P,2,L]，实际 {tuple(pred.shape)}")
+    if mask is not None and mask.ndim == 1:
+        mask = mask.view(pred.shape[0], pred.shape[1])
+    return pred, target, mask
+
+
+def _expand_patch_mask(mask: torch.Tensor, patch_size: int, length: int) -> torch.Tensor:
+    sample = mask.unsqueeze(-1).expand(-1, -1, int(patch_size)).reshape(mask.shape[0], -1)
+    return sample[:, : int(length)]
+
+
 def ssim_iq(
     pred: torch.Tensor,
     target: torch.Tensor,
     mask: torch.Tensor | None = None,
+    *,
+    length: int | None = None,
 ) -> float:
-    """Compute mean SSIM over I/Q channels on masked patch reconstructions."""
-    total, count = ssim_iq_accumulate(pred, target, mask)
+    """掩码包络 SSIM（``|I+jQ|``）。若给 ``length`` 则拼回波形再算。"""
+    total, count = ssim_iq_accumulate(pred, target, mask, length=length)
     if count == 0:
         return 0.0
     return float(total / count)
@@ -423,25 +516,45 @@ def ssim_iq_accumulate(
     pred: torch.Tensor,
     target: torch.Tensor,
     mask: torch.Tensor | None = None,
+    *,
+    length: int | None = None,
 ) -> tuple[float, int]:
-    """返回 (SSIM 分数之和, patch×channel 计数)，用于按样本加权聚合。"""
-    if pred.ndim == 4:
-        b, p, c, l = pred.shape
-        pred = pred.reshape(b * p, c, l)
-        target = target.reshape(b * p, c, l)
-        if mask is not None:
-            mask = mask.reshape(b * p)
-    if pred.ndim != 3 or pred.shape[1] != 2:
-        raise ValueError(f"期望 pred 形状 [N,2,L] 或 [B,P,2,L]，实际 {tuple(pred.shape)}")
+    """包络 SSIM 之和与有效点数。
+
+    不再对 I/Q 分通道打 16 点绝对相位 SSIM。默认在 mask patch 的 ``|z|`` 上
+    计算；若提供 ``length``，先拼回波形，只在 mask 采样点上平均 SSIM map。
+    """
+    pred, target, mask = _as_patch_iq(pred, target, mask)
+    if pred.shape[0] == 0:
+        return 0.0, 0
+    patch_size = int(pred.shape[-1])
+    wave_len = int(length) if length is not None else None
+    if wave_len is not None and wave_len > 0 and pred.ndim == 4:
+        from resmamba_signal_model.models.varlen import patches_to_iq
+
+        env_p = _iq_envelope(patches_to_iq(pred, wave_len))
+        env_t = _iq_envelope(patches_to_iq(target, wave_len))
+        sample_mask = (
+            _expand_patch_mask(mask, patch_size, wave_len)
+            if mask is not None
+            else torch.ones(pred.shape[0], wave_len, dtype=torch.bool, device=pred.device)
+        )
+        ssim_map = _ssim_1d_map(env_p, env_t)
+        keep = sample_mask[:, : ssim_map.shape[-1]]
+        if not bool(keep.any()):
+            return 0.0, 0
+        masked = ssim_map.masked_fill(~keep, 0.0)
+        return float(masked.sum().item()), int(keep.sum().item())
+
     if mask is not None:
         pred = pred[mask]
         target = target[mask]
+    else:
+        pred = pred.reshape(-1, 2, patch_size)
+        target = target.reshape(-1, 2, patch_size)
     if pred.shape[0] == 0:
         return 0.0, 0
-    n = int(pred.shape[0])
-    x = pred.reshape(n * 2, pred.shape[-1]).float()
-    y = target.reshape(n * 2, target.shape[-1]).float()
-    scores = _ssim_1d_batched(x, y)
+    scores = _ssim_1d_batched(_iq_envelope(pred), _iq_envelope(target))
     return float(scores.sum().item()), int(scores.numel())
 
 

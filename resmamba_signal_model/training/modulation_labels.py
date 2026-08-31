@@ -9,12 +9,18 @@ import numpy as np
 import torch
 import yaml
 
+from resmamba_signal_model.training.emitter_labels import (
+    GlobalEmitterLabelMap,
+    _dataset_id_for_name,
+    global_emitter_labels,
+)
 from resmamba_signal_model.training.pool_filters import (
     DEFAULT_DATASETS_CONFIG,
     load_downstream_modulation_datasets,
 )
 
 CONFIG_ROOT = Path(__file__).resolve().parents[2] / "configs"
+COMM_MODULATION_CLASSES_PER_DATASET = 11
 
 
 @dataclass(frozen=True)
@@ -96,6 +102,106 @@ def _unique_canonical_ids_from_label_maps(
             if cid is not None and int(cid) >= 0:
                 found.add(int(cid))
     return found
+
+
+def global_comm_modulation_labels(
+    dataset_id: torch.Tensor,
+    canonical_mod_label_id: torch.Tensor,
+    canonical_lookup: torch.Tensor,
+    offset_lookup: torch.Tensor,
+) -> torch.Tensor:
+    """``tx_modulation`` 方案 A：canonical→局部 0..10，再按 dataset_id 加 offset 得到 33 类全局标签。"""
+    local = remap_modulation_labels(canonical_mod_label_id, canonical_lookup)
+    return global_emitter_labels(dataset_id, local, offset_lookup)
+
+
+def build_global_comm_modulation_label_map(
+    rfdata_root: str | Path,
+    *,
+    dataset_names: list[str] | None = None,
+    config_path: str | Path | None = None,
+    train_cfg: dict | None = None,
+    classes_per_dataset: int = COMM_MODULATION_CLASSES_PER_DATASET,
+) -> tuple[GlobalEmitterLabelMap, CompactModulationLabelMap]:
+    """通信调制下游：每数据集固定 ``classes_per_dataset`` 槽位（默认 11×3=33 类）。"""
+    root = Path(rfdata_root)
+    if dataset_names is None:
+        dataset_names = load_downstream_modulation_datasets(root, config_path=config_path)
+    canonical = build_compact_modulation_label_map(
+        root,
+        dataset_names=list(dataset_names),
+        config_path=config_path,
+        train_cfg=train_cfg,
+    )
+    maps_path = root / "label_maps.json"
+    if not maps_path.is_file():
+        raise FileNotFoundError(f"缺少 label_maps.json: {maps_path}")
+    with maps_path.open("r", encoding="utf-8") as handle:
+        label_maps = json.load(handle)
+    dataset_id_by_name = {
+        str(name): int(dataset_id) for dataset_id, name in label_maps.get("datasets", {}).items()
+    }
+
+    offsets: dict[int, int] = {}
+    dataset_name_by_id: dict[int, str] = {}
+    class_counts: dict[int, int] = {}
+    next_offset = 0
+    slots = int(classes_per_dataset)
+    for dataset_name in dataset_names:
+        dataset_id = _dataset_id_for_name(root, str(dataset_name), dataset_id_by_name)
+        if dataset_id is None:
+            continue
+        if dataset_id in offsets:
+            continue
+        offsets[dataset_id] = next_offset
+        dataset_name_by_id[dataset_id] = str(dataset_name)
+        class_counts[dataset_id] = slots
+        next_offset += slots
+
+    label_map = GlobalEmitterLabelMap(
+        offsets=offsets,
+        dataset_names=dataset_name_by_id,
+        num_emitters=next_offset,
+        class_counts=class_counts,
+    )
+    return label_map, canonical
+
+
+def build_comm_modulation_dataset_class_mask(
+    label_map: GlobalEmitterLabelMap,
+    canonical: CompactModulationLabelMap,
+    rfdata_root: str | Path,
+    *,
+    num_datasets: int,
+) -> torch.Tensor | None:
+    """``[num_datasets, num_classes]``：每库只开放该库 H5 中实际出现的 canonical 类槽位。"""
+    root = Path(rfdata_root)
+    n_emitters = int(label_map.num_emitters)
+    n_ds = int(num_datasets)
+    if n_emitters <= 0 or n_ds <= 0 or not label_map.offsets:
+        return None
+    lookup = canonical.lookup()
+    mask = torch.zeros(n_ds, n_emitters, dtype=torch.bool)
+    for dataset_id, dataset_name in label_map.dataset_names.items():
+        ds = int(dataset_id)
+        if ds < 0 or ds >= n_ds:
+            continue
+        offset = int(label_map.offsets.get(ds, -1))
+        if offset < 0:
+            continue
+        canonical_ids = _unique_canonical_ids_from_h5(_candidate_h5_paths(root, dataset_name))
+        for cid in canonical_ids:
+            if int(cid) < 0 or int(cid) >= int(lookup.numel()):
+                continue
+            local = int(lookup[int(cid)].item())
+            if local < 0:
+                continue
+            global_id = offset + local
+            if 0 <= global_id < n_emitters:
+                mask[ds, global_id] = True
+    if not bool(mask.any()):
+        return None
+    return mask
 
 
 def build_compact_modulation_label_map(

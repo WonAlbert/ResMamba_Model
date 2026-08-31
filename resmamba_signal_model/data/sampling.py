@@ -14,12 +14,6 @@ from torch.utils.data import Sampler, WeightedRandomSampler
 
 from resmamba_signal_model.data.rfdata import RFDataPoolDataset
 
-DEFAULT_FAMILY_QUOTAS: dict[str, float] = {
-    "tx_comm": 0.40,
-    "ld_radar": 0.35,
-    "radcom": 0.25,
-}
-
 BalancedSamplingStrategy = Literal[
     "none",
     "uniform",
@@ -631,7 +625,7 @@ DEFAULT_FAMILY_QUOTAS: dict[str, float] = {
 
 DEFAULT_SOURCE_GROUPS: dict[str, list[str]] = {
     "ld_radar": ["radchar", "radar_mod15", "cjr_mix"],
-    "tx_comm": ["rml2016_*", "xidian14", "panoradio_hf"],
+    "tx_comm": ["rml2016_*", "panoradio_hf"],
     "radcom": ["radcom_awgn", "radcom_dynamic", "radcom_ota"],
 }
 
@@ -642,6 +636,22 @@ def h5_dataset_stem(h5_name: str) -> str:
         if stem.endswith(suffix):
             return stem[: -len(suffix)]
     return stem.rsplit(".", 1)[0]
+
+
+def pool_sample_stems(pool: RFDataPoolDataset) -> list[str]:
+    """每个 pool 下标对应的 H5 stem（与 ``moe_route_stem`` / 验证分库统计一致）。"""
+    from resmamba_signal_model.data.rfdata import _h5_moe_route_stem
+
+    stems: list[str] = []
+    for sub in pool.datasets:
+        path = getattr(sub, "h5_path", None)
+        if path is None:
+            raise ValueError(f"pool 子数据集缺少 h5_path: {type(sub).__name__}")
+        stem = _h5_moe_route_stem(Path(path))
+        stems.extend([stem] * len(sub))
+    if len(stems) != len(pool):
+        raise ValueError(f"pool {pool.pool_name!r} stem 列表 {len(stems)} != {len(pool)}")
+    return stems
 
 
 def stem_matches_pattern(stem: str, pattern: str) -> bool:
@@ -663,17 +673,145 @@ def sqrt_size_weight(segment_size: int) -> float:
     return float(np.sqrt(max(int(segment_size), 1)))
 
 
+WithinFamilyWeightMode = Literal["equal", "sqrt_size"]
+
+
+def resolve_within_family_weight_mode(value: str | None) -> WithinFamilyWeightMode:
+    key = str(value or "sqrt_size").strip().lower()
+    if key in ("equal", "uniform", "dataset_equal"):
+        return "equal"
+    if key in ("sqrt", "sqrt_size", "sqrt_n", "size_sqrt"):
+        return "sqrt_size"
+    raise ValueError(f"未知 within_family_weight={value!r}，可选: equal | sqrt_size")
+
+
+def resolve_stem_sample_weight(
+    stem: str,
+    stem_sample_weights: Mapping[str, float] | None,
+    *,
+    default: float = 1.0,
+) -> float:
+    """查 ``stem_sample_weights``：先精确匹配，再 glob（如 ``rml2016_*``）。"""
+    if not stem_sample_weights:
+        return float(default)
+    name = h5_dataset_stem(str(stem))
+    if name in stem_sample_weights:
+        return max(0.0, float(stem_sample_weights[name]))
+    for pattern, weight in stem_sample_weights.items():
+        if stem_matches_pattern(name, str(pattern)):
+            return max(0.0, float(weight))
+    return float(default)
+
+
+def _clip_and_renorm_shares(weights: list[float], *, max_share: float | None) -> list[float]:
+    """将族内权重裁到 ``max_share`` 后重新归一化（迭代至收敛）。"""
+    if not weights:
+        return weights
+    out = [max(float(w), 0.0) for w in weights]
+    total = sum(out)
+    if total <= 0.0:
+        return [1.0] * len(out)
+    if max_share is None or not (0.0 < float(max_share) < 1.0):
+        return out
+    cap = float(max_share)
+    # 无法让每个分量都 ≤ cap 时（n * cap < 1），退回均匀。
+    if len(out) * cap < 1.0 - 1.0e-12:
+        return [1.0] * len(out)
+    for _ in range(32):
+        total = sum(out)
+        if total <= 0.0:
+            return [1.0] * len(out)
+        shares = [w / total for w in out]
+        if all(s <= cap + 1.0e-12 for s in shares):
+            return out
+        capped = [min(s, cap) for s in shares]
+        remainder = 1.0 - sum(capped)
+        free = [i for i, s in enumerate(shares) if s < cap - 1.0e-12]
+        if not free or remainder <= 0.0:
+            return [1.0] * len(out)
+        boost = remainder / float(len(free))
+        out = []
+        for i, s in enumerate(capped):
+            out.append(s + (boost if i in free else 0.0))
+    return out
+
+
 @dataclass(frozen=True)
 class HomogeneousSamplingPlan:
-    """族配额 + 族内 sqrt(N) 权重；用于 HomogeneousTokenBudgetSampler 与测试断言。"""
+    """族配额 + 族内权重；用于 HomogeneousTokenBudgetSampler 与测试断言。"""
 
     families: tuple[str, ...]
     family_weights: tuple[float, ...]
     segment_family: tuple[str, ...]
     within_family_segment_weights: tuple[tuple[float, ...], ...]
+    within_family_weight_mode: WithinFamilyWeightMode = "sqrt_size"
+    max_within_family_share: float | None = None
 
     def family_for_segment_index(self, segment_index: int) -> str:
         return self.segment_family[int(segment_index)]
+
+    def expected_stem_shares(self, segments: list[_DatasetSegment]) -> dict[str, float]:
+        """返回各 H5 stem 的期望 batch 采样份额（族配额 × 族内归一化权重）。"""
+        fam_total = sum(float(w) for w in self.family_weights)
+        if fam_total <= 0.0:
+            return {}
+        shares: dict[str, float] = {}
+        for fam_i, family in enumerate(self.families):
+            fam_w = float(self.family_weights[fam_i]) / fam_total
+            seg_indices = [i for i, fam in enumerate(self.segment_family) if fam == family]
+            weights = list(self.within_family_segment_weights[fam_i])
+            w_sum = sum(weights)
+            if w_sum <= 0.0 or not seg_indices:
+                continue
+            for seg_i, weight in zip(seg_indices, weights):
+                stem = h5_dataset_stem(segments[seg_i].h5_name)
+                shares[stem] = shares.get(stem, 0.0) + fam_w * (float(weight) / w_sum)
+        return shares
+
+
+def build_segment_length_buckets(
+    segments: list[_DatasetSegment],
+    lengths: list[int],
+) -> list[dict[int, list[int]]]:
+    """每个 segment 内按样本有效长度分桶 → 全局 pool 下标列表。"""
+    if len(lengths) != sum(seg.size for seg in segments):
+        raise ValueError(
+            f"lengths 长度 {len(lengths)} 与 segment 总样本数 "
+            f"{sum(seg.size for seg in segments)} 不一致"
+        )
+    out: list[dict[int, list[int]]] = []
+    for seg in segments:
+        by_len: dict[int, list[int]] = defaultdict(list)
+        for local in range(seg.size):
+            global_i = seg.offset + local
+            by_len[int(lengths[global_i])].append(global_i)
+        out.append(dict(by_len))
+    return out
+
+
+def build_segment_length_tiers(
+    segments: list[_DatasetSegment],
+    lengths: list[int],
+) -> dict[int, list[int]]:
+    """每个 segment 的固定 H5 长度 → segment 下标列表（canonical 定长池用）。"""
+    tiers: dict[int, list[int]] = defaultdict(list)
+    for seg_i, seg in enumerate(segments):
+        tiers[int(lengths[seg.offset])].append(seg_i)
+    return dict(tiers)
+
+
+HomogeneousLengthBucketWeightMode = Literal["equal", "proportional"]
+
+
+def resolve_homogeneous_length_bucket_weight(value: str | None) -> HomogeneousLengthBucketWeightMode:
+    key = str(value or "proportional").strip().lower()
+    if key in ("equal", "uniform"):
+        return "equal"
+    if key in ("proportional", "prop", "size"):
+        return "proportional"
+    raise ValueError(
+        f"未知 homogeneous_length_bucket_weight={value!r}，可选: equal | proportional"
+    )
 
 
 def build_homogeneous_sampling_plan(
@@ -681,9 +819,17 @@ def build_homogeneous_sampling_plan(
     *,
     source_groups: dict[str, list[str]] | None = None,
     family_quotas: dict[str, float] | None = None,
+    within_family_weight: str | WithinFamilyWeightMode | None = None,
+    max_within_family_share: float | None = None,
+    stem_sample_weights: Mapping[str, float] | None = None,
 ) -> HomogeneousSamplingPlan:
     groups = dict(source_groups or DEFAULT_SOURCE_GROUPS)
     quotas = dict(family_quotas or DEFAULT_FAMILY_QUOTAS)
+    weight_mode = resolve_within_family_weight_mode(
+        within_family_weight if within_family_weight is not None else "sqrt_size"
+    )
+    max_share = None if max_within_family_share is None else float(max_within_family_share)
+    manual_weights = dict(stem_sample_weights) if stem_sample_weights else None
 
     segment_family: list[str] = []
     for seg in segments:
@@ -724,7 +870,17 @@ def build_homogeneous_sampling_plan(
         seg_indices = [i for i, fam in enumerate(segment_family) if fam == family]
         if not seg_indices:
             continue
-        weights = [sqrt_size_weight(segments[i].size) for i in seg_indices]
+        if manual_weights is not None:
+            # 难库上采样 / 易库降权：相对权重；未列出的 stem 默认 1.0
+            weights = [
+                resolve_stem_sample_weight(h5_dataset_stem(segments[i].h5_name), manual_weights)
+                for i in seg_indices
+            ]
+        elif weight_mode == "equal":
+            weights = [1.0 for _ in seg_indices]
+        else:
+            weights = [sqrt_size_weight(segments[i].size) for i in seg_indices]
+        weights = _clip_and_renorm_shares(weights, max_share=max_share)
         if sum(weights) <= 0:
             continue
         families.append(family)
@@ -742,6 +898,8 @@ def build_homogeneous_sampling_plan(
         family_weights=tuple(family_weights),
         segment_family=tuple(segment_family),
         within_family_segment_weights=tuple(tuple(row) for row in within_family_weights),
+        within_family_weight_mode=weight_mode,
+        max_within_family_share=max_share,
     )
 
 
@@ -992,12 +1150,17 @@ def plan_fixed_token_budget_batches(
     num_batches: int,
     seed: int = 0,
     class_ids: list[int] | torch.Tensor | None = None,
+    stem_ids: list[str] | None = None,
+    full_stems: list[str] | tuple[str, ...] | None = None,
 ) -> list[list[int]]:
     """从 val 下标固定抽出最多 ``num_batches`` 个 token-budget batch。
 
     不回头、不重洗：样本用尽即停。同一 ``seed`` 永远得到同一组下标。
     传入 ``class_ids`` 时按类别分层：每类内部 shuffle，再 round-robin 交错，
     多数类不会占满；某一类用尽就跳过，不回头重复抽。
+
+    ``full_stems`` + ``stem_ids``：列出的 stem **整库入验证**（额外 batch，不占
+    ``num_batches`` 配额），避免小库被大库挤出固定 val 子集。
     """
     if int(token_budget) < 1:
         raise ValueError(f"token_budget 必须 >= 1，当前 {token_budget}")
@@ -1011,8 +1174,38 @@ def plan_fixed_token_budget_batches(
         class_ids = [int(x) for x in class_ids.tolist()]
     if class_ids is not None and len(class_ids) != len(lengths):
         raise ValueError(f"class_ids 长度 {len(class_ids)} 与 lengths {len(lengths)} 不一致")
+    if stem_ids is not None and len(stem_ids) != len(lengths):
+        raise ValueError(f"stem_ids 长度 {len(stem_ids)} 与 lengths {len(lengths)} 不一致")
     token_budget = int(token_budget)
     tokens = [n_tokens_for_length(int(length), patch_size) for length in lengths]
+    full_set = {str(s).strip() for s in (full_stems or []) if str(s).strip()}
+    if full_set and stem_ids is not None:
+        full_indices = [i for i, stem in enumerate(stem_ids) if stem in full_set]
+        other_indices = [i for i, stem in enumerate(stem_ids) if stem not in full_set]
+        other_class = None if class_ids is None else [int(class_ids[i]) for i in other_indices]
+        other_batches: list[list[int]] = []
+        if other_indices:
+            if other_class is None:
+                order = list(other_indices)
+                random.Random(int(seed)).shuffle(order)
+            else:
+                local_order = _stratified_round_robin_order(other_class, seed)
+                order = [other_indices[j] for j in local_order]
+            other_batches = _pack_order_into_token_batches(
+                order, tokens, token_budget, num_batches
+            )
+        full_batches: list[list[int]] = []
+        if full_indices:
+            full_batches = _pack_order_into_token_batches(
+                full_indices,
+                tokens,
+                token_budget,
+                num_batches=max(1, len(full_indices)),
+            )
+        merged = other_batches + full_batches
+        if not merged:
+            raise ValueError("plan_fixed_token_budget_batches 得不到任何 batch")
+        return merged
     if class_ids is None:
         order = list(range(len(tokens)))
         random.Random(int(seed)).shuffle(order)
@@ -1022,8 +1215,9 @@ def plan_fixed_token_budget_batches(
 
 
 class HomogeneousTokenBudgetSampler(Sampler[list[int]]):
-    """每个 batch 仅来自同一 H5 子数据集：先按族配额抽族，再按 sqrt(N_train) 抽 segment，再按 token_budget 组 batch。
+    """每个 batch 仅来自同一 H5：先按族配额抽族，再按族内权重抽 segment，再按 token_budget 组 batch。
 
+    族内权重默认 ``sqrt_size``；预训练可切 ``equal`` 并设 ``max_within_family_share`` 限制大库。
     文件身份只用于采样，不得进入模型 batch。
     """
 
@@ -1038,6 +1232,14 @@ class HomogeneousTokenBudgetSampler(Sampler[list[int]]):
         lengths: list[int] | None = None,
         source_groups: dict[str, list[str]] | None = None,
         family_quotas: dict[str, float] | None = None,
+        within_family_weight: str | None = None,
+        max_within_family_share: float | None = None,
+        stem_sample_weights: Mapping[str, float] | None = None,
+        homogeneous_length_bucket: bool = False,
+        homogeneous_length_bucket_weight: str | None = None,
+        homogeneous_length_tier: bool = False,
+        homogeneous_stem_sticky_batches: int = 0,
+        chronos_length_tier_pool: bool = False,
     ) -> None:
         if token_budget < 1:
             raise ValueError(f"token_budget 必须 >= 1，当前 {token_budget}")
@@ -1048,6 +1250,15 @@ class HomogeneousTokenBudgetSampler(Sampler[list[int]]):
             raise ValueError(f"pool {pool.pool_name!r} 无有效 segment")
         self._lengths = list(lengths) if lengths is not None else pool_sample_lengths(pool)
         self._tokens = [n_tokens_for_length(length, patch_size) for length in self._lengths]
+        self._homogeneous_length_bucket = bool(homogeneous_length_bucket)
+        self._length_bucket_weight = resolve_homogeneous_length_bucket_weight(
+            homogeneous_length_bucket_weight
+        )
+        self._segment_length_buckets = build_segment_length_buckets(self._segments, self._lengths)
+        self._length_tier_segments = build_segment_length_tiers(self._segments, self._lengths)
+        self._homogeneous_length_tier = bool(homogeneous_length_tier)
+        self._stem_sticky_batches = max(0, int(homogeneous_stem_sticky_batches))
+        self._chronos_length_tier_pool = bool(chronos_length_tier_pool)
         total_tokens = sum(self._tokens)
         self._num_batches = (
             num_batches if num_batches is not None else max(1, (total_tokens + token_budget - 1) // token_budget)
@@ -1057,6 +1268,9 @@ class HomogeneousTokenBudgetSampler(Sampler[list[int]]):
             self._segments,
             source_groups=source_groups,
             family_quotas=family_quotas,
+            within_family_weight=within_family_weight,
+            max_within_family_share=max_within_family_share,
+            stem_sample_weights=stem_sample_weights,
         )
         self._family_segment_indices: list[list[int]] = []
         for family in self._plan.families:
@@ -1071,46 +1285,199 @@ class HomogeneousTokenBudgetSampler(Sampler[list[int]]):
     def __len__(self) -> int:
         return self._num_batches
 
+    def _pick_length_tier(self, rng: random.Random) -> int:
+        tiers = sorted(self._length_tier_segments.keys())
+        if not tiers:
+            raise ValueError("无长度档位")
+        if len(tiers) == 1:
+            return int(tiers[0])
+        weights = [
+            float(sum(self._segments[i].size for i in self._length_tier_segments[tier]))
+            for tier in tiers
+        ]
+        return int(rng.choices(tiers, weights=weights, k=1)[0])
+
+    def _pick_segment_index_eligible(self, rng: random.Random, eligible: list[int]) -> int:
+        if not eligible:
+            raise ValueError("eligible segments 为空")
+        if len(eligible) == 1:
+            return int(eligible[0])
+        weights = [float(self._segments[i].size) for i in eligible]
+        return int(rng.choices(eligible, weights=weights, k=1)[0])
+
     def _pick_segment_index(self, rng: random.Random) -> int:
         family_i = rng.choices(range(len(self._plan.families)), weights=self._plan.family_weights, k=1)[0]
         seg_indices = self._family_segment_indices[family_i]
         seg_weights = self._plan.within_family_segment_weights[family_i]
         return int(rng.choices(seg_indices, weights=seg_weights, k=1)[0])
 
+    def _pick_length_bucket(self, rng: random.Random, seg_i: int) -> int:
+        buckets = self._segment_length_buckets[seg_i]
+        lengths = sorted(buckets.keys())
+        if not lengths:
+            raise ValueError(f"segment {seg_i} 无长度桶")
+        if len(lengths) == 1:
+            return int(lengths[0])
+        if self._length_bucket_weight == "equal":
+            weights = [1.0] * len(lengths)
+        else:
+            weights = [float(len(buckets[length])) for length in lengths]
+        return int(rng.choices(lengths, weights=weights, k=1)[0])
+
+    def _fill_batch_from_order(
+        self,
+        rng: random.Random,
+        order: list[int],
+        pos: int,
+    ) -> tuple[list[int], int]:
+        n = len(order)
+        batch: list[int] = []
+        used = 0
+        while True:
+            if pos >= n:
+                rng.shuffle(order)
+                pos = 0
+            idx = order[pos]
+            cost = self._tokens[idx]
+            if not batch:
+                batch.append(idx)
+                used += cost
+                pos += 1
+                if used >= self.token_budget:
+                    break
+                continue
+            if used + cost > self.token_budget:
+                break
+            batch.append(idx)
+            used += cost
+            pos += 1
+            if used >= self.token_budget:
+                break
+        return batch, pos
+
+    def _segment_sampling_weight(self, seg_i: int) -> float:
+        family = self._plan.segment_family[seg_i]
+        try:
+            fam_i = self._plan.families.index(family)
+        except ValueError:
+            return float(max(self._segments[seg_i].size, 1))
+        seg_indices = self._family_segment_indices[fam_i]
+        try:
+            local_j = seg_indices.index(seg_i)
+        except ValueError:
+            return 0.0
+        fam_w = float(self._plan.family_weights[fam_i])
+        within = float(self._plan.within_family_segment_weights[fam_i][local_j])
+        return max(fam_w * within, 0.0)
+
+    def _draw_one_sample_index(
+        self,
+        rng: random.Random,
+        seg_i: int,
+        *,
+        bucket_state: dict[tuple[int, int], tuple[list[int], int]],
+        orders: list[list[int]],
+        pos: list[int],
+    ) -> int:
+        if self._homogeneous_length_bucket:
+            length = self._pick_length_bucket(rng, seg_i)
+            key = (seg_i, length)
+            if key not in bucket_state:
+                indices = list(self._segment_length_buckets[seg_i][length])
+                rng.shuffle(indices)
+                bucket_state[key] = (indices, 0)
+            order, start_pos = bucket_state[key]
+            if start_pos >= len(order):
+                rng.shuffle(order)
+                start_pos = 0
+            idx = order[start_pos]
+            bucket_state[key] = (order, start_pos + 1)
+            return int(idx)
+        order = orders[seg_i]
+        if pos[seg_i] >= len(order):
+            rng.shuffle(order)
+            pos[seg_i] = 0
+        idx = order[pos[seg_i]]
+        pos[seg_i] += 1
+        return int(idx)
+
+    def _fill_batch_chronos_tier_pool(
+        self,
+        rng: random.Random,
+        tier: int,
+        *,
+        bucket_state: dict[tuple[int, int], tuple[list[int], int]],
+        orders: list[list[int]],
+        pos: list[int],
+    ) -> list[int]:
+        eligible = list(self._length_tier_segments.get(int(tier), []))
+        if not eligible:
+            raise ValueError(f"长度 tier {tier} 无可用 segment")
+        weights = [max(self._segment_sampling_weight(i), 1.0e-9) for i in eligible]
+        batch: list[int] = []
+        used = 0
+        while True:
+            seg_i = int(rng.choices(eligible, weights=weights, k=1)[0])
+            idx = self._draw_one_sample_index(
+                rng, seg_i, bucket_state=bucket_state, orders=orders, pos=pos
+            )
+            cost = int(self._tokens[idx])
+            if not batch:
+                batch.append(idx)
+                used += cost
+            elif used + cost > self.token_budget:
+                break
+            else:
+                batch.append(idx)
+                used += cost
+            if used >= self.token_budget:
+                break
+        return batch
+
     def __iter__(self) -> Iterator[list[int]]:
         rng = random.Random(self._seed)
         orders: list[list[int]] = []
+        pos: list[int] = []
         for seg in self._segments:
             order = list(range(seg.offset, seg.offset + seg.size))
             rng.shuffle(order)
             orders.append(order)
-        pos = [0] * len(self._segments)
+            pos.append(0)
+        bucket_state: dict[tuple[int, int], tuple[list[int], int]] = {}
+        sticky_seg: int | None = None
+        sticky_remain = 0
         for _ in range(self._num_batches):
-            seg_i = self._pick_segment_index(rng)
-            order = orders[seg_i]
-            n = len(order)
-            batch: list[int] = []
-            used = 0
-            while True:
-                if pos[seg_i] >= n:
-                    rng.shuffle(order)
-                    pos[seg_i] = 0
-                idx = order[pos[seg_i]]
-                cost = self._tokens[idx]
-                if not batch:
-                    batch.append(idx)
-                    used += cost
-                    pos[seg_i] += 1
-                    if used >= self.token_budget:
-                        break
-                    continue
-                if used + cost > self.token_budget:
-                    break
-                batch.append(idx)
-                used += cost
-                pos[seg_i] += 1
-                if used >= self.token_budget:
-                    break
+            if self._chronos_length_tier_pool:
+                tier = self._pick_length_tier(rng)
+                batch = self._fill_batch_chronos_tier_pool(
+                    rng, tier, bucket_state=bucket_state, orders=orders, pos=pos
+                )
+                yield batch
+                continue
+            if sticky_remain <= 0:
+                if self._homogeneous_length_tier:
+                    tier = self._pick_length_tier(rng)
+                    seg_i = self._pick_segment_index_eligible(rng, self._length_tier_segments[tier])
+                else:
+                    seg_i = self._pick_segment_index(rng)
+                sticky_seg = seg_i
+                sticky_remain = self._stem_sticky_batches
+            else:
+                seg_i = sticky_seg if sticky_seg is not None else self._pick_segment_index(rng)
+                sticky_remain -= 1
+            if self._homogeneous_length_bucket:
+                length = self._pick_length_bucket(rng, seg_i)
+                key = (seg_i, length)
+                if key not in bucket_state:
+                    indices = list(self._segment_length_buckets[seg_i][length])
+                    rng.shuffle(indices)
+                    bucket_state[key] = (indices, 0)
+                order, start_pos = bucket_state[key]
+                batch, next_pos = self._fill_batch_from_order(rng, order, start_pos)
+                bucket_state[key] = (order, next_pos)
+            else:
+                batch, next_pos = self._fill_batch_from_order(rng, orders[seg_i], pos[seg_i])
+                pos[seg_i] = next_pos
             yield batch
 
 

@@ -4,6 +4,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+import h5py
+import numpy as np
 import torch
 import yaml
 
@@ -181,6 +183,103 @@ def h5_dataset_name(filename: str) -> str:
 def filter_emitter_downstream_pool(files: list[str], allowed_datasets: list[str] | set[str]) -> list[str]:
     allowed = set(allowed_datasets)
     return sorted(filename for filename in files if h5_dataset_name(filename) in allowed)
+
+
+def _candidate_h5_paths(root: Path, dataset_name: str) -> list[Path]:
+    paths: list[Path] = []
+    for split in ("test", "val", "train"):
+        for base in (root / "h5", root):
+            path = base / f"{dataset_name}_{split}.h5"
+            if path.is_file():
+                paths.append(path)
+    return paths
+
+
+def _local_class_count_for_dataset(
+    root: Path,
+    dataset_name: str,
+    *,
+    modulations: dict | None = None,
+) -> int:
+    table = (modulations or {}).get(dataset_name) or {}
+    if table:
+        return len(table)
+    counts: set[int] = set()
+    for path in _candidate_h5_paths(root, dataset_name):
+        with h5py.File(path, "r") as handle:
+            if "mod_label_id" not in handle:
+                continue
+            arr = np.asarray(handle["mod_label_id"][:], dtype=np.int64)
+            counts.update(int(x) for x in np.unique(arr) if int(x) >= 0)
+    return len(counts)
+
+
+def _dataset_id_for_name(
+    root: Path,
+    dataset_name: str,
+    dataset_id_by_name: dict[str, int],
+) -> int | None:
+    if dataset_name in dataset_id_by_name:
+        return int(dataset_id_by_name[dataset_name])
+    for path in _candidate_h5_paths(root, dataset_name):
+        with h5py.File(path, "r") as handle:
+            if "dataset_id" not in handle:
+                continue
+            arr = np.asarray(handle["dataset_id"][:], dtype=np.int64)
+            valid = arr[arr >= 0]
+            if valid.size:
+                return int(valid[0])
+    return None
+
+
+def build_global_radar_model_label_map(
+    rfdata_root: str | Path,
+    *,
+    dataset_names: list[str] | None = None,
+    config_path: str | Path | None = None,
+    train_cfg: dict | None = None,
+) -> GlobalEmitterLabelMap:
+    """``ld_model`` 雷达型号识别：按数据集局部 ``mod_label_id`` 拼紧凑全局类空间。"""
+    from resmamba_signal_model.training.pool_filters import load_downstream_radar_model_datasets
+
+    root = Path(rfdata_root)
+    maps_path = root / "label_maps.json"
+    if not maps_path.is_file():
+        raise FileNotFoundError(f"缺少 label_maps.json: {maps_path}")
+    with maps_path.open("r", encoding="utf-8") as handle:
+        label_maps = json.load(handle)
+
+    if dataset_names is None:
+        dataset_names = load_downstream_radar_model_datasets(root, config_path=config_path)
+    dataset_id_by_name = {
+        str(name): int(dataset_id) for dataset_id, name in label_maps.get("datasets", {}).items()
+    }
+    modulations = label_maps.get("modulations") or {}
+
+    offsets: dict[int, int] = {}
+    dataset_name_by_id: dict[int, str] = {}
+    class_counts: dict[int, int] = {}
+    next_offset = 0
+    for dataset_name in dataset_names:
+        dataset_id = _dataset_id_for_name(root, str(dataset_name), dataset_id_by_name)
+        if dataset_id is None:
+            continue
+        n_classes = _local_class_count_for_dataset(root, str(dataset_name), modulations=modulations)
+        if n_classes <= 0:
+            continue
+        if dataset_id in offsets:
+            continue
+        offsets[dataset_id] = next_offset
+        dataset_name_by_id[dataset_id] = str(dataset_name)
+        class_counts[dataset_id] = n_classes
+        next_offset += n_classes
+
+    return GlobalEmitterLabelMap(
+        offsets=offsets,
+        dataset_names=dataset_name_by_id,
+        num_emitters=next_offset,
+        class_counts=class_counts,
+    )
 
 
 def build_global_emitter_label_map(

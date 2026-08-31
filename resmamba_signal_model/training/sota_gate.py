@@ -127,7 +127,7 @@ def build_gate_jobs() -> list[GateJob]:
             depends_on=("validity_pytest",),
             requires=full,
             gpu_mode="all",
-            metrics=("monitor_value", "val/ssim", "val/impute_mse"),
+            metrics=("monitor_value", "val/ssim", "val/recon_mse"),
         ),
         _job(
             id="validity_stage2",

@@ -30,6 +30,22 @@ def _set_module_grad(module: nn.Module | None, enabled: bool) -> None:
         param.requires_grad = bool(enabled)
 
 
+def _skip_generation_head_training(model: nn.Module, task: str) -> bool:
+    """统一 query decoder 生成任务不训 encoder 侧 Prediction/Imputation 头。"""
+    kind_fn = getattr(model, "task_kind", None)
+    if not callable(kind_fn):
+        return False
+    kind = str(kind_fn(task))
+    if kind not in ("prediction", "imputation"):
+        return False
+    cfg = getattr(model, "cfg", None)
+    if cfg is None:
+        return False
+    if bool(getattr(cfg, "use_legacy_generation_heads", False)):
+        return False
+    return bool(getattr(cfg, "force_unified_generation", False))
+
+
 def _iter_task_heads(model: nn.Module) -> Iterable[tuple[str, nn.Module]]:
     for task, attr in HEAD_MODULE_NAMES.items():
         head = getattr(model, attr, None)
@@ -47,6 +63,8 @@ def _freeze_all(model: nn.Module) -> None:
 
 
 def _unfreeze_head_for_task(model: nn.Module, task: str) -> None:
+    if _skip_generation_head_training(model, task):
+        return
     head = getattr(model, HEAD_MODULE_NAMES.get(task, ""), None)
     extra = getattr(model, "extra_task_heads", None)
     if head is None and isinstance(extra, nn.ModuleDict) and task in extra:
@@ -68,6 +86,9 @@ def apply_stage_freeze(
     stage = str(stage)
     model.truncate_backward = False  # type: ignore[attr-defined]
     model.skip_recon = False  # type: ignore[attr-defined]
+    model.skip_revin = bool(  # type: ignore[attr-defined]
+        train_cfg.get("skip_revin", stage in ("stage2", "stage3", "joint", "continual"))
+    )
 
     if stage == "pretrain":
         for param in model.parameters():
@@ -142,7 +163,14 @@ def apply_stage_freeze(
             _unfreeze_dt_bias(model)
         return
 
-    raise ValueError(f"未知 stage {stage!r}，可选: pretrain/stage2/stage3/joint")
+    if stage == "continual":
+        model.skip_recon = bool(train_cfg.get("skip_recon", True))  # type: ignore[attr-defined]
+        from resmamba_signal_model.training.continual import apply_continual_freeze
+
+        apply_continual_freeze(model)
+        return
+
+    raise ValueError(f"未知 stage {stage!r}，可选: pretrain/stage2/stage3/joint/continual")
 
 
 def _unfreeze_dt_bias(model: nn.Module) -> None:
@@ -164,6 +192,11 @@ def specialist_state_prefixes(task: str) -> tuple[str, ...]:
     return (f"{head}.", f"extra_task_heads.{task}.", f"task_adapters.{task}.")
 
 
+def stage2_task_state_prefixes(task: str) -> tuple[str, ...]:
+    """阶段二 ``task_schedule`` 按任务合并 best 时要写入的模块前缀（含 z 探针）。"""
+    return specialist_state_prefixes(task) + (f"z_linear_probes.{task}.",)
+
+
 def filter_specialist_state(state: dict[str, Any], task: str) -> dict[str, Any]:
     prefixes = specialist_state_prefixes(task)
     filtered: dict[str, Any] = {}
@@ -173,6 +206,24 @@ def filter_specialist_state(state: dict[str, Any], task: str) -> dict[str, Any]:
         elif any(key.startswith(prefix) for prefix in prefixes):
             filtered[key] = value
     return filtered
+
+
+def filter_stage2_task_state(state: dict[str, Any], task: str) -> dict[str, Any]:
+    """从完整 ``state_dict`` 中取出 stage2 单任务 best 片段（头 + z 探针）。"""
+    prefixes = stage2_task_state_prefixes(task)
+    return {
+        key: value
+        for key, value in state.items()
+        if any(key.startswith(prefix) for prefix in prefixes)
+    }
+
+
+def merge_stage2_task_states(base_state: dict[str, Any], task_states: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """把各任务 best 片段覆盖到 ``base_state`` 上，得到 composite ``best.ckpt``。"""
+    merged = dict(base_state)
+    for _task, partial in task_states.items():
+        merged.update(partial)
+    return merged
 
 
 def default_stage3_tasks(train_cfg: dict[str, Any] | None = None) -> tuple[str, ...]:

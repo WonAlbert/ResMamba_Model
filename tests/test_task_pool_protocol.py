@@ -52,6 +52,15 @@ def test_finalize_task_pools_maps_train_test_val(tmp_path: Path) -> None:
             value=value,
         )
         _write_h5(
+            h5 / f"rml2016_10a_{split}.h5",
+            n=6,
+            task_id=0,
+            dataset_id=3,
+            field="mod_label_id",
+            labels=mod_labels,
+            value=value,
+        )
+        _write_h5(
             h5 / f"radar_mod15_{split}.h5",
             n=6,
             task_id=0,
@@ -85,15 +94,17 @@ def test_finalize_task_pools_maps_train_test_val(tmp_path: Path) -> None:
     assert "radar_mod15_train.h5" in pools["pretrain_train"]
     assert "electromagnetic_0926_train.h5" not in pools["pretrain_train"]
     assert "communication_emitters_train.h5" not in pools["pretrain_train"]
-    assert pools["downstream_comm_modulation_train"] == ["rml2016_04c_test.h5"]
-    assert pools["downstream_comm_modulation_val"] == ["rml2016_04c_val.h5"]
+    assert pools["downstream_comm_modulation_train"] == ["rml2016_04c_test.h5", "rml2016_10a_test.h5"]
+    assert pools["downstream_comm_modulation_val"] == ["rml2016_04c_val.h5", "rml2016_10a_val.h5"]
     assert pools["downstream_radar_model_train"] == ["radar_mod15_test.h5"]
     assert pools["downstream_radar_model_val"] == ["radar_mod15_val.h5"]
-    assert pools["downstream_modulation_train"] == ["rml2016_04c_test.h5"]
+    assert pools["downstream_modulation_train"] == ["rml2016_04c_test.h5", "rml2016_10a_test.h5"]
     assert pools["downstream_emitter_train"] == []
     assert "rml2016_04c_train.h5" not in pools["downstream_comm_modulation_train"]
     assert "radar_mod15_train.h5" not in pools["downstream_radar_model_train"]
-    assert "rml2016_04c_test.h5" in pools["clustering_comm_train"]
+    assert "rml2016_10a_test.h5" in pools["clustering_comm_train"]
+    assert "rml2016_10a_val.h5" in pools["clustering_comm_val"]
+    assert "radar_mod15_test.h5" in pools["clustering_radar_train"]
     assert "radar_mod15_val.h5" in pools["clustering_radar_val"]
 
 

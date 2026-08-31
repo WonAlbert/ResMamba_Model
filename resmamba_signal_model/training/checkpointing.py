@@ -10,10 +10,15 @@ from typing import Any
 import torch
 
 from resmamba_signal_model.models.heads import remap_task_head_checkpoints
+from resmamba_signal_model.training.freeze import (
+    filter_stage2_task_state,
+    merge_stage2_task_states,
+)
 from resmamba_signal_model.training.selection import (
     resolve_checkpoint_monitor_name,
     specialist_relative_geomean,
 )
+from resmamba_signal_model.training.task_catalog import KIND_MONITOR, resolve_task_catalog
 
 try:
     from lightning.fabric.utilities.rank_zero import rank_zero_info
@@ -141,22 +146,120 @@ def aggregate_val_monitor(callback_metrics: dict[str, Any]) -> float | None:
     return float(sum(values) / len(values))
 
 
+_DATALOADER_IDX_RE = re.compile(r"/dataloader_idx_\d+$")
+
+
 def _metric_from_callbacks(callback_metrics: dict[str, Any], *keys: str) -> float | None:
     for key in keys:
-        if key in callback_metrics:
-            return float(callback_metrics[key].detach() if torch.is_tensor(callback_metrics[key]) else callback_metrics[key])
+        parsed = _as_finite_float(callback_metrics.get(key))
+        if parsed is not None:
+            return parsed
     for stored, value in callback_metrics.items():
-        name = str(stored)
+        name = _DATALOADER_IDX_RE.sub("", str(stored))
         for key in keys:
             if name == key or name.startswith(key + "/"):
-                return float(value.detach() if torch.is_tensor(value) else value)
+                parsed = _as_finite_float(value)
+                if parsed is not None:
+                    return parsed
+    return None
+
+
+def resolve_task_checkpoint_monitor(
+    train_cfg: dict[str, Any],
+    *,
+    stage: str,
+    task: str,
+) -> tuple[str, str, tuple[str, ...]]:
+    """段内选模：返回 ``(primary_monitor, mode, monitor_fallbacks)``。"""
+    profiles = train_cfg.get("task_profiles") or {}
+    profile = profiles.get(task) if isinstance(profiles, dict) else None
+    if isinstance(profile, dict) and profile.get("checkpoint_monitor"):
+        monitor = str(profile["checkpoint_monitor"]).strip()
+        mode = checkpoint_mode_for_monitor(monitor, train_cfg.get("checkpoint_mode"))
+        return monitor, mode, (monitor,)
+
+    catalog = resolve_task_catalog(train_cfg)
+    spec = catalog.get(task)
+    metric = (spec.monitor if spec is not None else None) or KIND_MONITOR.get(
+        spec.kind if spec is not None else "classification",
+        "f1",
+    )
+    if metric == "f1":
+        primary = f"val/f1_{task}"
+        fallbacks = (primary, f"val/acc_{task}", f"val/macro_f1_{task}")
+    elif metric == "nmi_within_domain":
+        primary = f"val/macro_nmi_{task}"
+        fallbacks = (primary, f"val/nmi_{task}", "val/nmi_within_domain")
+    elif metric == "mse":
+        primary = "val/mse_prediction" if task == "prediction" else f"val/mse_{task}"
+        fallbacks = (primary, "val/mse", f"val/macro_mse_{task}")
+        return primary, "min", fallbacks
+    else:
+        primary = f"val/{metric}_{task}"
+        fallbacks = (primary,)
+    mode = checkpoint_mode_for_monitor(primary, train_cfg.get("checkpoint_mode"))
+    return primary, mode, fallbacks
+
+
+def metric_is_improved(new: float, best: float | None, *, mode: str) -> bool:
+    if best is None:
+        return True
+    if mode == "min":
+        return new < best
+    return new > best
+
+
+def read_task_monitor_value(callback_metrics: dict[str, Any], fallbacks: tuple[str, ...]) -> float | None:
+    for key in fallbacks:
+        value = _metric_from_callbacks(callback_metrics, key)
+        if value is not None:
+            return value
     return None
 
 
 _VAL_TASK_METRIC_RE = re.compile(
-    r"^val/(?P<metric>acc|f1|nmi|ssim|mse|macro_acc|macro_f1|macro_mse|macro_ssim)_(?P<task>[^/]+)(?:/(?P<dataset>.+))?$"
+    r"^val/(?P<metric>acc|f1|miss_rate|nmi|mse|mae|macro_acc|macro_f1|macro_mse|ssim)_(?P<task>[^/]+)(?:/(?P<dataset>.+))?$"
 )
-_DATALOADER_IDX_RE = re.compile(r"/dataloader_idx_\d+$")
+
+
+def _task_metric_bases(task_report: dict[str, Any] | None) -> set[str]:
+    bases: set[str] = set()
+    for task in task_report or {}:
+        name = str(task)
+        bases.add(name[:-2] if name.endswith("_z") else name)
+    return bases
+
+
+def prune_inactive_task_val_metrics(
+    callback_metrics: dict[str, Any],
+    task_report: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """``task_schedule`` 单任务验证时去掉其它任务残留在 callback_metrics 里的 val 指标。"""
+    active = _task_metric_bases(task_report)
+    if not active:
+        return dict(callback_metrics)
+    pruned: dict[str, Any] = {}
+    for key, value in callback_metrics.items():
+        name = _DATALOADER_IDX_RE.sub("", str(key))
+        if not name.startswith("val/"):
+            pruned[key] = value
+            continue
+        short = name[4:]
+        if "/" in short:
+            prefix = short.split("/", 1)[0]
+            base = prefix[:-2] if prefix.endswith("_z") else prefix
+            if base not in active:
+                continue
+            pruned[key] = value
+            continue
+        match = _VAL_TASK_METRIC_RE.match(name)
+        if match:
+            task = str(match.group("task"))
+            base = task[:-2] if task.endswith("_z") else task
+            if base not in active:
+                continue
+        pruned[key] = value
+    return pruned
 
 
 def extract_task_selection_metrics(callback_metrics: dict[str, Any]) -> dict[str, dict[str, float]]:
@@ -180,6 +283,9 @@ def extract_task_selection_metrics(callback_metrics: dict[str, Any]) -> dict[str
             continue
         if name in ("val/mse_prediction", "val/mse"):
             add("prediction", "mse", raw)
+            continue
+        if name in ("val/mae_prediction", "val/mae"):
+            add("prediction", "mae", raw)
             continue
         if name in ("val/mse_imputation", "val/impute_mse"):
             add("imputation", "mse", raw)
@@ -237,6 +343,35 @@ def aggregate_specialist_geomean(
 def aggregate_multitask_geomean(callback_metrics: dict[str, Any]) -> float | None:
     """stage2/downstream：任务指标几何平均，不使用 ``val/loss`` 均值。"""
     return aggregate_specialist_geomean(callback_metrics, None)
+
+
+CLASSIFICATION_TASK_NAMES: tuple[str, ...] = ("ld_intrapulse", "ld_model", "tx_modulation")
+
+
+def aggregate_classification_geomean(
+    callback_metrics: dict[str, Any],
+    *,
+    task_names: tuple[str, ...] | None = None,
+) -> float | None:
+    """stage2 分类门控：仅调制/个体三类，不含聚类与 prediction。"""
+    names = task_names or CLASSIFICATION_TASK_NAMES
+    task_metrics = extract_task_selection_metrics(callback_metrics)
+    filtered = {name: metrics for name, metrics in task_metrics.items() if name in names}
+    if not filtered:
+        return None
+    try:
+        score, _details = specialist_relative_geomean(
+            filtered,
+            {name: 1.0 for name in filtered},
+        )
+    except ValueError:
+        return None
+    return float(score)
+
+
+def resolve_composite_exclude_tasks(train_cfg: dict[str, Any]) -> frozenset[str]:
+    raw = train_cfg.get("composite_exclude_tasks") or []
+    return frozenset(str(item) for item in raw)
 
 
 def strip_state_prefix(state: dict[str, Any]) -> dict[str, Any]:
@@ -354,25 +489,42 @@ else:
     ExceptionSafeModelCheckpoint = None  # type: ignore[assignment, misc]
 
 
-def make_model_checkpoint(dirpath: Path, *, monitor: str, mode: str) -> Any:
+def make_model_checkpoint(
+    dirpath: Path,
+    *,
+    monitor: str,
+    mode: str,
+    save_last: bool = False,
+    save_best: bool = True,
+) -> Any:
     if ModelCheckpoint is None:
         raise ImportError("需要 lightning 才能创建 ModelCheckpoint")
     dirpath.mkdir(parents=True, exist_ok=True)
-    return ExceptionSafeModelCheckpoint(
-        dirpath=str(dirpath),
-        filename="best",
-        monitor=monitor,
-        mode=mode,
-        save_top_k=1,
-        save_last=False,
-        save_on_exception=True,
-        save_weights_only=False,
-        auto_insert_metric_name=False,
-        enable_version_counter=False,
-        save_on_train_epoch_end=False,
-        every_n_epochs=1,
-        verbose=True,
-    )
+    kwargs: dict[str, Any] = {
+        "dirpath": str(dirpath),
+        "save_on_exception": True,
+        "save_weights_only": False,
+        "auto_insert_metric_name": False,
+        "enable_version_counter": False,
+        "save_on_train_epoch_end": False,
+        "every_n_epochs": 1,
+        "verbose": True,
+        "save_last": bool(save_last),
+    }
+    if save_best:
+        kwargs.update(
+            filename="best",
+            monitor=monitor,
+            mode=mode,
+            save_top_k=1,
+        )
+    else:
+        kwargs.update(
+            filename="best",
+            monitor=None,
+            save_top_k=0,
+        )
+    return ExceptionSafeModelCheckpoint(**kwargs)
 
 
 def _metric_float(value: Any) -> float | None:
@@ -386,6 +538,171 @@ def _metric_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+class TaskCompositeCheckpointCallback(Callback):
+    """``task_schedule`` stage2：段内按任务 monitor 保存 best 头，合并写入 ``best.ckpt``。"""
+
+    def __init__(
+        self,
+        dirpath: Path,
+        train_cfg: dict[str, Any],
+        *,
+        stage: str = "stage2",
+    ) -> None:
+        super().__init__()
+        self.dirpath = Path(dirpath)
+        self.train_cfg = train_cfg
+        self.stage = str(stage)
+        self.best_path = self.dirpath / "best.ckpt"
+        self._task_bests: dict[str, dict[str, Any]] = {}
+        self.best_model_path: str | None = None
+        self.best_model_score: float | None = None
+
+    def task_best_summary(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for task, payload in self._task_bests.items():
+            out[task] = {
+                "monitor": payload.get("monitor"),
+                "score": payload.get("score"),
+                "epoch": payload.get("epoch"),
+                "mode": payload.get("mode"),
+            }
+        return out
+
+    def composite_geomean(self) -> float | None:
+        if not self._task_bests:
+            return None
+        exclude = resolve_composite_exclude_tasks(self.train_cfg)
+        task_metrics: dict[str, dict[str, float]] = {}
+        for task, payload in self._task_bests.items():
+            if task in exclude:
+                continue
+            metric_name = str(payload.get("selection_metric") or "f1")
+            if metric_name in ("mse", "recon_mse"):
+                raw = float(payload.get("score", 0.0))
+                task_metrics[task] = {"mse": raw}
+            elif metric_name in ("nmi_within_domain", "mean_nmi", "macro_nmi", "nmi"):
+                raw = float(payload.get("score", 0.0))
+                task_metrics[task] = {"nmi_within_domain": raw, "nmi": raw}
+            elif metric_name == "f1":
+                task_metrics[task] = {"f1": float(payload.get("score", 0.0))}
+            else:
+                task_metrics[task] = {metric_name: float(payload.get("score", 0.0))}
+        try:
+            score, _details = specialist_relative_geomean(task_metrics, {name: 1.0 for name in task_metrics})
+        except ValueError:
+            return None
+        return float(score)
+
+    def _active_tasks(self, pl_module: Any) -> list[str]:
+        tasks = list(self.train_cfg.get("active_train_tasks") or [])
+        if tasks:
+            return [str(task) for task in tasks]
+        report = getattr(pl_module, "_last_val_report", None) or {}
+        return [str(task) for task in report if not str(task).endswith("_z")]
+
+    def _selection_metric_name(self, task: str) -> str:
+        catalog = resolve_task_catalog(self.train_cfg)
+        spec = catalog.get(task)
+        if spec is not None and spec.monitor:
+            return str(spec.monitor)
+        return KIND_MONITOR.get(spec.kind if spec is not None else "classification", "f1")
+
+    def _save_composite(self, trainer: Any, pl_module: Any) -> None:
+        if not self._task_bests:
+            return
+        self.dirpath.mkdir(parents=True, exist_ok=True)
+        live_state = {key: value.detach().cpu() for key, value in pl_module.state_dict().items()}
+        merged = merge_stage2_task_states(
+            live_state,
+            {task: payload["state"] for task, payload in self._task_bests.items()},
+        )
+        backup = {key: value.detach().cpu().clone() for key, value in pl_module.state_dict().items()}
+        pl_module.load_state_dict(merged, strict=False)
+        try:
+            connector = getattr(trainer, "_checkpoint_connector", None)
+            if connector is not None and hasattr(connector, "dump_checkpoint"):
+                checkpoint = connector.dump_checkpoint()
+            else:
+                checkpoint = {
+                    "epoch": int(getattr(trainer, "current_epoch", 0)),
+                    "global_step": int(getattr(trainer, "global_step", 0)),
+                    "state_dict": pl_module.state_dict(),
+                }
+            if isinstance(checkpoint, dict):
+                checkpoint["composite_task_best"] = self.task_best_summary()
+                checkpoint["composite_geomean"] = self.composite_geomean()
+            torch.save(checkpoint, self.best_path)
+        finally:
+            pl_module.load_state_dict(backup, strict=False)
+        self.best_model_path = str(self.best_path)
+        self.best_model_score = self.composite_geomean()
+        if rank_zero_info is not None:
+            rank_zero_info(
+                f"TaskCompositeCheckpoint: wrote {self.best_path} tasks={sorted(self._task_bests)} "
+                f"geomean={self.best_model_score}"
+            )
+
+    def on_validation_end(self, trainer: Any, pl_module: Any) -> None:
+        if getattr(trainer, "sanity_checking", False):
+            return
+        if self.stage != "stage2" or not self.train_cfg.get("task_schedule"):
+            return
+        metrics = dict(getattr(trainer, "callback_metrics", {}) or {})
+        report = getattr(pl_module, "_last_val_report", None) or {}
+        metrics = prune_inactive_task_val_metrics(metrics, report if isinstance(report, dict) else None)
+        updated = False
+        epoch = int(getattr(trainer, "current_epoch", 0))
+        live_state = pl_module.state_dict()
+        exclude_tasks = resolve_composite_exclude_tasks(self.train_cfg)
+        eval_only = bool(self.train_cfg.get("active_eval_only"))
+        for task in self._active_tasks(pl_module):
+            if eval_only or task in exclude_tasks:
+                continue
+            _primary, mode, fallbacks = resolve_task_checkpoint_monitor(
+                self.train_cfg,
+                stage=self.stage,
+                task=task,
+            )
+            raw = read_task_monitor_value(metrics, fallbacks)
+            if raw is None and isinstance(report, dict) and task in report:
+                info = report[task]
+                if isinstance(info, dict):
+                    selection = self._selection_metric_name(task)
+                    if selection in ("mse", "recon_mse"):
+                        raw = _as_finite_float(info.get("mse", info.get("mean_mse")))
+                    elif selection in ("nmi_within_domain", "mean_nmi", "macro_nmi", "nmi"):
+                        raw = _as_finite_float(info.get("mean_nmi", info.get("nmi")))
+                    elif selection == "f1":
+                        raw = _as_finite_float(info.get("f1", info.get("mean_f1")))
+                    elif selection == "acc":
+                        raw = _as_finite_float(info.get("acc", info.get("mean_acc")))
+            if raw is None:
+                continue
+            prev = self._task_bests.get(task)
+            prev_score = None if prev is None else prev.get("score")
+            if not metric_is_improved(float(raw), None if prev_score is None else float(prev_score), mode=mode):
+                continue
+            partial = {
+                key: tensor.detach().cpu().clone()
+                for key, tensor in filter_stage2_task_state(live_state, task).items()
+            }
+            self._task_bests[task] = {
+                "monitor": fallbacks[0],
+                "mode": mode,
+                "score": float(raw),
+                "selection_metric": self._selection_metric_name(task),
+                "epoch": epoch,
+                "state": partial,
+            }
+            updated = True
+            if rank_zero_info is not None:
+                rank_zero_info(
+                    f"TaskCompositeCheckpoint: task={task} improved {fallbacks[0]}={raw} epoch={epoch}"
+                )
+        if updated:
+            self._save_composite(trainer, pl_module)
 
 
 class TrainStateCallback(Callback):
@@ -403,8 +720,15 @@ class TrainStateCallback(Callback):
                 return callback
         return None
 
+    def _composite_callback(self, trainer: Any) -> TaskCompositeCheckpointCallback | None:
+        for callback in getattr(trainer, "callbacks", []):
+            if isinstance(callback, TaskCompositeCheckpointCallback):
+                return callback
+        return None
+
     def write(self, trainer: Any, pl_module: Any, *, extra: dict[str, Any] | None = None) -> None:
         ckpt_cb = self._checkpoint_callback(trainer)
+        composite = self._composite_callback(trainer)
         payload: dict[str, Any] = {
             "stage": self.stage,
             "epoch": int(getattr(trainer, "current_epoch", 0)),
@@ -416,6 +740,19 @@ class TrainStateCallback(Callback):
             "last_model_path": getattr(ckpt_cb, "last_model_path", None) or None,
             "updated_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
         }
+        if composite is not None:
+            payload["best_model_path"] = str(composite.best_path) if composite.best_path.is_file() else None
+            payload["best_model_score"] = composite.composite_geomean()
+            payload["task_best"] = composite.task_best_summary()
+        early_cb = None
+        for callback in getattr(trainer, "callbacks", []):
+            from resmamba_signal_model.training.task_schedule import TaskScheduleEarlyStoppingCallback
+
+            if isinstance(callback, TaskScheduleEarlyStoppingCallback):
+                early_cb = callback
+                break
+        if early_cb is not None and early_cb.stopped_sessions:
+            payload["task_schedule_early_stopped"] = list(early_cb.stopped_sessions)
         if extra:
             payload.update(extra)
         self.path.parent.mkdir(parents=True, exist_ok=True)

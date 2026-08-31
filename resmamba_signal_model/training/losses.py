@@ -9,7 +9,12 @@ from scipy.optimize import linear_sum_assignment
 
 from resmamba_signal_model.models.domain import DomainDiscriminator, GradientReversal
 from resmamba_signal_model.models.physics import physics_constraint_loss, safe_complex_abs
-from resmamba_signal_model.training.clustering_labels import resolve_modulation_labels
+from resmamba_signal_model.training.clustering_labels import (
+    GLOBAL_LABEL_NAMESPACE,
+    global_cluster_labels,
+    resolve_cluster_eval_labels,
+    resolve_modulation_labels,
+)
 from resmamba_signal_model.training.continual import confidence_masked_distillation_loss, old_prototype_anchor_loss
 from resmamba_signal_model.training.emitter_labels import global_emitter_labels
 
@@ -17,7 +22,7 @@ DEFAULT_CONTRASTIVE_TEMPERATURE = 0.2
 MAX_CONTRASTIVE_SAMPLES = 512
 MIN_CONTRASTIVE_SAMPLES = 4
 MAX_SINGLE_LOSS = 10.0
-PREDICTION_MAE_LOSS_SCALE = 10.0
+PREDICTION_MSE_LOSS_SCALE = 10.0
 NEGCOS_TAU_MAX = 0.5
 NEGCOS_TAU_MIN = 0.05
 
@@ -26,7 +31,7 @@ __all__ = [
     "GradientReversal",
     "NEGCOS_TAU_MAX",
     "NEGCOS_TAU_MIN",
-    "PREDICTION_MAE_LOSS_SCALE",
+    "PREDICTION_MSE_LOSS_SCALE",
     "assign_unique_prototypes",
     "clustering_prototype_alignment_loss",
     "domain_adversarial_loss",
@@ -34,6 +39,7 @@ __all__ = [
     "foundation_pretrain_losses",
     "latent_prediction_loss",
     "resolve_vicreg_gamma",
+    "token_contrastive_loss",
     "vicreg_loss",
     "vicreg_token_loss",
     "modulation_hierarchical_metric_loss",
@@ -41,6 +47,7 @@ __all__ = [
     "negcos_temperature",
     "physics_constraint_loss",
     "mae_reconstruction_loss",
+    "mse_reconstruction_loss",
     "RECON_MONITOR_WEIGHTS",
     "resolve_recon_mask",
     "reconstruction_monitor_loss",
@@ -49,6 +56,7 @@ __all__ = [
     "sinkhorn_balanced_assignment",
     "structure_preserving_loss",
     "supervised_contrastive_loss",
+    "resolve_pretrain_supcon_labels",
     "unsupervised_clustering_loss",
     "weighted_pretrain_loss",
 ]
@@ -98,6 +106,14 @@ def negcos_temperature(
     return float(tau_min + 0.5 * (tau_max - tau_min) * (1.0 + math.cos(math.pi * p)))
 
 
+def _connected_zero(tensor: torch.Tensor) -> torch.Tensor:
+    """返回 0，并在 ``tensor`` 需要梯度时保留 ``grad_fn``，避免 Lightning backward 崩掉。"""
+    flat = tensor.reshape(-1)
+    if flat.numel() == 0:
+        return tensor.sum() * 0.0
+    return flat[0] * 0.0
+
+
 def safe_cross_entropy(
     logits: torch.Tensor,
     labels: torch.Tensor,
@@ -106,7 +122,7 @@ def safe_cross_entropy(
 ) -> torch.Tensor:
     valid = labels >= 0
     if valid.sum() == 0:
-        return logits.new_tensor(0.0)
+        return _connected_zero(logits)
     logits = logits[valid].float()
     labels = labels[valid].long()
     num_classes = logits.shape[-1]
@@ -115,7 +131,7 @@ def safe_cross_entropy(
         logits = logits[in_range]
         labels = labels[in_range]
     if labels.numel() == 0:
-        return logits.new_tensor(0.0)
+        return _connected_zero(logits)
     logits = torch.clamp(logits, -50.0, 50.0)
     smoothing = min(max(float(label_smoothing), 0.0), 0.5)
     return F.cross_entropy(logits, labels, label_smoothing=smoothing)
@@ -149,13 +165,27 @@ def _mean_clamped(per: torch.Tensor, valid: torch.Tensor | None = None, max_val:
 
 
 def mae_reconstruction_loss(pred: torch.Tensor, target: torch.Tensor, mae_mask: torch.Tensor) -> torch.Tensor:
+    """Masked patch 预训练主重建（Smooth L1；与 8/25 有效配方一致）。"""
     if mae_mask is None or mae_mask.sum() == 0:
         return pred.new_tensor(0.0)
     n = min(pred.shape[1], target.shape[1], mae_mask.shape[1])
     pred = pred[:, :n]
     target = target[:, :n]
     mask = mae_mask[:, :n]
-    elem = F.smooth_l1_loss(pred, target, reduction="none")
+    elem = F.smooth_l1_loss(pred.float(), target.float(), reduction="none")
+    per = _masked_per_sample(elem, mask)
+    return _mean_clamped(per, mask.any(dim=-1))
+
+
+def mse_reconstruction_loss(pred: torch.Tensor, target: torch.Tensor, mae_mask: torch.Tensor) -> torch.Tensor:
+    """Masked patch MSE（下游 prediction / 与 val/recon_mse 同形）。"""
+    if mae_mask is None or mae_mask.sum() == 0:
+        return pred.new_tensor(0.0)
+    n = min(pred.shape[1], target.shape[1], mae_mask.shape[1])
+    pred = pred[:, :n]
+    target = target[:, :n]
+    mask = mae_mask[:, :n]
+    elem = (pred.float() - target.float()).square()
     per = _masked_per_sample(elem, mask)
     return _mean_clamped(per, mask.any(dim=-1))
 
@@ -182,8 +212,14 @@ def resolve_recon_mask(outputs: dict[str, Any], kind: str) -> torch.Tensor | Non
             mask = outputs.get("mae_mask")
     elif kind == "mae":
         mask = outputs.get("mae_mask")
-        if mask is not None and not bool(mask.any()) and outputs.get("span_mask") is not None:
-            mask = outputs["span_mask"]
+        if mask is not None and not bool(mask.any()):
+            suffix = outputs.get("suffix_mask")
+            if suffix is not None and bool(suffix.any()):
+                mask = suffix
+            elif outputs.get("span_mask") is not None and bool(outputs["span_mask"].any()):
+                mask = outputs["span_mask"]
+        if mask is None or not bool(mask.any()):
+            mask = outputs.get("target_mask", mask)
     elif kind in ("query", "target"):
         mask = outputs.get("target_mask", outputs.get("recon_mask", outputs.get("mae_mask")))
     else:
@@ -197,6 +233,34 @@ def resolve_recon_mask(outputs: dict[str, Any], kind: str) -> torch.Tensor | Non
 
 def domain_adversarial_loss(domain_logits: torch.Tensor, dataset_id: torch.Tensor) -> torch.Tensor:
     return safe_cross_entropy(domain_logits, dataset_id)
+
+
+def resolve_pretrain_supcon_labels(
+    batch: dict[str, Any] | None,
+    *,
+    namespace: int = GLOBAL_LABEL_NAMESPACE,
+) -> torch.Tensor | None:
+    """预训练对比标签：优先 ``global_label_id``，否则 ``dataset_id * ns + local``。"""
+    if batch is None:
+        return None
+    labels = batch.get("global_label_id")
+    if torch.is_tensor(labels):
+        return labels.long()
+    dataset_id = batch.get("dataset_id")
+    if not torch.is_tensor(dataset_id):
+        return None
+    mod = batch.get("mod_label_id")
+    emitter = batch.get("emitter_id")
+    source = batch.get("source_label_id")
+    if mod is None and emitter is None and source is None:
+        return None
+    if mod is None:
+        mod = torch.full_like(dataset_id, -1)
+    if emitter is None:
+        emitter = torch.full_like(dataset_id, -1)
+    if source is None:
+        source = torch.full_like(dataset_id, -1)
+    return global_cluster_labels(dataset_id, mod, emitter, source, namespace=namespace)
 
 
 def supervised_contrastive_loss(
@@ -455,6 +519,26 @@ def _as_complex_last(patches: torch.Tensor) -> torch.Tensor:
     return torch.complex(patches[:, :, 0].float(), patches[:, :, 1].float())
 
 
+def _relative_phase_error(pred_c: torch.Tensor, target_c: torch.Tensor) -> torch.Tensor:
+    """相邻差分相位误差 ``1-cos(Δφ̂-Δφ)``，对全局载波相位不变。
+
+    16 点 patch 上的绝对 FFT 相干不可辨（突发初相 / 随机截断 / MAE 挖洞），
+    调制与脉内信息在 ``Δφ`` / 相邻共轭相关里。``pred_c``/``target_c`` 为
+    ``[B, N, P]`` complex，返回 ``[B, N]``。
+    """
+    if pred_c.shape[-1] < 2:
+        return pred_c.real.new_zeros(pred_c.shape[:2])
+    pred_lag = pred_c[..., :-1].conj() * pred_c[..., 1:]
+    tgt_lag = target_c[..., :-1].conj() * target_c[..., 1:]
+    pred_u = pred_lag / safe_complex_abs(pred_lag)
+    tgt_u = tgt_lag / safe_complex_abs(tgt_lag)
+    coh = (pred_u.real * tgt_u.real + pred_u.imag * tgt_u.imag).clamp(-1.0, 1.0)
+    err = (1.0 - coh).clamp(0.0, 2.0)
+    weight = (safe_complex_abs(target_c[..., :-1]) * safe_complex_abs(target_c[..., 1:])).clamp_min(0.0)
+    denom = weight.sum(dim=-1).clamp_min(1.0e-8)
+    return (err * weight).sum(dim=-1) / denom
+
+
 def _masked_mean(elem: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
     valid = None if mask is None else mask[:, : min(elem.shape[1], mask.shape[1])].any(dim=-1)
     return _mean_clamped(_masked_per_sample(elem, mask), valid)
@@ -469,8 +553,8 @@ def structure_preserving_loss(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """时域 SmoothL1 + 对数频谱幅度；相位仅 complex-pair 模态。
 
-    返回的主损失只含 time+spectrum。``1-相干`` 常年停在 ~0.9，若与时频等权
-    会盖过 MAE；相位项单独放进 ``structure_phase``，由配置降权。
+    主损失只含 time+spectrum。``structure_phase`` 是相对 Δφ（不是 16 点
+    FFT 绝对相干），单独加权，避免再把不可辨的载波初相当成监督。
     """
     if mask is not None:
         n = min(pred.shape[1], target.shape[1], mask.shape[1])
@@ -497,10 +581,7 @@ def structure_preserving_loss(
         ).mean(dim=-1)
         spec_per = _masked_per_sample(mag_elem, mask)
         if complex_pair:
-            pred_u = pred_spec / safe_complex_abs(pred_spec)
-            target_u = target_spec / safe_complex_abs(target_spec)
-            coherence = pred_u.real * target_u.real + pred_u.imag * target_u.imag
-            phase_elem = (1.0 - coherence).mean(dim=-1)
+            phase_elem = _relative_phase_error(pred_c, target_c)
             phase_per = _masked_per_sample(phase_elem, mask)
     elif pred.ndim >= 3:
         pred_f = torch.log1p(torch.fft.rfft(pred.float(), dim=-1).abs())
@@ -643,6 +724,61 @@ def vicreg_token_loss(
     )
 
 
+def token_contrastive_loss(
+    h: torch.Tensor,
+    mask: torch.Tensor,
+    sample_ids: torch.Tensor | None = None,
+    *,
+    temperature: float = 0.5,
+    max_tokens: int = 512,
+) -> torch.Tensor:
+    """PATK 风格 token 对比：同序列 token 为正，跨序列为负。"""
+    if h is None or h.ndim != 3 or h.shape[0] < 1:
+        ref = h if torch.is_tensor(h) else torch.zeros(())
+        return ref.new_tensor(0.0)
+    b, _l, _d = h.shape
+    if sample_ids is None:
+        sample_ids = torch.arange(b, device=h.device, dtype=torch.long)
+    else:
+        sample_ids = sample_ids.reshape(-1).to(device=h.device, dtype=torch.long)
+    valid = mask.to(dtype=torch.bool)
+    feats: list[torch.Tensor] = []
+    owners: list[torch.Tensor] = []
+    for i in range(b):
+        sel = h[i, valid[i]]
+        if sel.shape[0] == 0:
+            continue
+        feats.append(safe_l2_normalize(sel.float(), dim=-1))
+        owners.append(sample_ids[i].expand(sel.shape[0]))
+    if not feats:
+        return h.new_tensor(0.0)
+    tokens = torch.cat(feats, dim=0)
+    owners = torch.cat(owners, dim=0)
+    n = int(tokens.shape[0])
+    if n < 2:
+        return tokens.sum() * 0.0
+    if n > int(max_tokens):
+        idx = torch.randperm(n, device=tokens.device)[: int(max_tokens)]
+        tokens = tokens[idx]
+        owners = owners[idx]
+        n = int(tokens.shape[0])
+    tau = max(float(temperature), 1.0e-6)
+    sim = (tokens @ tokens.t()) / tau
+    self_mask = torch.eye(n, device=tokens.device, dtype=torch.bool)
+    pos_mask = owners.unsqueeze(0).eq(owners.unsqueeze(1)) & ~self_mask
+    if not bool(pos_mask.any()):
+        return tokens.sum() * 0.0
+    sim = sim.masked_fill(self_mask, float("-inf"))
+    log_denom = torch.logsumexp(sim, dim=1)
+    pos_sim = sim.masked_fill(~pos_mask, float("-inf"))
+    log_num = torch.logsumexp(pos_sim, dim=1)
+    valid_rows = pos_mask.any(dim=1)
+    if not bool(valid_rows.any()):
+        return tokens.sum() * 0.0
+    loss = -(log_num[valid_rows] - log_denom[valid_rows]).mean()
+    return torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
+
+
 def moe_load_balance_loss(outputs: dict[str, Any]) -> torch.Tensor:
     """聚合 tokenizer / encoder / decoder MoE 负载均衡损失。"""
     lb = outputs.get("moe_load_balance")
@@ -667,20 +803,34 @@ def foundation_pretrain_losses(
     def _need(name: str) -> bool:
         return wanted is None or name in wanted
 
-    pred = outputs.get("recon_norm", outputs["mae_pred"])
-    target = outputs.get("patch_targets_norm", outputs["patch_targets"])
+    pred = outputs.get("recon_norm")
+    if pred is None:
+        pred = outputs.get("mae_pred")
+    if pred is None:
+        pred = outputs.get("h_enc")
+    if pred is None:
+        pred = outputs.get("z_enc")
+    if pred is None:
+        raise KeyError("foundation_pretrain_losses 需要 recon_norm / mae_pred / h_enc / z_enc 之一")
+    target = outputs.get("patch_targets_norm", outputs.get("patch_targets", pred))
     if _need("mae"):
         mae_mask = resolve_recon_mask(outputs, "mae")
         if mae_mask is None:
             losses["mae"] = pred.new_tensor(0.0)
         else:
             losses["mae"] = _clamp_loss(mae_reconstruction_loss(pred, target, mae_mask))
+    if _need("mse"):
+        mae_mask = resolve_recon_mask(outputs, "mae")
+        if mae_mask is None:
+            losses["mse"] = pred.new_tensor(0.0)
+        else:
+            losses["mse"] = _clamp_loss(mse_reconstruction_loss(pred, target, mae_mask))
     if _need("impute"):
         span = resolve_recon_mask(outputs, "imputation")
         if span is None or not bool(span.any()):
             losses["impute"] = pred.new_tensor(0.0)
         else:
-            losses["impute"] = _clamp_loss(mae_reconstruction_loss(pred, target, span))
+            losses["impute"] = _clamp_loss(mse_reconstruction_loss(pred, target, span))
     if _need("physical"):
         mask = outputs.get("recon_mask", outputs.get("target_mask", outputs.get("mae_mask")))
         losses["physical"] = _clamp_loss(physics_constraint_loss(pred, target, mask))
@@ -757,13 +907,54 @@ def foundation_pretrain_losses(
                 cov_weight=float(outputs.get("vicreg_cov_weight", 1.0) or 1.0),
                 gamma=gamma_token,
             )
+    if _need("tcl"):
+        h_enc = outputs.get("h_enc")
+        visible = outputs.get("visible", outputs.get("patch_mask"))
+        if h_enc is None or visible is None:
+            losses["tcl"] = pred.new_tensor(0.0)
+        else:
+            pool_mask = visible & outputs.get("patch_mask", visible)
+            sample_ids = outputs.get("tcl_sample_ids")
+            if sample_ids is None and batch is not None:
+                sample_ids = batch.get("tcl_sample_ids")
+            losses["tcl"] = token_contrastive_loss(
+                h_enc,
+                pool_mask,
+                sample_ids,
+                temperature=float(outputs.get("tcl_temperature", 0.5) or 0.5),
+                max_tokens=int(outputs.get("tcl_max_tokens", 512) or 512),
+            )
+    if _need("z_supcon"):
+        student = outputs.get("z_enc", outputs.get("z_general", outputs.get("z")))
+        labels = outputs.get("supcon_labels")
+        if labels is None:
+            labels = resolve_pretrain_supcon_labels(batch)
+        if student is None or labels is None:
+            losses["z_supcon"] = pred.new_tensor(0.0)
+        else:
+            losses["z_supcon"] = supervised_contrastive_loss(student, labels.long())
+    if _need("proto_swav"):
+        embedding = outputs.get("cluster_embedding", outputs.get("z_enc", outputs.get("z")))
+        logits = outputs.get("cluster_logits")
+        prototypes = outputs.get("cluster_prototypes")
+        if embedding is None or (logits is None and prototypes is None):
+            losses["proto_swav"] = pred.new_tensor(0.0)
+        else:
+            cluster_loss, _cluster_parts = unsupervised_clustering_loss(
+                embedding,
+                logits,  # type: ignore[arg-type]
+                embedding_alt=outputs.get("cluster_embedding_view2"),
+                logits_alt=outputs.get("cluster_logits_view2"),
+                prototypes=prototypes,
+                temperature=float(outputs.get("proto_swav_temperature", 0.1) or 0.1),
+            )
+            losses["proto_swav"] = cluster_loss
     return losses
 
 
 # 验证/选 ckpt 用的重建项：排除 domain、近常数 phase、以及依赖 teacher 的对齐项。
 RECON_MONITOR_WEIGHTS: dict[str, float] = {
     "mae": 1.0,
-    "impute": 0.2,
     "structure": 0.2,
 }
 
@@ -780,6 +971,11 @@ def reconstruction_monitor_loss(
     total = ref.new_tensor(0.0) if ref is not None else torch.tensor(0.0)
     for name, weight in active.items():
         value = parts.get(name)
+        # mae ↔ mse 互为回退，兼容旧/新 loss_weights 键名
+        if value is None and name == "mae":
+            value = parts.get("mse")
+        if value is None and name == "mse":
+            value = parts.get("mae")
         if value is None:
             continue
         total = total + float(weight) * value
@@ -815,6 +1011,7 @@ def downstream_task_loss(
     *,
     emitter_offset_lookup: torch.Tensor | None = None,
     modulation_compact_lookup: torch.Tensor | None = None,
+    modulation_offset_lookup: torch.Tensor | None = None,
     emitter_contrastive_weight: float = 0.0,
     modulation_contrastive_weight: float = 0.0,
     z_contrastive_weight: float = 0.0,
@@ -861,14 +1058,36 @@ def downstream_task_loss(
         logits = _first_present(outputs, "task_logits", f"{task}_logits", "modulation_logits")
         if logits is None:
             raise KeyError(f"分类任务 {task!r} 缺少 logits")
-        raw_labels = batch.get(label_field or "mod_label_id", batch.get("source_label_id"))
-        if raw_labels is None:
-            raise KeyError(f"分类任务 {task!r} 缺少标签列")
-        labels = resolve_modulation_labels(raw_labels, batch.get("source_label_id"))
-        if modulation_compact_lookup is not None:
-            from resmamba_signal_model.training.modulation_labels import remap_modulation_labels
+        if task == "ld_model" and emitter_offset_lookup is not None:
+            local = batch.get(label_field or "mod_label_id", batch.get("mod_label_id"))
+            if local is None:
+                raise KeyError(f"分类任务 {task!r} 缺少 mod_label_id")
+            labels = global_emitter_labels(batch["dataset_id"], local, emitter_offset_lookup)
+        elif task == "tx_modulation" and modulation_offset_lookup is not None:
+            raw_labels = batch.get(label_field or "canonical_mod_label_id", batch.get("mod_label_id"))
+            if raw_labels is None:
+                raise KeyError(f"分类任务 {task!r} 缺少 canonical_mod_label_id")
+            if modulation_compact_lookup is None:
+                raise KeyError("tx_modulation 紧凑 offset 标签需要 modulation_compact_lookup")
+            from resmamba_signal_model.training.modulation_labels import (
+                global_comm_modulation_labels,
+            )
 
-            labels = remap_modulation_labels(labels, modulation_compact_lookup)
+            labels = global_comm_modulation_labels(
+                batch["dataset_id"],
+                raw_labels,
+                modulation_compact_lookup,
+                modulation_offset_lookup,
+            )
+        else:
+            raw_labels = batch.get(label_field or "mod_label_id", batch.get("source_label_id"))
+            if raw_labels is None:
+                raise KeyError(f"分类任务 {task!r} 缺少标签列")
+            labels = resolve_modulation_labels(raw_labels, batch.get("source_label_id"))
+            if modulation_compact_lookup is not None:
+                from resmamba_signal_model.training.modulation_labels import remap_modulation_labels
+
+                labels = remap_modulation_labels(labels, modulation_compact_lookup)
         ce = safe_cross_entropy(logits, labels)
         parts["task_ce"] = ce
         loss = loss + ce
@@ -923,13 +1142,20 @@ def downstream_task_loss(
                 parts["z_contrastive"] = z_contrastive
                 loss = loss + float(z_contrastive_weight) * z_contrastive
     elif kind == "clustering":
-        # 训练路径默认无监督；global_label_id 不得进入 loss。
         if supervised_clustering:
             labels = batch.get(label_field or "global_label_id")
             if labels is None:
+                labels = resolve_cluster_eval_labels(
+                    batch.get("mod_label_id"),
+                    batch.get("emitter_id"),
+                    batch.get("source_label_id"),
+                )
+            if labels is None:
                 parts["cluster_align"] = outputs["cluster_logits"].new_tensor(0.0)
             else:
-                align = clustering_prototype_alignment_loss(outputs["cluster_embedding"], outputs["cluster_logits"], labels)
+                align = clustering_prototype_alignment_loss(
+                    outputs["cluster_embedding"], outputs["cluster_logits"], labels
+                )
                 parts["cluster_align"] = align
                 loss = loss + align
         else:
@@ -960,10 +1186,10 @@ def downstream_task_loss(
         mask = resolve_recon_mask(outputs, kind)
         if mask is None:
             mask = outputs.get("mae_mask")
-        mae = mae_reconstruction_loss(pred, target, mask)
-        scaled = mae * float(PREDICTION_MAE_LOSS_SCALE)
-        parts["mae"] = mae
-        parts["mae_scaled"] = scaled
+        mse = mse_reconstruction_loss(pred, target, mask)
+        scaled = mse * float(PREDICTION_MSE_LOSS_SCALE)
+        parts["mse"] = mse
+        parts["mse_scaled"] = scaled
         loss = loss + scaled
     else:
         raise ValueError(f"未知下游任务 {task!r} kind={kind!r}")
@@ -975,8 +1201,8 @@ def downstream_task_loss(
     if recon_weight > 0 and kind in ("classification", "emitter", "clustering") and "mae_pred" in outputs:
         pred = outputs.get("recon_norm", outputs["mae_pred"])
         target = outputs.get("patch_targets_norm", outputs["patch_targets"])
-        recon = mae_reconstruction_loss(pred, target, outputs.get("patch_mask", outputs.get("mae_mask")))
-        parts["mae"] = recon
+        recon = mse_reconstruction_loss(pred, target, outputs.get("patch_mask", outputs.get("mae_mask")))
+        parts["mse"] = recon
         loss = loss + float(recon_weight) * recon
     if phys_weight > 0 and "mae_pred" in outputs and outputs["mae_pred"].ndim == 4:
         pred = outputs.get("recon_norm", outputs["mae_pred"])

@@ -14,7 +14,7 @@ def test_ssim_iq_accumulate_matches_mean() -> None:
     target = pred + 0.01 * torch.randn_like(pred)
     mask = torch.tensor([True, False])
     total, count = ssim_iq_accumulate(pred, target, mask)
-    assert count == 2
+    assert count == 1
     direct = ssim_iq(pred[:1], target[:1], mask[:1])
     assert abs(total / count - direct) < 1e-5
 
@@ -91,3 +91,24 @@ def test_ssim_iq_stays_bounded_on_large_amplitude() -> None:
     target = pred + 1.0e5 * torch.randn_like(pred)
     score = ssim_iq(pred, target)
     assert -1.0 <= score <= 1.0
+
+
+def test_ssim_envelope_ignores_carrier_phase() -> None:
+    torch.manual_seed(0)
+    target = torch.randn(2, 3, 2, 32)
+    pred = torch.stack((-target[:, :, 1], target[:, :, 0]), dim=2)
+    mask = torch.ones(2, 3, dtype=torch.bool)
+    assert ssim_iq(pred, target, mask) > 0.99
+
+
+def test_ssim_envelope_wave_uses_length_and_mask() -> None:
+    torch.manual_seed(1)
+    target = torch.randn(2, 4, 2, 16)
+    pred = target.clone()
+    pred[:, 0] = 0.0
+    # 只评测远离损坏 patch 的后半段，避免 SSIM 窗跨过边界
+    mask = torch.tensor([[False, False, True, True], [False, False, True, True]])
+    masked_only = ssim_iq(pred, target, mask, length=64)
+    all_patches = ssim_iq(pred, target, torch.ones_like(mask), length=64)
+    assert masked_only > 0.99
+    assert all_patches < masked_only

@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from resmamba_signal_model.models.elastic_sampler import ElasticRoVSampler
 from resmamba_signal_model.models.moe import MOE_EXPERT_NAMES, MoEAux, MoEFusion
 from resmamba_signal_model.models.physics import PHYS_DIM, patch_physics, safe_angle, safe_complex_abs
 from resmamba_signal_model.models.varlen import n_patches, pad_time_to_patch, patchify_iq
@@ -26,6 +27,9 @@ class TimeFreqTokenizerConfig:
     moe_num_experts: int = 3
     moe_top_k: int | None = None
     l_min: int = 16
+    # fixed_patch：均匀切分；elastic_rov：RoV 概率采样 + 弹性长度
+    tokenization_mode: str = "fixed_patch"
+    elastic_length_scale: float = 0.5
 
 
 def _band_pool(logmag: torch.Tensor, n_bands: int) -> torch.Tensor:
@@ -81,6 +85,24 @@ class _TimeBranchExpert(nn.Module):
         return fused.transpose(1, 2).contiguous()
 
 
+class _ElasticPatchExpert(nn.Module):
+    """弹性 patch 直接嵌入（RoV 采样位置与固定 stride conv 不对齐时使用）。"""
+
+    def __init__(self, patch_size: int, d_model: int) -> None:
+        super().__init__()
+        flat = 2 * int(patch_size)
+        self.net = nn.Sequential(
+            nn.Linear(flat, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+
+    def forward(self, iq_patches: torch.Tensor) -> torch.Tensor:
+        b, n, _c, p = iq_patches.shape
+        x = iq_patches.reshape(b, n, -1)
+        return self.net(x)
+
+
 class TimeFreqTokenizer(nn.Module):
     """共享 stem + 三路具名专家（LD 脉内 / LD 型号 / TX 调制）+ task/family 硬路由融合。"""
 
@@ -102,6 +124,18 @@ class TimeFreqTokenizer(nn.Module):
         self.dropout = nn.Dropout(cfg.dropout)
         self.norm = nn.LayerNorm(cfg.d_model)
         self._last_moe_aux: list[MoEAux] = []
+        self._elastic_mode = str(getattr(cfg, "tokenization_mode", "fixed_patch")).strip().lower() == "elastic_rov"
+        if self._elastic_mode:
+            self.elastic_sampler = ElasticRoVSampler(
+                cfg.patch_size,
+                length_scale=float(getattr(cfg, "elastic_length_scale", 0.5)),
+            )
+            self.intrapulse_elastic = _ElasticPatchExpert(cfg.patch_size, cfg.d_model)
+            self.model_elastic = _ElasticPatchExpert(cfg.patch_size, cfg.d_model)
+        else:
+            self.elastic_sampler = None
+            self.intrapulse_elastic = None
+            self.model_elastic = None
 
     def pop_moe_aux(self) -> list[MoEAux]:
         aux = list(self._last_moe_aux)
@@ -144,6 +178,14 @@ class TimeFreqTokenizer(nn.Module):
         iq_patches: torch.Tensor,
         n_tok: int,
     ) -> list[torch.Tensor]:
+        if self._elastic_mode:
+            assert self.intrapulse_elastic is not None and self.model_elastic is not None
+            intrapulse = self.intrapulse_elastic(iq_patches)
+            if self.phase_proj is not None:
+                intrapulse = intrapulse + self._phase_tokens(iq_patches)
+            model_tok = self.model_elastic(iq_patches)
+            tx_tok = self._freq_tokens(iq_patches)
+            return [intrapulse, model_tok, tx_tok][: self.num_experts]
         stem = self.stem(iq_p)
         intrapulse = self.intrapulse_expert(stem, n_tok)
         if self.phase_proj is not None:
@@ -171,10 +213,16 @@ class TimeFreqTokenizer(nn.Module):
         orig_len = length
         n_tok = n_patches(length, self.cfg.patch_size)
         iq_p, mask_p = pad_time_to_patch(iq, sample_mask, self.cfg.patch_size)
-        iq_patches, patch_mask = patchify_iq(iq, sample_mask, self.cfg.patch_size)
-        n_tok = min(n_tok, iq_patches.shape[1])
-        iq_patches = iq_patches[:, :n_tok]
-        patch_mask = patch_mask[:, :n_tok]
+        elastic_starts: torch.Tensor | None = None
+        if self._elastic_mode:
+            assert self.elastic_sampler is not None
+            iq_patches, patch_mask, elastic_starts = self.elastic_sampler(iq, sample_mask, n_samples=n_tok)
+            n_tok = int(iq_patches.shape[1])
+        else:
+            iq_patches, patch_mask = patchify_iq(iq, sample_mask, self.cfg.patch_size)
+            n_tok = min(n_tok, iq_patches.shape[1])
+            iq_patches = iq_patches[:, :n_tok]
+            patch_mask = patch_mask[:, :n_tok]
 
         branches = self._expert_branches(iq_p, iq_patches, n_tok)
         pad_mask = ~patch_mask
@@ -200,7 +248,7 @@ class TimeFreqTokenizer(nn.Module):
             tokens = tokens + self.physics_proj(phys.to(dtype=tokens.dtype))
         tokens = self.dropout(self.norm(tokens))
         tokens = tokens.masked_fill(~patch_mask.unsqueeze(-1), 0.0)
-        return {
+        out: dict[str, torch.Tensor | int] = {
             "tokens": torch.nan_to_num(tokens),
             "token_mask": patch_mask,
             "patch_mask": patch_mask,
@@ -210,3 +258,6 @@ class TimeFreqTokenizer(nn.Module):
             "orig_length": torch.full((batch,), orig_len, device=iq.device, dtype=torch.long),
             "patch_offset": 0,
         }
+        if elastic_starts is not None:
+            out["elastic_start_indices"] = elastic_starts
+        return out

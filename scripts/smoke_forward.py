@@ -16,9 +16,9 @@ from resmamba_signal_model.training.losses import foundation_pretrain_losses, we
 def tiny_cfg() -> SignalModelConfig:
     return SignalModelConfig(
         d_model=32,
-        encoder_mamba_layers=5,
+        encoder_mamba_layers=4,
         encoder_transformer_layers=1,
-        decoder_mamba_layers=1,
+        decoder_mamba_layers=2,
         mamba_d_state=8,
         mamba_headdim=16,
         require_mamba_kernel=False,
@@ -54,7 +54,7 @@ def main() -> None:
     total, parts = weighted_pretrain_loss(
         out,
         batch,
-        {"mae": 1.0, "physical": 0.2, "domain": 0.1, "readout": 0.1, "moe": 0.01},
+        {"mae": 1.0, "physical": 0.2, "readout": 0.1, "structure": 0.2},
     )
     print("z", tuple(out["z"].shape), "recon", tuple(out["mae_pred"].shape), "tokens", tuple(out["tokens"].shape))
     print("losses", {k: round(float(v.detach()), 6) for k, v in parts.items()})
@@ -63,7 +63,7 @@ def main() -> None:
     assert torch.isfinite(out["z"]).all()
     assert "moe_load_balance" in out
     assert torch.isfinite(out["moe_load_balance"])
-    assert "moe" in parts
+    assert "mse" in parts
     aux = out_task.get("moe_gate_weights")
     assert aux
     tok_weights = aux[0][0]

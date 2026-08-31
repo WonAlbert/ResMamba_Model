@@ -341,7 +341,7 @@ class SharedDecoder(nn.Module):
         d_model: int,
         patch_size: int,
         *,
-        decoder_mamba_layers: int = 1,
+        decoder_mamba_layers: int = 2,
         attn_num_heads: int = 8,
         dropout: float = 0.0,
         sequence_packing: bool = True,
@@ -355,8 +355,9 @@ class SharedDecoder(nn.Module):
         **block_kwargs,
     ) -> None:
         super().__init__()
-        if decoder_mamba_layers != 1:
-            raise ValueError("SharedDecoder 锁定 decoder_mamba_layers=1，不加 Decoder Transformer")
+        n_blocks = int(decoder_mamba_layers)
+        if n_blocks < 1:
+            raise ValueError(f"decoder_mamba_layers 必须 >= 1，当前 {decoder_mamba_layers}")
         self.d_model = d_model
         self.sequence_packing = sequence_packing
         self.legacy_reconstruction = bool(legacy_reconstruction)
@@ -377,7 +378,7 @@ class SharedDecoder(nn.Module):
                     moe_ffn_expand=moe_ffn_expand,
                     **block_kwargs,
                 )
-                for _ in range(1)
+                for _ in range(n_blocks)
             ]
         )
         self.query_decoder = UnifiedQueryDecoder(

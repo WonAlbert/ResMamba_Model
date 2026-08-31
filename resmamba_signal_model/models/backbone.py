@@ -42,7 +42,7 @@ class MambaMoEFFNBlock(nn.Module):
 
 
 class HybridEncoder(nn.Module):
-    """Encoder 布局 M-M-M-M-M-T：5×BiMamba2 + 1×RoPE MemoryTransformer。"""
+    """Encoder 布局 M-M-M-M-M-T：默认 5×BiMamba2 + 1×RoPE MemoryTransformer。"""
 
     def __init__(
         self,

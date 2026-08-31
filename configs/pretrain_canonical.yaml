@@ -1,0 +1,3 @@
+# 预训练 + canonical_v1 数据（prepare_datasets --canonical-iq）
+_base_: pretrain.yaml
+rfdata_root: /root/autodl-tmp/ResMamba_Signal_Model/dataset/canonical_v1

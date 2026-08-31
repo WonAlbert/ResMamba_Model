@@ -8,19 +8,117 @@ import torch
 
 from resmamba_signal_model.training.checkpointing import (
     TrainStateCallback,
+    aggregate_classification_geomean,
     aggregate_multitask_geomean,
     aggregate_specialist_geomean,
     aggregate_val_monitor,
     checkpoint_mode_for_monitor,
     extract_task_selection_metrics,
     make_model_checkpoint,
+    metric_is_improved,
+    prune_inactive_task_val_metrics,
+    read_task_monitor_value,
     resolve_lightning_precision,
     resolve_run_and_ckpt,
     resolve_run_seed,
+    resolve_task_checkpoint_monitor,
     resolve_train_monitor,
+)
+from resmamba_signal_model.training.freeze import (
+    filter_stage2_task_state,
+    merge_stage2_task_states,
 )
 from resmamba_signal_model.training.logging_utils import format_val_epoch_metrics
 from resmamba_signal_model.training.mix import DynamicRatioScheduler
+
+
+def test_resolve_task_checkpoint_monitor_builtin_tasks() -> None:
+    cfg = {"tasks": ["ld_intrapulse", "ld_model", "tx_modulation", "ld_clustering", "tx_clustering", "prediction"]}
+    monitor, mode, fallbacks = resolve_task_checkpoint_monitor(cfg, stage="stage2", task="ld_intrapulse")
+    assert monitor == "val/f1_ld_intrapulse"
+    assert mode == "max"
+    assert "val/f1_ld_intrapulse" in fallbacks
+
+    monitor, mode, fallbacks = resolve_task_checkpoint_monitor(cfg, stage="stage2", task="ld_clustering")
+    assert monitor == "val/macro_nmi_ld_clustering"
+    assert mode == "max"
+
+    monitor, mode, _ = resolve_task_checkpoint_monitor(cfg, stage="stage2", task="prediction")
+    assert monitor == "val/mse_prediction"
+    assert mode == "min"
+
+
+def test_aggregate_classification_geomean_excludes_prediction() -> None:
+    metrics = {
+        "val/f1_ld_intrapulse": 0.8,
+        "val/f1_tx_modulation": 0.7,
+        "val/mse_prediction": 0.5,
+    }
+    cls_geo = aggregate_classification_geomean(metrics)
+    all_geo = aggregate_multitask_geomean(metrics)
+    assert cls_geo is not None and all_geo is not None
+    assert cls_geo > all_geo
+
+
+def test_metric_is_improved_respects_mode() -> None:
+    assert metric_is_improved(0.8, 0.7, mode="max")
+    assert not metric_is_improved(0.6, 0.7, mode="max")
+    assert metric_is_improved(0.2, 0.3, mode="min")
+    assert not metric_is_improved(0.4, 0.3, mode="min")
+    assert metric_is_improved(0.5, None, mode="max")
+
+
+def test_merge_stage2_task_states_overlays_heads() -> None:
+    base = {
+        "encoder.weight": torch.tensor([1.0]),
+        "ld_intrapulse_head.weight": torch.tensor([0.0]),
+        "ld_model_head.weight": torch.tensor([0.0]),
+        "z_linear_probes.ld_intrapulse.weight": torch.tensor([0.0]),
+    }
+    task_a = {"ld_intrapulse_head.weight": torch.tensor([2.0]), "z_linear_probes.ld_intrapulse.weight": torch.tensor([3.0])}
+    task_b = {"ld_model_head.weight": torch.tensor([4.0])}
+    merged = merge_stage2_task_states(base, {"ld_intrapulse": task_a, "ld_model": task_b})
+    assert merged["ld_intrapulse_head.weight"].item() == 2.0
+    assert merged["ld_model_head.weight"].item() == 4.0
+    assert merged["encoder.weight"].item() == 1.0
+    partial = filter_stage2_task_state(
+        {"ld_model_head.bias": torch.tensor([1.0]), "encoder.weight": torch.tensor([9.0])},
+        "ld_model",
+    )
+    assert "ld_model_head.bias" in partial
+    assert "encoder.weight" not in partial
+
+
+def test_read_task_monitor_value_strips_dataloader_idx() -> None:
+    metrics = {"val/f1_ld_intrapulse/dataloader_idx_0": torch.tensor(0.75)}
+    assert read_task_monitor_value(metrics, ("val/f1_ld_intrapulse",)) == pytest.approx(0.75)
+
+
+def test_prune_inactive_task_val_metrics() -> None:
+    metrics = {
+        "val/acc_ld_intrapulse": 0.75,
+        "val/acc_tx_modulation": 0.12,
+        "val/ld_intrapulse/loss": 4.5,
+        "val/tx_modulation/loss": 7.9,
+        "val/loss": 7.9,
+    }
+    report = {
+        "tx_modulation": {
+            "kind": "classification",
+            "acc": 0.12,
+            "f1": 0.06,
+            "mean_acc": 0.12,
+            "mean_f1": 0.06,
+            "n": 100,
+            "datasets": {},
+        },
+    }
+    pruned = prune_inactive_task_val_metrics(metrics, report)
+    assert "val/acc_tx_modulation" in pruned
+    assert "val/tx_modulation/loss" in pruned
+    assert "val/loss" in pruned
+    assert "val/acc_ld_intrapulse" not in pruned
+    assert "val/ld_intrapulse/loss" not in pruned
 
 
 def test_checkpoint_mode_for_monitor() -> None:
@@ -62,7 +160,7 @@ def test_aggregate_val_monitor_means_per_source_loss() -> None:
         "val/recon/dataloader_idx_0": torch.tensor(0.2),
         "val/recon/dataloader_idx_1": torch.tensor(0.4),
         "val/loss/dataloader_idx_0": torch.tensor(9.0),
-        "val/mae/dataloader_idx_0": torch.tensor(9.0),
+        "val/recon_mse/dataloader_idx_0": torch.tensor(9.0),
         "val/monitor": torch.tensor(99.0),
     }
     assert aggregate_val_monitor(metrics) == pytest.approx(0.3)
@@ -129,16 +227,16 @@ def test_format_val_epoch_metrics_groups_sources() -> None:
             "loss/total": 1.0,
             "val/monitor": torch.tensor(0.25),
             "val/loss/dataloader_idx_0": 0.1,
-            "val/mae/dataloader_idx_0": 0.02,
+            "val/recon_mse/dataloader_idx_0": 0.02,
             "val/loss/dataloader_idx_1": 0.4,
-            "val/impute_mse/dataloader_idx_1": 1.2e5,
+            "val/mse_imputation/dataloader_idx_1": 1.2e5,
         },
         epoch=3,
         source_names=["radcom", "radar"],
     )
     assert "val epoch 3" in text
     assert "monitor=0.25" in text
-    assert "[radcom] loss=0.1  mae=0.02" in text
+    assert "[radcom] loss=0.1  recon_mse=0.02" in text
     assert "[radar]" in text
     assert "1.2000e+05" in text
     assert format_val_epoch_metrics({"loss/total": 1.0}, epoch=0) == ""
@@ -153,18 +251,20 @@ def test_format_val_epoch_metrics_prints_per_dataset_scores() -> None:
                 "kind": "classification",
                 "acc": 0.8123,
                 "f1": 0.7741,
+                "miss_rate": 0.21,
                 "mean_acc": 0.8,
                 "mean_f1": 0.76,
+                "mean_miss_rate": 0.22,
                 "n": 100,
                 "datasets": {
-                    "rml2016_10a": {"acc": 0.85, "f1": 0.83, "n": 40},
-                    "rml2018_1a": {"acc": 0.75, "f1": 0.69, "n": 60},
+                    "rml2016_10a": {"acc": 0.85, "f1": 0.83, "miss_rate": 0.18, "n": 40},
+                    "rml2018_1a": {"acc": 0.75, "f1": 0.69, "miss_rate": 0.24, "n": 60},
                 },
             }
         },
     )
-    assert "modulation  acc=0.8123  f1=0.7741  mean_acc=0.8  mean_f1=0.76  n=100" in text
-    assert "rml2016_10a  acc=0.85  f1=0.83  n=40" in text
+    assert "modulation  acc=0.8123  f1=0.7741  miss_rate=0.21  n=100" in text
+    assert "rml2016_10a  acc=0.85  f1=0.83  miss_rate=0.18  n=40" in text
     assert "rml2018_1a" in text
     assert "monitor=0.3" in text
     assert "acc_modulation" not in text

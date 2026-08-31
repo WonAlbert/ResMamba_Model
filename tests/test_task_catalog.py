@@ -22,7 +22,7 @@ def test_catalog_defaults_to_six_tasks() -> None:
     assert catalog.names == list(DEFAULT_TASKS)
     assert catalog.source_to_task["classification"] == "tx_modulation"
     assert builtin_spec("ld_intrapulse").label_field == "canonical_mod_label_id"
-    assert builtin_spec("ld_model").label_field == "global_emitter_id"
+    assert builtin_spec("ld_model").label_field == "mod_label_id"
     assert builtin_spec("ld_clustering").monitor == "nmi_within_domain"
 
 

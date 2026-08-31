@@ -18,7 +18,8 @@ def test_resolve_val_label_field() -> None:
     assert resolve_val_label_field("pretrain", "prediction") == "auto"
     assert resolve_val_label_field("downstream", "emitter") == "global_emitter_id"
     assert resolve_val_label_field("downstream", "modulation") == "canonical_mod_label_id"
-    assert resolve_val_label_field("downstream", "clustering") == "global_label_id"
+    assert resolve_val_label_field("downstream", "clustering") == "auto"
+    assert resolve_val_label_field("downstream", "ld_clustering") == "auto"
 
 
 def test_emitter_val_subset_per_dataset_and_class() -> None:

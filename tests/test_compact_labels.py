@@ -10,10 +10,13 @@ from resmamba_signal_model.training.compact_labels import (
 from resmamba_signal_model.training.emitter_labels import (
     build_compact_emitter_dataset_class_mask,
     build_global_emitter_label_map,
+    build_global_radar_model_label_map,
     global_emitter_labels,
 )
 from resmamba_signal_model.training.modulation_labels import (
     build_compact_modulation_label_map,
+    build_global_comm_modulation_label_map,
+    global_comm_modulation_labels,
     remap_modulation_labels,
 )
 from resmamba_signal_model.training.losses import downstream_task_loss
@@ -62,6 +65,47 @@ def test_compact_modulation_map_rml() -> None:
     assert remapped.tolist() == [0, 10, -1, -1]
 
 
+def test_global_comm_modulation_map_scheme_a() -> None:
+    if not (DATASET / "label_maps.json").is_file():
+        return
+    comm_map, canonical = build_global_comm_modulation_label_map(DATASET)
+    assert canonical.num_classes == 11
+    assert comm_map.num_emitters == 33
+    assert comm_map.offsets[2] == 0
+    assert comm_map.offsets[3] == 11
+    assert comm_map.offsets[4] == 22
+    lookup = canonical.lookup()
+    offset_lookup = comm_map.offset_lookup()
+    # QAM16 on rml2016_10a (dataset_id=3) -> local 7 + offset 11 = 18
+    labels = global_comm_modulation_labels(
+        torch.tensor([3, 3]),
+        torch.tensor([15, 15]),
+        lookup,
+        offset_lookup,
+    )
+    assert labels.tolist() == [18, 18]
+    # QPSK on 04c (dataset_id=2) -> local 9 + offset 0 = 9
+    labels_qpsk = global_comm_modulation_labels(
+        torch.tensor([2]),
+        torch.tensor([25]),
+        lookup,
+        offset_lookup,
+    )
+    assert labels_qpsk.tolist() == [9]
+
+
+def test_compact_radar_model_map() -> None:
+    if not (DATASET / "label_maps.json").is_file():
+        return
+    label_map = build_global_radar_model_label_map(DATASET)
+    assert label_map.num_emitters == 24
+    assert label_map.class_counts is not None
+    assert sum(label_map.class_counts.values()) == 24
+    mask = build_compact_emitter_dataset_class_mask(label_map, num_datasets=32)
+    assert mask is not None
+    assert mask.shape == (32, 24)
+
+
 def test_apply_compact_task_labels_sets_model_cfg() -> None:
     if not (DATASET / "label_maps.json").is_file():
         return
@@ -72,8 +116,16 @@ def test_apply_compact_task_labels_sets_model_cfg() -> None:
     if emitter_map is not None:
         assert model_cfg.num_emitters >= 0
     if mod_map is not None:
-        assert model_cfg.num_mod_classes == 11
-        assert train_cfg["model"]["num_mod_classes"] == 11
+        assert model_cfg.num_mod_classes == 33
+        assert train_cfg["model"]["num_mod_classes"] == 33
+        assert "compact_tx_modulation" in train_cfg
+        assert train_cfg["compact_tx_modulation"]["num_classes"] == 33
+    if getattr(model_cfg, "num_ld_model_classes", None):
+        assert int(model_cfg.num_ld_model_classes) == 24
+        assert "compact_ld_model" in train_cfg
+    if getattr(model_cfg, "num_intrapulse_classes", None):
+        assert int(model_cfg.num_intrapulse_classes) >= 1
+        assert "compact_intrapulse" in train_cfg
 
 
 def test_downstream_loss_uses_compact_emitter_and_modulation() -> None:
@@ -111,24 +163,66 @@ def test_downstream_loss_uses_compact_emitter_and_modulation() -> None:
     mod_outputs = {
         "z": torch.randn(batch_size, d_model),
         "task_pooled": torch.randn(batch_size, d_model),
-        "task_logits": torch.randn(batch_size, 3),
+        "task_logits": torch.randn(batch_size, 33),
     }
     mod_batch = {
-        "canonical_mod_label_id": torch.tensor([10, 20, 30, -1]),
-        "dataset_id": torch.zeros(batch_size, dtype=torch.long),
+        "canonical_mod_label_id": torch.tensor([15, 25, 30, -1]),
+        "dataset_id": torch.tensor([3, 2, 3, 0]),
     }
     mod_lookup = torch.full((31,), -1, dtype=torch.long)
-    mod_lookup[10] = 0
-    mod_lookup[20] = 1
+    mod_lookup[15] = 7
+    mod_lookup[25] = 9
     mod_lookup[30] = 2
+    offset_lookup = torch.full((8,), -1, dtype=torch.long)
+    offset_lookup[2] = 0
+    offset_lookup[3] = 11
     loss_m, parts_m = downstream_task_loss(
         mod_outputs,
         mod_batch,
-        "modulation",
+        "tx_modulation",
         modulation_compact_lookup=mod_lookup,
+        modulation_offset_lookup=offset_lookup,
         modulation_contrastive_weight=0.0,
         z_probe_weight=0.0,
         label_field="canonical_mod_label_id",
     )
     assert torch.isfinite(loss_m)
     assert "task_ce" in parts_m
+    expected = global_comm_modulation_labels(
+        mod_batch["dataset_id"],
+        mod_batch["canonical_mod_label_id"],
+        mod_lookup,
+        offset_lookup,
+    )
+    assert expected.tolist() == [18, 9, 13, -1]
+
+
+def test_ld_intrapulse_loss_without_comm_compact_lookup_has_grad() -> None:
+    torch.manual_seed(0)
+    logits = torch.randn(4, 5, requires_grad=True)
+    outputs = {
+        "z": torch.randn(4, 8),
+        "task_pooled": torch.randn(4, 8),
+        "task_logits": logits,
+    }
+    batch = {
+        "canonical_mod_label_id": torch.tensor([0, 1, 2, 3]),
+        "dataset_id": torch.zeros(4, dtype=torch.long),
+    }
+    loss, parts = downstream_task_loss(
+        outputs,
+        batch,
+        "ld_intrapulse",
+        modulation_compact_lookup=None,
+        modulation_contrastive_weight=0.0,
+        z_contrastive_weight=0.0,
+        z_probe_weight=0.0,
+        domain_weight=0.0,
+        recon_weight=0.0,
+        phys_weight=0.0,
+        label_field="canonical_mod_label_id",
+        task_kind="classification",
+    )
+    assert loss.requires_grad
+    assert "task_ce" in parts
+    assert float(parts["task_ce"].detach()) > 0.0

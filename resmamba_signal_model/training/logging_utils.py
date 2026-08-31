@@ -64,9 +64,21 @@ def _fmt_metric(value: float) -> str:
     return text if text else "0"
 
 
-_TASK_PRINT_ORDER = ("modulation", "emitter", "clustering", "prediction", "imputation")
+_TASK_PRINT_ORDER = (
+    "pretrain",
+    "ld_intrapulse",
+    "ld_model",
+    "tx_modulation",
+    "ld_clustering",
+    "tx_clustering",
+    "prediction",
+    "modulation",
+    "emitter",
+    "clustering",
+    "imputation",
+)
 _STRUCTURED_METRIC_RE = re.compile(
-    r"^(acc_|f1_|macro_acc_|macro_f1_|macro_nmi_|macro_ssim_|nmi|ssim|impute_mse|recon_mse|mse_)"
+    r"^(acc_|f1_|miss_rate_|nmi|mse_|mae_|recon_mse|recon_mae)"
 )
 
 
@@ -87,46 +99,39 @@ def _format_task_report_lines(report: dict[str, Any]) -> list[str]:
             parts = [
                 f"acc={_fmt_metric(float(info['acc']))}",
                 f"f1={_fmt_metric(float(info['f1']))}",
-                f"mean_acc={_fmt_metric(float(info['mean_acc']))}",
-                f"mean_f1={_fmt_metric(float(info['mean_f1']))}",
+                f"miss_rate={_fmt_metric(float(info['miss_rate']))}",
                 f"n={int(info.get('n', 0))}",
             ]
             lines.append(f"{task}  " + "  ".join(parts))
             for dataset, row in sorted((info.get("datasets") or {}).items()):
                 lines.append(
                     f"  {dataset}  acc={_fmt_metric(float(row['acc']))}  "
-                    f"f1={_fmt_metric(float(row['f1']))}  n={int(row.get('n', 0))}"
+                    f"f1={_fmt_metric(float(row['f1']))}  "
+                    f"miss_rate={_fmt_metric(float(row['miss_rate']))}  n={int(row.get('n', 0))}"
                 )
         elif kind == "clustering":
-            parts = [f"mean_nmi={_fmt_metric(float(info['mean_nmi']))}"]
-            if "mean_nmi_modulation" in info:
-                parts.append(f"mean_nmi_modulation={_fmt_metric(float(info['mean_nmi_modulation']))}")
-            if "mean_nmi_emitter" in info:
-                parts.append(f"mean_nmi_emitter={_fmt_metric(float(info['mean_nmi_emitter']))}")
-            parts.extend(
-                [
-                    f"nmi={_fmt_metric(float(info['nmi']))}",
-                    f"n={int(info.get('n', 0))}",
-                ]
-            )
+            parts = [
+                f"acc={_fmt_metric(float(info['acc']))}",
+                f"nmi={_fmt_metric(float(info['nmi']))}",
+                f"n={int(info.get('n', 0))}",
+            ]
             lines.append(f"{task}  " + "  ".join(parts))
             for dataset, row in sorted((info.get("datasets") or {}).items()):
                 lines.append(
-                    f"  {dataset}  nmi={_fmt_metric(float(row['nmi']))}  n={int(row.get('n', 0))}"
+                    f"  {dataset}  acc={_fmt_metric(float(row['acc']))}  "
+                    f"nmi={_fmt_metric(float(row['nmi']))}  n={int(row.get('n', 0))}"
                 )
         elif kind == "reconstruction":
             parts = [
                 f"mse={_fmt_metric(float(info['mse']))}",
-                f"mean_mse={_fmt_metric(float(info['mean_mse']))}",
-                f"ssim={_fmt_metric(float(info['ssim']))}",
-                f"mean_ssim={_fmt_metric(float(info['mean_ssim']))}",
+                f"mae={_fmt_metric(float(info['mae']))}",
                 f"n={int(info.get('n', 0))}",
             ]
             lines.append(f"{task}  " + "  ".join(parts))
             for dataset, row in sorted((info.get("datasets") or {}).items()):
                 lines.append(
                     f"  {dataset}  mse={_fmt_metric(float(row['mse']))}  "
-                    f"ssim={_fmt_metric(float(row['ssim']))}  n={int(row.get('n', 0))}"
+                    f"mae={_fmt_metric(float(row['mae']))}  n={int(row.get('n', 0))}"
                 )
     return lines
 
@@ -143,6 +148,19 @@ def format_val_epoch_metrics(
     overall: dict[str, float] = {}
     per_source: dict[int, dict[str, float]] = {}
     hide_structured = bool(task_report)
+    active_task_names = set(task_report or {})
+    catalog_tasks = set(active_task_names)
+    for task_name in active_task_names:
+        if str(task_name).endswith("_z"):
+            catalog_tasks.add(str(task_name)[:-2])
+
+    def _skip_stale_task_metric(short: str) -> bool:
+        if not catalog_tasks or "/" not in short:
+            return False
+        task_prefix = short.split("/", 1)[0]
+        base_task = task_prefix[:-2] if task_prefix.endswith("_z") else task_prefix
+        return base_task not in catalog_tasks
+
     for key, raw in metrics.items():
         name = str(key)
         if not name.startswith("val/"):
@@ -158,6 +176,8 @@ def format_val_epoch_metrics(
                 short = short[4:]
             if hide_structured and _is_structured_val_metric(short):
                 continue
+            if _skip_stale_task_metric(short):
+                continue
             label = names[idx] if idx < len(names) else f"dataloader_{idx}"
             prefix = f"{label}/"
             if short.startswith(prefix):
@@ -168,6 +188,8 @@ def format_val_epoch_metrics(
         else:
             short = name[4:]
             if hide_structured and _is_structured_val_metric(short):
+                continue
+            if _skip_stale_task_metric(short):
                 continue
             overall[short] = value
     task_lines = _format_task_report_lines(task_report) if task_report else []
@@ -186,33 +208,45 @@ def format_val_epoch_metrics(
 
 
 def should_log_loss_part(name: str, loss_weights: dict[str, Any] | None) -> bool:
-    """TensorBoard / 指标日志：跳过配置权重 ≤0 的 loss 分项。
-
-    未出现在 ``loss_weights`` 中的诊断项（如 ``structure_time``）仍记录。
-    """
+    """TensorBoard / 指标日志：仅记录 ``loss_weights`` 中权重 >0 的分项。"""
     key = str(name).rsplit("/", 1)[-1]
     if not key or key.startswith("_"):
         return False
     if key == "total":
         return True
     if not loss_weights or key not in loss_weights:
-        return True
+        return False
     return float(loss_weights.get(key, 0.0) or 0.0) > 0.0
 
 
-def link_autodl_tensorboard(log_dir: Path) -> None:
-    """AutoDL 默认监控 /root/tf-logs；将当前 run 链到该目录便于面板读取。"""
+def link_autodl_tensorboard(log_dir: Path, *, run_name: str | None = None) -> Path | None:
+    """AutoDL 默认监控 /root/tf-logs；每 run 仅保留一个以 run_name 命名的软链，避免 tag 合并。"""
     autodl_root = Path("/root/tf-logs")
     if not Path("/root").is_dir():
-        return
+        return None
     autodl_root.mkdir(parents=True, exist_ok=True)
-    link = autodl_root / "resmamba_current"
-    if link.is_symlink() or link.is_file():
-        link.unlink()
-    elif link.exists():
-        return
-    link.symlink_to(log_dir.resolve())
-    print(f"AutoDL TensorBoard: {link} -> {log_dir.resolve()}")
+    for entry in list(autodl_root.iterdir()):
+        if entry.name.startswith("."):
+            continue
+        if entry.is_symlink():
+            entry.unlink()
+        elif entry.is_file() and entry.name in ("LOGDIR", "README.txt", "CURRENT_RUN"):
+            entry.unlink()
+
+    version_dir = log_dir / "version_0"
+    version_dir.mkdir(parents=True, exist_ok=True)
+    name = str(run_name or log_dir.parent.name).strip() or "resmamba_run"
+    link = autodl_root / name
+    link.symlink_to(version_dir.resolve())
+    (autodl_root / "CURRENT_RUN").write_text(name + "\n", encoding="utf-8")
+    (autodl_root / "LOGDIR").write_text(
+        f"TensorBoard logdir (one run only):\n  /root/tf-logs/{name}\n\n"
+        f"After each new train.py run, restart TensorBoard (AutoDL 6007 or scripts/tensorboard.sh).\n"
+        f"Do NOT use runs/experiments as logdir.\n",
+        encoding="utf-8",
+    )
+    print(f"AutoDL TensorBoard: /root/tf-logs/{name} -> {version_dir.resolve()}")
+    return link
 
 
 def setup_run_file_logger(run_dir: Path, *, name: str = "resmamba") -> logging.Logger:

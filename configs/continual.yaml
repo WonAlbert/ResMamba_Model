@@ -1,10 +1,13 @@
 # 持续学习：共享低秩 adapter + 原型吸收 + 置信蒸馏
+# 入口：python scripts/train.py --stage continual --config configs/continual.yaml --init-from <joint|stage2>/best.ckpt
 model_config: configs/model.yaml
 rfdata_root: /root/autodl-tmp/ResMamba_Signal_Model/dataset
 iq_normalize: none
+skip_revin: true
 sequence_packing: true
 mix_strategy: token_share
-combine_then_pack: true
+combine_then_pack: false
+homogeneous_batch: true
 balanced_sampling: false
 balanced_sampling_strategy: length_bucket
 token_budget: 4096
@@ -30,17 +33,19 @@ lr_min_ratio: 0.1
 token_normalized_loss: true
 clustering_view2: true
 lambda_recon: 0.0
-modulation_contrastive_weight: 0.25
-emitter_contrastive_weight: 0.25
-supervised_clustering: false
-cluster_utilization_weight: 0.15
-cluster_balance_mix: 0.7
+modulation_contrastive_weight: 0.0
+emitter_contrastive_weight: 0.0
+supervised_clustering: true
+cluster_utilization_weight: 0.0
+cluster_balance_mix: 0.0
 cluster_sinkhorn_epsilon: 0.1
+cluster_consistency_weight: 1.0
 use_dataset_bias: false
 train_encoder: false
 train_decoder: false
 train_heads: true
 skip_recon: true
+compact_task_labels: true
 continual: true
 distill_weight: 0.5
 distill_temperature: 2.0
@@ -62,17 +67,19 @@ loss_weights:
   physical: 0.0
   domain: 0.0
 tasks:
-  - modulation
-  - emitter
-  - clustering
+  - ld_intrapulse
+  - ld_model
+  - tx_modulation
+  - ld_clustering
+  - tx_clustering
   - prediction
-  - imputation
 task_pools:
-  classification: [downstream_modulation_train, downstream_modulation_val]
-  emitter: [downstream_emitter_train, downstream_emitter_val]
-  clustering: [clustering_train, clustering_val]
+  ld_intrapulse: [downstream_radar_modulation_train, downstream_radar_modulation_val]
+  ld_model: [downstream_radar_model_train, downstream_radar_model_val]
+  tx_modulation: [downstream_comm_modulation_train, downstream_comm_modulation_val]
+  ld_clustering: [clustering_radar_train, clustering_radar_val]
+  tx_clustering: [clustering_comm_train, clustering_comm_val]
   prediction: [downstream_prediction_train, downstream_prediction_val]
-  imputation: [downstream_prediction_train, downstream_prediction_val]
 continual_sessions:
   - name: session0
     epochs: 1

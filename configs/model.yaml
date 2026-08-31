@@ -52,7 +52,10 @@ model:
   num_mod_classes: 256
   num_emitters: 512
   num_prototypes: 32
-  clustering_num_prototypes: 128
+  # 聚类单库对齐：radar_mod15=15 类，rml2016_10a=11 类
+  clustering_num_prototypes: 15
+  ld_clustering_num_prototypes: 15
+  tx_clustering_num_prototypes: 11
   use_dataset_bias: false
   low_rank_prototype: true
   prototype_rank: 64
@@ -61,6 +64,10 @@ model:
   encoder_pool_heads: 4
   encoder_z_l2_normalize: true
   build_task_heads: false
+  force_unified_generation: true
   train_encoder: true
   train_decoder: true
   train_heads: true
+  tokenizer:
+    tokenization_mode: elastic_rov
+    elastic_length_scale: 0.5

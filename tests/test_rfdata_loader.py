@@ -49,6 +49,7 @@ def test_dataset_skips_extra_metadata_by_default(tmp_path: Path) -> None:
     sample = RFDataH5Dataset(path, iq_normalize="joint_power")[0]
     assert sample["iq"].shape == (2, 32)
     assert sample["mod_label_id"] == 0
+    assert sample["moe_route_stem"] == "a"
     assert "snr" not in sample
     assert "h5_path" not in sample
     extra = RFDataH5Dataset(path, include_extra_metadata=True)[1]

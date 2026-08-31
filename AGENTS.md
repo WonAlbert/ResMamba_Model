@@ -41,7 +41,8 @@ pytest -q
 | 一 预训练 | `--stage pretrain --config configs/pretrain.yaml` | 全量训练骨干；`build_task_interface=false`（无 UTI） |
 | 二 LP 探测 | `--stage stage2 --config configs/stage2.yaml --init-from <pretrain>/ckpts/best.ckpt` | 冻结骨干；只训**当前任务头**（+ 可选 `z_enc` 线性探针）；截断反传 |
 | 三 单任务适配 | `--stage stage3 --task <name> --config configs/stage3.yaml --init-from <stage2>/best.ckpt` | 该任务 Hybrid-LoRA+ + TaskAdapter + 头 |
-| 三 联合 | `--stage joint --config configs/joint.yaml` + `--adapter-dir` | 各任务 LoRA/Adapter/头 + **仅** `SharedTaskAdapter` |
+| 四 联合 | `--stage joint --config configs/joint.yaml` + `--adapter-dir` | 各任务 LoRA/Adapter/头 + **仅** `SharedTaskAdapter` |
+| 五 持续学习 | `--stage continual --config configs/continual.yaml --init-from <joint|stage2>/best.ckpt` | 共享 LoRA + 原型吸收 + 置信蒸馏；不解冻骨干 |
 
 冒烟：任意阶段加 `--profile tiny --synthetic`。日志：`runs/experiments/<run>/`。
 
@@ -55,6 +56,8 @@ python scripts/train.py --stage stage3 --task tx_modulation --config configs/sta
   --init-from runs/experiments/<stage2>/ckpts/best.ckpt
 python scripts/train.py --stage joint --config configs/joint.yaml \
   --init-from runs/experiments/<stage2>/ckpts/best.ckpt
+python scripts/train.py --stage continual --config configs/continual.yaml \
+  --init-from runs/experiments/<joint>/ckpts/best.ckpt
 ```
 
 ## 验收（当前）
@@ -72,6 +75,7 @@ python scripts/train.py --stage stage3 --task ld_clustering --profile tiny --syn
 python scripts/train.py --stage stage3 --task tx_clustering --profile tiny --synthetic
 python scripts/train.py --stage stage3 --task prediction --profile tiny --synthetic
 python scripts/train.py --stage joint --profile tiny --synthetic
+python scripts/train.py --stage continual --profile tiny --synthetic
 pytest -q
 ```
 
@@ -80,8 +84,9 @@ pytest -q
 ## 架构要点（改模型时勿破坏）
 
 - **Encoder**：`M-M-M-M-M-T`；预训练 `encode_visible_only`（MAE）；可见 token **GatingPool**（默认；`encoder_pool_type: attn_pool` 可切回 AttnPool）→ **`z_enc` / `h_enc`**（分类身份；`z_general`/`z` 别名指向此处；默认 L2 归一化；复用 MAE encode，不二次全序列）；无 mask / 下游 encode 时对全有效 patch 池化；超长序列 chunk 均值记忆 + RoPE。
-- **Decoder**：恰好 1 层 `DecoderBlock`；token 通路重建；`[DEC]` + AttnPool → **`z_recon`**（重建/物理 readout，不作分类身份）。
+- **Decoder**：默认 2 层 `DecoderBlock`；token 通路重建；`[DEC]` + AttnPool → **`z_recon`**（重建/物理 readout，不作分类身份）。
 - **下游**：冻结 `z_enc` → 可选 TaskAdapter → 任务私有头；**不**构建 / 不经过 UTI（`train.py` 设 `build_task_interface=false`）。联合阶段仅新增 `SharedTaskAdapter`（不解冻 tokenizer 尾部 / 无 `shared_lora`）。
+- **持续学习**：`--stage continual`；共享 LoRA（`shared_lora: true`）+ 置信蒸馏 + 旧原型锚 + `absorb_unknown`；只训共享 adapter / 原型 / 头（见 `training/continual.py`）。
 - **MoE**：三路专家（`ld_intrapulse` / `ld_model` / `tx_modulation`）；预训练按 H5 stem、下游按 task 名硬路由（非内容 gate）。
 - **Tokenizer**：共享 stem + 三路专家分支 + 复数双侧频谱分带；无 dataset/task token。
 - **归一化**：模型内 `revin_scale_mode: joint_energy`（I/Q 共享 Winsorized RMS；`amp_aux` 旁路绝对功率进 Decoder FiLM / 物理读出，不进 `z_enc`）。Loader 保持 `iq_normalize: none`。
@@ -101,6 +106,7 @@ pytest -q
 | `configs/stage2.yaml` | 冻结骨干 LP 探测 |
 | `configs/stage3.yaml` | 单任务 Hybrid-LoRA+ |
 | `configs/joint.yaml` | 联合 PEFT |
+| `configs/continual.yaml` | 持续学习（共享 LoRA + 原型吸收 + 蒸馏） |
 | `configs/datasets.yaml` | 数据池白名单 |
 | `configs/val_subset.yaml` | 验证子集 |
 
@@ -120,13 +126,14 @@ ResMamba_Signal_Model/
 │   ├── stage2.yaml
 │   ├── stage3.yaml
 │   ├── joint.yaml
-│   ├── downstream.yaml
 │   ├── continual.yaml
 │   ├── datasets.yaml
 │   └── val_subset.yaml
 ├── docs/
 │   ├── RESEARCH_REPORT.md
-│   └── sota_gate.md
+│   ├── sota_gate.md
+│   ├── data_preprocess.md
+│   └── architecture_drawing_schemes.md
 ├── figures/                  # 波形示意等
 ├── resmamba_signal_model/
 │   ├── __init__.py
@@ -173,7 +180,7 @@ ResMamba_Signal_Model/
 │       ├── task_catalog.py
 │       ├── mix.py
 │       ├── sota_gate.py
-│       ├── continual.py
+│       ├── continual.py      # 蒸馏 / 原型吸收 / 会话
 │       └── ...               # lr / early_stop / labels / logging
 ├── scripts/
 │   ├── train.py              # 唯一训练入口
@@ -187,7 +194,7 @@ ResMamba_Signal_Model/
 └── tests/                    # pytest：模型、数据、阶段冻结、门控等
 ```
 
-数据根目录 `dataset/`（H5、外部源、split manifest）与 `runs/` 为运行产物，默认不入库。协议：`*_train.h5` 无标签预训练；`*_test.h5` 阶段二/三有标签训练；`*_val.h5` 全阶段验证。缺 test 时 `prepare_datasets.py --rebuild-pools-only` 从 train 分层切 20%。评估默认 `*_val.h5`（`infer.py --split val`）。I/O 契约见 `resmamba_signal_model/data/` 与 `configs/datasets.yaml`。
+数据根目录 `dataset/`（H5、外部源、split manifest）与 `runs/` 为运行产物，默认不入库。协议：`*_train.h5` 无标签预训练；`*_test.h5` 阶段二/三有标签训练；`*_val.h5` 全阶段验证。缺 test 时 `prepare_datasets.py --ensure-missing-test-splits --rebuild-task-pools` 从 train 分层切 20%。评估默认 `*_val.h5`（`infer.py --split val`）。I/O 契约见 `resmamba_signal_model/data/` 与 `configs/datasets.yaml`。
 
 ## 改代码时的优先落点
 
@@ -203,6 +210,6 @@ ResMamba_Signal_Model/
 ## 完成定义（Definition of Done）
 
 - [ ] 相关 `pytest` 通过；涉及正式宽度时注明是否依赖 Mamba kernel。
-- [ ] 训练相关改动：tiny synthetic 冒烟可跑通对应 `--stage`。
-- [ ] 若触及下游分类：对照上文**验收第一标准**记录 stage2 / stage3 的 modulation / emitter acc。
+- [ ] 训练相关改动：tiny synthetic 冒烟可跑通对应 `--stage`（含可选 `continual`）。
+- [ ] 若触及下游分类：对照六任务 stage2 / stage3 指标记录（勿再用旧 modulation/emitter 阈值）。
 - [ ] 本次变更已单独 commit；需要远端时已推送到当前功能分支。

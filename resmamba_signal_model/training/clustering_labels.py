@@ -32,6 +32,29 @@ def local_cluster_label(
     return local
 
 
+def resolve_cluster_eval_labels(
+    mod_label_id: np.ndarray | torch.Tensor | None,
+    emitter_id: np.ndarray | torch.Tensor | None,
+    source_label_id: np.ndarray | torch.Tensor | None,
+) -> np.ndarray | torch.Tensor | None:
+    """聚类验证指标用局部标签（单 H5 内 mod > emitter > source），不做跨 dataset 全局命名。"""
+    if mod_label_id is None and emitter_id is None and source_label_id is None:
+        return None
+    if mod_label_id is None:
+        mod_label_id = emitter_id if emitter_id is not None else source_label_id
+    if emitter_id is None:
+        if isinstance(mod_label_id, torch.Tensor):
+            emitter_id = torch.full_like(mod_label_id, -1)
+        else:
+            emitter_id = np.full(np.shape(mod_label_id), -1, dtype=np.int32)
+    if source_label_id is None:
+        if isinstance(mod_label_id, torch.Tensor):
+            source_label_id = torch.full_like(mod_label_id, -1)
+        else:
+            source_label_id = np.full(np.shape(mod_label_id), -1, dtype=np.int32)
+    return local_cluster_label(mod_label_id, emitter_id, source_label_id)
+
+
 def resolve_modulation_labels(
     mod_label_id: torch.Tensor,
     source_label_id: torch.Tensor | None = None,

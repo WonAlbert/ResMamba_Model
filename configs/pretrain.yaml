@@ -1,4 +1,5 @@
-# 预训练：重建 / 物理 / 插补 / 读出 / 域对抗；无分类 CE
+# 预训练：MAE(random) + 物理 / 读出 / 结构(+相位) + VICReg；关 impute；无分类 CE
+# 难库上采样 / 易库降权；mask 先固定 0.3，难库 recon_mse 相对基线下降后再开自适应
 model_config: configs/model.yaml
 rfdata_root: /root/autodl-tmp/ResMamba_Signal_Model/dataset
 pool: pretrain_train
@@ -10,60 +11,142 @@ mix_strategy: token_share
 mix_value_clip: 2.0
 combine_then_pack: false
 homogeneous_batch: true
+# 同 H5 batch 内再按有效长度分桶，压低 step loss 尖峰（仍保持单 H5 同质）
+homogeneous_length_bucket: true
+homogeneous_length_bucket_weight: proportional
+homogeneous_length_tier: true
+# 同一 H5 连续 N 个 batch（Chronos 模式下为 0：每 batch 随机 tier/库）
+homogeneous_stem_sticky_batches: 48
+# Chronos 式：同长度 tier 内混库 + batch shuffle（见 amazon-science/chronos-forecasting）
+# z_supcon>0 时必须关 iq_mixup（mixup 会污染对比标签）；lit 侧也会在 z_supcon 开启时强制关闭
+chronos_sampling:
+  enabled: true
+  length_tier_pool: true
+  stem_sticky_batches: 0
+  shuffle_buffer_batches: 64
+  stem_share_cap: 0.28
+  iq_mixup:
+    enabled: false
+    k: 2
+    alpha: 0.3
 balanced_sampling: false
 balanced_sampling_strategy: length_bucket
+# accum↓ → 同等墙钟更多 optimizer 更新；token_budget 保持 8192 以保住 it/s
 token_budget: 8192
-steps_per_epoch: 600
-val_batches: 50
+steps_per_epoch: 400
+val_batches: 40
 val_seed: 0
+# 小库整库验证，避免被 val_batches 固定子集挤掉（radar_mod15 val 仅 913 条）
+val_full_stems:
+  - radar_mod15
 seed: 0
 check_val_every_n_epoch: 1
 checkpoint_monitor: val/monitor
 checkpoint_mode: min
-early_stopping_patience: 10
-early_stopping_min_delta: 0.001
+early_stopping_patience: 8
+early_stopping_min_delta: 0.0005
 min_ratio: 0.05
 synthetic: false
 amp: true
 amp_dtype: bfloat16
-epochs: 50
-num_workers: 20
-prefetch_factor: 8
+# 续训 / 加速：40ep + 正确 cosine；opt/ep = 400/2 = 200（旧 150）
+epochs: 40
+num_workers: 12
+prefetch_factor: 4
 max_grad_norm: 0.5
-gradient_accumulation_steps: 1
-learning_rate: 5.0e-5
-warmup_steps: 500
+gradient_accumulation_steps: 2
+# peak_lr = learning_rate × accum = 8e-5 × 2 = 1.6e-4
+learning_rate: 8.0e-5
+warmup_steps: 150
 lr_schedule: warmup_cosine
 lr_min_ratio: 0.1
 lr_scale_with_grad_accum: true
 token_normalized_loss: true
+# 反传总 loss 除以该 H5 的历史 EMA，换库时优化目标 ~1.0、稳定下降
+stem_normalized_loss: true
 p_trunc: 0.3
 l_min: 16
 chunk_len: 8192
 vicreg_gamma: l2_unit
-vicreg_gamma_token: 1.0
+vicreg_warmup_steps: 400
+model:
+  mae_mask_probs:
+    random: 1.0
+    contiguous: 0.0
+    mixed: 0.0
+    suffix: 0.0
+  # 阶段 A：固定 0.3；阶段 B 由 adaptive_mae_unlock 打开自适应
+  adaptive_mae_mask: false
+  mask_ratio: 0.30
+  mae_mask_ref_patches: 8
+  mae_mask_ratio_min: 0.30
+  mae_mask_ratio_max: 0.55
+  mae_mask_log_scale: 0.10
+# 难库 train recon_mse EMA 相对各自基线下降 rel_drop 后解锁自适应
+adaptive_mae_unlock:
+  enabled: true
+  hard_stems: [rml2016_04c, panoradio_hf, radchar]
+  min_steps: 1200
+  min_stem_updates: 40
+  rel_drop: 0.08
+# 进度条看 loss/total_train_ema + loss/mae_norm；TB 另有 raw loss/total 与 loss/recon_mse*
+mae_log_ema_alpha: 0.995
+total_log_ema_alpha: 0.995
+stem_loss_ema_alpha: 0.99
+# MAE 为主；z_supcon / proto_swav 给 z_enc 半监督对比 + SwAV 式原型可分压力（不进 val/monitor）
 loss_weights:
   mae: 1.0
   physical: 0.2
-  impute: 0.2
   readout: 0.1
-  # 任务无关骨干：domain 不进 z_enc；关闭易塌缩的 EMA 余弦 latent
-  domain: 0.0
-  structure: 0.2
-  structure_phase: 0.15
-  latent: 0.0
-  vicreg: 0.5
-  vicreg_token: 0.2
+  structure: 0.15
+  structure_phase: 0.05
+  vicreg: 0.15
+  z_supcon: 0.15
+  proto_swav: 0.10
+# proto_swav>0 时 lit 挂轻量 PretrainPrototypeDisk（不进 foundation task heads）
+pretrain_disc:
+  num_prototypes: 32
+  proj_dim: 128
+  temperature: 0.1
 ema_teacher: false
 ema_momentum: 0.999
 supervised_clustering: false
 source_groups:
   ld_radar: [radchar, radar_mod15, cjr_mix]
-  tx_comm: [rml2016_*, xidian14, panoradio_hf]
+  tx_comm: [rml2016_*, panoradio_hf]
 family_quotas:
-  tx_comm: 0.55
-  ld_radar: 0.45
+  tx_comm: 0.45
+  ld_radar: 0.55
+# 有 stem_sample_weights 时族内用手动相对权重（不再 equal/√N）
+within_family_weight: equal
+max_within_family_share: 0.40
+# 相对权重（族内归一化后再 × family_quotas）；stem_share_cap=0.28 才能抬高小库
+stem_sample_weights:
+  rml2016_04c: 2.5
+  panoradio_hf: 2.0
+  radchar: 1.5
+  rml2016_10a: 1.0
+  rml2016_10b: 1.0
+  cjr_mix: 2.5
+  radar_mod15: 3.0
+# 期望份额约（family×族内，受 stem_share_cap=0.28 约束）：
+#   ld_radar ~55%: radar_mod15≈18–22%, cjr_mix≈15–18%, radchar 余量
+#   tx_comm  ~45%: 04c / panoradio / 10a/10b
 profiles:
+  # 旧 foundation ckpt + 新 z_supcon/proto_swav：短续训加速收敛（用 --init-from，勿 --resume）
+  disc_continue:
+    epochs: 6
+    steps_per_epoch: 300
+    val_batches: 24
+    check_val_every_n_epoch: 1
+    # peak ≈ 2.4e-4（×accum）；短 warmup，余弦压到 6ep
+    learning_rate: 1.2e-4
+    warmup_steps: 40
+    vicreg_warmup_steps: 0
+    early_stopping_patience: 4
+    early_stopping_min_delta: 0.001
+    adaptive_mae_unlock:
+      enabled: false
   tiny:
     model_config: configs/model_tiny.yaml
     synthetic: true
@@ -77,3 +160,9 @@ profiles:
     warmup_steps: 1
     learning_rate: 1.0e-3
     require_mamba_kernel: false
+    adaptive_mae_unlock:
+      enabled: false
+    pretrain_disc:
+      num_prototypes: 8
+      proj_dim: 32
+      temperature: 0.1

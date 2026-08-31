@@ -25,7 +25,6 @@ def test_load_pretrain_datasets() -> None:
         "rml2016_04c",
         "rml2016_10a",
         "rml2016_10b",
-        "xidian14",
         "panoradio_hf",
     ]
     assert "radchar" in datasets
@@ -56,8 +55,8 @@ def test_load_downstream_radar_modulation_datasets() -> None:
 def test_load_clustering_pools() -> None:
     radar = load_clustering_radar_datasets()
     comm = load_clustering_comm_datasets()
-    assert radar == ["radar_mod15", "cjr_mix"]
-    assert comm == ["rml2016_10a", "xidian14"]
+    assert radar == ["radar_mod15"]
+    assert comm == ["rml2016_10a"]
 
 
 def test_load_downstream_shared_datasets() -> None:
@@ -68,7 +67,6 @@ def test_load_downstream_shared_datasets() -> None:
         "rml2016_04c",
         "rml2016_10a",
         "rml2016_10b",
-        "xidian14",
     ]
 
 

@@ -15,8 +15,18 @@ NAMESPACE_ALIASES = {
     "emitter": DEVICE_NAMESPACE,
     "device": DEVICE_NAMESPACE,
     "source": DEVICE_NAMESPACE,
+    "ld_clustering": "ld_clustering",
+    "tx_clustering": "tx_clustering",
 }
 DEFAULT_NAMESPACES: tuple[str, ...] = (CONTENT_NAMESPACE, DEVICE_NAMESPACE)
+
+
+def clustering_registry_namespace(task: str) -> str:
+    """聚类任务写入 PrototypeRegistry 的命名空间（雷达/通信分任务，不共用 modulation/emitter bank）。"""
+    key = str(task).strip().lower()
+    if key in ("ld_clustering", "tx_clustering"):
+        return resolve_namespace(key)
+    return CONTENT_NAMESPACE if "tx" in key else DEVICE_NAMESPACE
 
 
 def resolve_namespace(name: str) -> str:
@@ -74,6 +84,9 @@ class PrototypeBank(nn.Module):
             soft = F.one_hot(assignment.long().clamp(0, k - 1), k).to(dtype=z.dtype)
         else:
             soft = assignment.detach().float()
+        k = int(self.num_prototypes)
+        if soft.shape[-1] != k:
+            return
         mass = soft.sum(dim=0).clamp_min(1.0e-8)
         new_mean = (soft.t() @ z) / mass.unsqueeze(-1)
         centered = z.unsqueeze(1) - new_mean.unsqueeze(0)
@@ -208,3 +221,47 @@ class PrototypeRegistry(nn.Module):
         d = min(bank.dim, int(weight.shape[1]))
         with torch.no_grad():
             bank.mean[:n, :d].copy_(weight[:n, :d].to(dtype=bank.mean.dtype))
+
+
+class PretrainPrototypeDisk(nn.Module):
+    """预训练轻量原型盘：``proj(z_enc)`` + 可学习原型，供 ``proto_swav`` 使用。
+
+    不挂入 task heads / PrototypeRegistry，避免与下游 ckpt 布局纠缠。
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        *,
+        proj_dim: int = 128,
+        num_prototypes: int = 32,
+        temperature: float = 0.1,
+        view_dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        dim = int(d_model)
+        out = max(8, int(proj_dim))
+        self.proj = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, out),
+        )
+        self.prototypes = nn.Parameter(torch.randn(max(2, int(num_prototypes)), out) * 0.02)
+        self.temperature = float(temperature)
+        self.view_dropout = nn.Dropout(float(view_dropout))
+
+    def forward(self, z_enc: torch.Tensor) -> dict[str, torch.Tensor]:
+        tau = max(float(self.temperature), 1.0e-6)
+        z = F.normalize(self.proj(z_enc.float()), dim=-1)
+        proto = F.normalize(self.prototypes.float(), dim=-1)
+        logits = z @ proto.t() / tau
+        out: dict[str, torch.Tensor] = {
+            "cluster_embedding": z,
+            "cluster_logits": logits,
+            "cluster_probs": logits.softmax(dim=-1),
+            "cluster_prototypes": proto,
+        }
+        if self.training:
+            z2 = F.normalize(self.proj(self.view_dropout(z_enc.float())), dim=-1)
+            out["cluster_embedding_view2"] = z2
+            out["cluster_logits_view2"] = z2 @ proto.t() / tau
+        return out

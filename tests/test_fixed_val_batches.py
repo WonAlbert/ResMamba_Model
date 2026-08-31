@@ -203,3 +203,21 @@ def test_val_loader_stratified_on_imbalanced_synthetic() -> None:
     assert counts.keys() == {0, 1, 2}
     assert max(counts.values()) - min(counts.values()) <= 1
     assert all(count == 10 for count in counts.values())
+
+
+def test_plan_full_stems_includes_entire_small_stem() -> None:
+    lengths = [16] * 20 + [16] * 5  # big stem 20 + small stem 5
+    stem_ids = ["big"] * 20 + ["small"] * 5
+    plan = plan_fixed_token_budget_batches(
+        lengths,
+        token_budget=8,
+        patch_size=16,
+        num_batches=2,
+        seed=0,
+        stem_ids=stem_ids,
+        full_stems=["small"],
+    )
+    used = set(_flatten(plan))
+    assert set(range(20, 25)).issubset(used)
+    # 小库全量 + 大库仍受 num_batches 限制
+    assert len([i for i in used if i < 20]) <= 16

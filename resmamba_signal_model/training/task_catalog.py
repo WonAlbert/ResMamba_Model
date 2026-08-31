@@ -86,12 +86,12 @@ class TaskSpec:
             self.monitor = KIND_MONITOR[self.kind]
         if not self.label_field:
             if self.kind == "clustering":
-                self.label_field = "global_label_id"
+                self.label_field = "local_cluster_eval"
             elif self.kind == "classification":
                 if self.name == "ld_intrapulse":
                     self.label_field = "canonical_mod_label_id"
                 elif self.name == "ld_model":
-                    self.label_field = "global_emitter_id"
+                    self.label_field = "mod_label_id"
                 else:
                     self.label_field = "canonical_mod_label_id"
 
@@ -120,7 +120,7 @@ def builtin_spec(name: str) -> TaskSpec:
             "ld_model",
             "classification",
             "ld_model",
-            label_field="global_emitter_id",
+            label_field="mod_label_id",
         ),
         "tx_modulation": TaskSpec(
             "tx_modulation",
@@ -128,8 +128,8 @@ def builtin_spec(name: str) -> TaskSpec:
             "tx_modulation",
             label_field="canonical_mod_label_id",
         ),
-        "ld_clustering": TaskSpec("ld_clustering", "clustering", "ld_clustering", label_field="global_label_id"),
-        "tx_clustering": TaskSpec("tx_clustering", "clustering", "tx_clustering", label_field="global_label_id"),
+        "ld_clustering": TaskSpec("ld_clustering", "clustering", "ld_clustering", label_field="local_cluster_eval"),
+        "tx_clustering": TaskSpec("tx_clustering", "clustering", "tx_clustering", label_field="local_cluster_eval"),
         "prediction": TaskSpec("prediction", "prediction", "prediction"),
     }
     if name not in presets:
@@ -283,10 +283,17 @@ def apply_catalog_to_model_cfg(model_cfg: Any, catalog: TaskCatalog) -> Any:
     model_cfg.num_task_types = max(int(getattr(model_cfg, "num_task_types", 8) or 8), len(names) + 4)
     for spec in catalog.specs:
         if spec.kind == "clustering" and spec.num_prototypes:
-            model_cfg.clustering_num_prototypes = int(spec.num_prototypes)
+            if spec.name == "ld_clustering":
+                model_cfg.ld_clustering_num_prototypes = int(spec.num_prototypes)
+            elif spec.name == "tx_clustering":
+                model_cfg.tx_clustering_num_prototypes = int(spec.num_prototypes)
+            else:
+                model_cfg.clustering_num_prototypes = int(spec.num_prototypes)
         if spec.kind == "classification" and spec.num_classes:
             if spec.name == "ld_model":
                 model_cfg.num_emitters = int(spec.num_classes)
+            elif spec.name == "ld_intrapulse":
+                model_cfg.num_intrapulse_classes = int(spec.num_classes)
             else:
                 model_cfg.num_mod_classes = int(spec.num_classes)
     return model_cfg

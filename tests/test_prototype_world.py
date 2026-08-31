@@ -6,7 +6,12 @@ import torch
 import torch.nn.functional as F
 
 from resmamba_signal_model.models.heads import PrototypeClusteringHead
-from resmamba_signal_model.models.prototypes import CONTENT_NAMESPACE, DEVICE_NAMESPACE, PrototypeRegistry
+from resmamba_signal_model.models.prototypes import (
+    CONTENT_NAMESPACE,
+    DEVICE_NAMESPACE,
+    PrototypeRegistry,
+    clustering_registry_namespace,
+)
 from resmamba_signal_model.training.continual import absorb_unknown_embeddings, old_prototype_anchor_loss
 from resmamba_signal_model.training.losses import confidence_masked_distillation_loss, negcos_temperature
 from resmamba_signal_model.models.model import SignalFoundationModel, SignalModelConfig
@@ -116,6 +121,32 @@ def _tiny(**kwargs) -> SignalFoundationModel:
     )
     payload.update(kwargs)
     return SignalFoundationModel(SignalModelConfig(**payload))
+
+
+def test_clustering_registry_namespace() -> None:
+    assert clustering_registry_namespace("ld_clustering") == "ld_clustering"
+    assert clustering_registry_namespace("tx_clustering") == "tx_clustering"
+
+
+def test_ema_update_ignores_mismatched_assignment_k() -> None:
+    torch.manual_seed(0)
+    bank = PrototypeRegistry(8, num_prototypes=4).bank(CONTENT_NAMESPACE)
+    before = bank.mean.detach().clone()
+    embed = F.normalize(torch.randn(6, 8), dim=-1)
+    assign = torch.randn(6, 128).softmax(dim=-1)
+    bank.ema_update(embed, assign)
+    assert torch.equal(bank.mean, before)
+
+
+def test_ema_update_accepts_matching_assignment_k() -> None:
+    torch.manual_seed(0)
+    bank = PrototypeRegistry(8, num_prototypes=4).bank(CONTENT_NAMESPACE)
+    before = bank.mean.detach().clone()
+    embed = F.normalize(torch.randn(6, 8), dim=-1)
+    assign = torch.zeros(6, 4)
+    assign[:, 0] = 1.0
+    bank.ema_update(embed, assign)
+    assert not torch.equal(bank.mean, before)
 
 
 def test_clustering_head_honors_clustering_num_prototypes() -> None:

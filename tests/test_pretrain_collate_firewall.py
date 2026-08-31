@@ -32,6 +32,26 @@ def test_pretrain_collate_strips_ids() -> None:
     assert "length" in out
 
 
+def test_pretrain_collate_keep_disc_labels() -> None:
+    batch = {
+        "iq": torch.randn(2, 2, 32),
+        "length": torch.tensor([32, 32]),
+        "dataset_id": torch.tensor([1, 2]),
+        "mod_label_id": torch.tensor([3, 4]),
+        "global_label_id": torch.tensor([100003, 200004]),
+        "emitter_id": torch.tensor([5, 6]),
+        "h5_path": ["dataset/h5/radchar_train.h5", "dataset/h5/radar_mod15_train.h5"],
+        "receiver_id": ["rx1", "rx2"],
+    }
+    out = pretrain_collate_firewall(batch, keep_disc_labels=True)
+    assert out["global_label_id"].tolist() == [100003, 200004]
+    assert out["dataset_id"].tolist() == [1, 2]
+    assert out["mod_label_id"].tolist() == [3, 4]
+    assert "h5_path" not in out
+    assert "receiver_id" not in out
+    assert out["moe_route_stem"] == ["radchar", "radar_mod15"]
+
+
 def test_pretrain_forward_invariant_to_fake_labels() -> None:
     cfg = SignalModelConfig(
         d_model=32,

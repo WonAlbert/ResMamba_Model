@@ -9,9 +9,11 @@ from resmamba_signal_model.training.lr_schedule import (
     WarmupCosineLR,
     as_torch_lr_scheduler,
     build_lr_scheduler,
+    optimizer_steps_per_epoch,
     resolve_lr_schedule,
     scale_lr_for_grad_accum,
     should_reset_lr_schedule_on_resume,
+    total_optimizer_steps_from_cfg,
     use_cosine_lr_decay,
 )
 
@@ -76,6 +78,15 @@ def test_as_torch_lr_scheduler_wraps_warmup_cosine() -> None:
 def test_scale_lr_for_grad_accum() -> None:
     assert scale_lr_for_grad_accum(3e-4, 4, enabled=True) == 1.2e-3
     assert scale_lr_for_grad_accum(3e-4, 4, enabled=False) == 3e-4
+
+
+def test_total_optimizer_steps_accounts_for_grad_accum() -> None:
+    cfg = {"steps_per_epoch": 600, "epochs": 80, "gradient_accumulation_steps": 4}
+    assert optimizer_steps_per_epoch(cfg) == 150
+    assert total_optimizer_steps_from_cfg(cfg) == 12000
+    cfg2 = {"steps_per_epoch": 400, "epochs": 40, "gradient_accumulation_steps": 2}
+    assert optimizer_steps_per_epoch(cfg2) == 200
+    assert total_optimizer_steps_from_cfg(cfg2) == 8000
 
 
 def test_warmup_cosine_reconfigure_resets_progress() -> None:

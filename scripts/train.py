@@ -29,6 +29,7 @@ from resmamba_signal_model.training.task_catalog import (
     resolve_task_catalog,
 )
 from resmamba_signal_model.training.checkpointing import (
+    TaskCompositeCheckpointCallback,
     TrainStateCallback,
     extract_model_state_dict,
     load_init_from_checkpoint,
@@ -46,7 +47,11 @@ from resmamba_signal_model.training.emitter_labels import load_emitter_namespace
 from resmamba_signal_model.training.compact_labels import (
     apply_compact_task_labels,
     compact_emitter_class_mask,
+    compact_ld_model_class_mask,
     compact_task_labels_enabled,
+    compact_tx_modulation_class_mask,
+    radar_model_map_from_train_cfg,
+    tx_modulation_map_from_train_cfg,
 )
 from resmamba_signal_model.training.freeze import apply_stage_freeze, filter_specialist_state
 from resmamba_signal_model.training.lit_module import SignalLitModule
@@ -59,6 +64,7 @@ STAGE_DEFAULT_CONFIG = {
     "stage2": "configs/stage2.yaml",
     "stage3": "configs/stage3.yaml",
     "joint": "configs/joint.yaml",
+    "continual": "configs/continual.yaml",
 }
 
 
@@ -170,6 +176,8 @@ _MODEL_OVERLAY_KEYS = (
     "share_bidirectional_weights",
     "phase_plugin",
     "legacy_decoder_reconstruction",
+    "use_legacy_generation_heads",
+    "force_unified_generation",
     "encoder_pool_type",
     "encoder_pool_heads",
     "encoder_z_l2_normalize",
@@ -252,7 +260,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Signal foundation model Lightning trainer")
     parser.add_argument(
         "--stage",
-        choices=("pretrain", "stage2", "stage3", "joint"),
+        choices=("pretrain", "stage2", "stage3", "joint", "continual"),
         default="pretrain",
     )
     parser.add_argument("--config", default=None, help="训练 YAML，默认按 --stage 选择")
@@ -299,12 +307,22 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="只跑验证：加载 --resume/--init-from（或 --run-name 下 best.ckpt），不训练",
     )
+    parser.add_argument(
+        "--pretrain-stem",
+        action="append",
+        default=None,
+        help="预训练只保留这些数据集 stem（可重复）；例如 --pretrain-stem xidian14。"
+        "对应 train_cfg.pretrain_stems；单库探针勿与 --init-from 混用续训语义。",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     silence_third_party_warnings()
     args = parse_args()
+    default_cfg = ROOT / STAGE_DEFAULT_CONFIG.get(args.stage, "configs/pretrain.yaml")
+    config_path = args.config or str(default_cfg)
+    print(f"resmamba train stage={args.stage} config={config_path}", flush=True)
     if args.stage == "stage3" and not args.task:
         raise SystemExit("stage3 需要 --task <任务名>")
     default_cfg = ROOT / STAGE_DEFAULT_CONFIG.get(args.stage, "configs/pretrain.yaml")
@@ -347,6 +365,12 @@ def main() -> None:
         train_cfg["amp_dtype"] = args.amp_dtype
     if args.precision is not None:
         train_cfg["precision"] = args.precision
+    if args.pretrain_stem:
+        stems = [str(s).strip() for s in args.pretrain_stem if str(s).strip()]
+        if not stems:
+            raise SystemExit("--pretrain-stem 不能为空")
+        train_cfg["pretrain_stems"] = stems
+        print(f"pretrain_stems={stems}", flush=True)
     seed = resolve_run_seed(train_cfg)
     train_cfg["seed"] = seed
     train_cfg.setdefault("val_seed", seed)
@@ -355,8 +379,8 @@ def main() -> None:
     model_cfg.build_task_heads = args.stage != "pretrain"
     model_cfg.build_task_interface = False
     model_cfg.build_prototype_registry = args.stage != "pretrain"
-    model_cfg.build_adapters = args.stage in ("stage3", "joint")
-    model_cfg.build_shared_adapter = args.stage == "joint"
+    model_cfg.build_adapters = args.stage in ("stage3", "joint", "continual")
+    model_cfg.build_shared_adapter = args.stage in ("joint", "continual")
     apply_catalog_to_model_cfg(model_cfg, catalog)
     train_cfg.setdefault("patch_size", model_cfg.patch_size)
     compact_emitter_map = None
@@ -381,10 +405,12 @@ def main() -> None:
 
     from resmamba_signal_model.training.task_schedule import (
         TaskScheduleCallback,
+        TaskScheduleEarlyStoppingCallback,
         expand_task_schedule_with_joint,
         resolve_task_schedule,
         slice_task_schedule_from,
         sources_for_tasks,
+        task_schedule_early_stopping_enabled,
         total_schedule_epochs,
     )
 
@@ -451,7 +477,30 @@ def main() -> None:
     print(cache_msg, flush=True)
 
     model = SignalFoundationModel(model_cfg)
-    if compact_emitter_map is not None:
+    ld_model_map = radar_model_map_from_train_cfg(train_cfg)
+    if ld_model_map is not None:
+        mask = compact_ld_model_class_mask(ld_model_map, num_datasets=int(model_cfg.num_datasets))
+        model.load_emitter_dataset_class_mask(train_cfg.get("rfdata_root"), mask=mask)
+    tx_map, tx_canonical = tx_modulation_map_from_train_cfg(train_cfg)
+    if tx_map is None and bool(train_cfg.get("compact_task_labels")):
+        try:
+            from resmamba_signal_model.training.modulation_labels import build_global_comm_modulation_label_map
+
+            tx_map, tx_canonical = build_global_comm_modulation_label_map(
+                train_cfg.get("rfdata_root"),
+                train_cfg=train_cfg,
+            )
+        except (FileNotFoundError, KeyError, OSError):
+            tx_map, tx_canonical = None, None
+    if tx_map is not None and tx_canonical is not None:
+        tx_mask = compact_tx_modulation_class_mask(
+            tx_map,
+            tx_canonical,
+            train_cfg.get("rfdata_root"),
+            num_datasets=int(model_cfg.num_datasets),
+        )
+        model.load_tx_modulation_dataset_class_mask(tx_mask)
+    elif compact_emitter_map is not None:
         mask = compact_emitter_class_mask(
             compact_emitter_map,
             num_datasets=int(model_cfg.num_datasets),
@@ -461,12 +510,15 @@ def main() -> None:
         model.load_emitter_dataset_class_mask(train_cfg.get("rfdata_root"))
     if bool(train_cfg.get("compact_task_labels")):
         logger.info(
-            "compact_task_labels num_mod_classes=%s num_emitters=%s",
+            "compact_task_labels num_mod_classes=%s num_intrapulse_classes=%s num_emitters=%s num_ld_model_classes=%s",
             model_cfg.num_mod_classes,
+            getattr(model_cfg, "num_intrapulse_classes", None),
             model_cfg.num_emitters,
+            getattr(model_cfg, "num_ld_model_classes", None),
         )
         print(
-            f"compact_task_labels mod={model_cfg.num_mod_classes} emitter={model_cfg.num_emitters}",
+            f"compact_task_labels mod={model_cfg.num_mod_classes} intrapulse={getattr(model_cfg, 'num_intrapulse_classes', None)} "
+            f"emitter={model_cfg.num_emitters} ld_model={getattr(model_cfg, 'num_ld_model_classes', None)}",
             flush=True,
         )
     if args.init_from:
@@ -478,9 +530,11 @@ def main() -> None:
         print(f"init-from {init_path} missing={len(missing)} unexpected={len(unexpected)}", flush=True)
 
     peft_cfg = None
-    if args.stage in ("stage3", "joint"):
+    if args.stage in ("stage3", "joint", "continual"):
         peft_cfg = peft_config_from_train_cfg(train_cfg)
-        peft_cfg.shared_lora = bool(train_cfg.get("shared_lora", False))
+        peft_cfg.shared_lora = bool(
+            train_cfg.get("shared_lora", args.stage == "continual")
+        )
         tasks = [args.task] if args.stage == "stage3" and args.task else list(catalog.names)
         inject_hybrid_lora(model, tasks, peft_cfg)
         logger.info("injected Hybrid-LoRA+ tasks=%s modules=%s", tasks, len(getattr(model.peft, "names", [])))
@@ -502,8 +556,19 @@ def main() -> None:
         _torch.set_float32_matmul_precision("high")
 
     lit = SignalLitModule(model, train_cfg, stage=args.stage, mix=data.mix)
+    if lit.pretrain_disc is not None:
+        n_disc = sum(int(p.numel()) for p in lit.pretrain_disc.parameters())
+        logger.info(
+            "pretrain_disc enabled num_prototypes=%s params=%s",
+            int(lit.pretrain_disc.prototypes.shape[0]),
+            n_disc,
+        )
+        print(
+            f"pretrain_disc K={int(lit.pretrain_disc.prototypes.shape[0])} params={n_disc}",
+            flush=True,
+        )
     tb_dir = run_dir / "tb"
-    link_autodl_tensorboard(tb_dir)
+    link_autodl_tensorboard(tb_dir, run_name=run_dir.name)
     precision = resolve_lightning_precision(train_cfg)
     monitor, ckpt_mode = resolve_train_monitor(
         train_cfg,
@@ -523,9 +588,22 @@ def main() -> None:
         train_cfg.get("strategy"),
     )
     ckpt_dir = run_dir / "ckpts"
-    ckpt_cb = make_model_checkpoint(ckpt_dir, monitor=monitor, mode=ckpt_mode)
+    save_last = bool(train_cfg.get("save_last", False))
+    use_task_composite = args.stage == "stage2" and bool(task_sessions)
+    use_task_schedule_early_stop = task_schedule_early_stopping_enabled(
+        train_cfg,
+        stage=args.stage,
+        sessions=task_sessions or [],
+    )
+    ckpt_cb = make_model_checkpoint(
+        ckpt_dir,
+        monitor=monitor,
+        mode=ckpt_mode,
+        save_last=save_last,
+        save_best=not use_task_composite,
+    )
     state_cb = TrainStateCallback(run_dir / "train_state.json", monitor=monitor, stage=args.stage)
-    early_cb = make_early_stopping_callback(
+    early_cb = None if use_task_schedule_early_stop else make_early_stopping_callback(
         monitor=monitor,
         mode=ckpt_mode,
         patience=int(train_cfg.get("early_stopping_patience") or 0),
@@ -546,6 +624,31 @@ def main() -> None:
         )
     if task_sessions:
         callbacks.append(TaskScheduleCallback(task_sessions, train_cfg, stage=args.stage))
+        if use_task_composite:
+            callbacks.append(
+                TaskCompositeCheckpointCallback(ckpt_dir, train_cfg, stage=args.stage)
+            )
+            logger.info(
+                "task_composite_checkpoint enabled save_last=%s (per-task monitor merge -> best.ckpt)",
+                save_last,
+            )
+            print(
+                f"task_composite_checkpoint enabled save_last={save_last}",
+                flush=True,
+            )
+        if use_task_schedule_early_stop:
+            callbacks.append(
+                TaskScheduleEarlyStoppingCallback(task_sessions, train_cfg, stage=args.stage)
+            )
+            logger.info(
+                "task_schedule early_stop patience=%s min_delta=%s",
+                int(train_cfg.get("early_stopping_patience") or 0),
+                float(train_cfg.get("early_stopping_min_delta") or 0.0),
+            )
+            print(
+                f"task_schedule early_stop patience={int(train_cfg.get('early_stopping_patience') or 0)}",
+                flush=True,
+            )
         logger.info("task_schedule=%s", [(s.get("name"), s.get("epochs"), s.get("tasks")) for s in task_sessions])
 
     trainer_kwargs: dict[str, Any] = dict(
@@ -597,7 +700,15 @@ def main() -> None:
         logger.info("validation finished")
         return
     trainer.fit(lit, datamodule=data, ckpt_path=str(resume_ckpt) if resume_ckpt is not None else None)
-    logger.info("training finished best=%s", ckpt_cb.best_model_path)
+    best_path = None
+    for callback in trainer.callbacks:
+        if isinstance(callback, TaskCompositeCheckpointCallback):
+            best_path = callback.best_model_path or str(callback.best_path)
+            break
+    if best_path is None:
+        best_path = getattr(ckpt_cb, "best_model_path", None)
+    logger.info("training finished best=%s", best_path)
+    print(f"training finished best={best_path}", flush=True)
     if args.stage == "joint":
         bundle_path = Path(ckpt_cb.best_model_path) if ckpt_cb.best_model_path else ckpt_dir / "best.ckpt"
         if ckpt_cb.best_model_path:

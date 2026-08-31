@@ -1,0 +1,100 @@
+# 单预训练库探针：每个 stem 从零训 2 epoch，每 epoch 验证；勿跨库续训。
+# 用法见 scripts/run_pretrain_per_dataset_probe.py
+model_config: configs/model.yaml
+rfdata_root: /root/autodl-tmp/ResMamba_Signal_Model/dataset
+pool: pretrain_train
+cache_iq_in_memory: true
+val_pool: pretrain_val
+iq_normalize: none
+sequence_packing: true
+mix_strategy: token_share
+mix_value_clip: 2.0
+combine_then_pack: false
+homogeneous_batch: true
+homogeneous_length_bucket: true
+homogeneous_length_bucket_weight: proportional
+homogeneous_length_tier: true
+homogeneous_stem_sticky_batches: 12
+balanced_sampling: false
+balanced_sampling_strategy: length_bucket
+token_budget: 8192
+steps_per_epoch: 600
+val_batches: 50
+val_seed: 0
+seed: 0
+check_val_every_n_epoch: 1
+checkpoint_monitor: val/monitor
+checkpoint_mode: min
+# 短探针：关闭早停，固定跑满 epochs
+early_stopping_patience: 0
+early_stopping_min_delta: 0.0
+min_ratio: 0.05
+synthetic: false
+amp: true
+amp_dtype: bfloat16
+epochs: 2
+num_workers: 20
+prefetch_factor: 8
+max_grad_norm: 0.5
+gradient_accumulation_steps: 4
+learning_rate: 1.0e-4
+warmup_steps: 200
+lr_schedule: warmup_cosine
+lr_min_ratio: 0.1
+lr_scale_with_grad_accum: true
+token_normalized_loss: true
+p_trunc: 0.3
+l_min: 16
+chunk_len: 8192
+vicreg_gamma: l2_unit
+vicreg_gamma_token: 1.0
+vicreg_warmup_steps: 400
+model:
+  mae_mask_probs:
+    random: 1.0
+    contiguous: 0.0
+    mixed: 0.0
+    suffix: 0.0
+  adaptive_mae_mask: true
+  mask_ratio: 0.50
+  mae_mask_ref_patches: 8
+  mae_mask_ratio_min: 0.45
+  mae_mask_ratio_max: 0.75
+  mae_mask_log_scale: 0.10
+mae_log_ema_alpha: 0.995
+total_log_ema_alpha: 0.995
+stem_loss_ema_alpha: 0.99
+loss_weights:
+  mae: 1.0
+  physical: 0.2
+  readout: 0.1
+  structure: 0.2
+  structure_phase: 0.15
+  vicreg: 0.2
+  vicreg_token: 0.2
+ema_teacher: false
+ema_momentum: 0.999
+supervised_clustering: false
+# 单库时族配额由 sampler 自动缩到当前族
+source_groups:
+  ld_radar: [radchar, radar_mod15, cjr_mix]
+  tx_comm: [rml2016_*, xidian14, panoradio_hf]
+family_quotas:
+  tx_comm: 0.55
+  ld_radar: 0.45
+within_family_weight: equal
+max_within_family_share: 0.25
+profiles:
+  tiny:
+    model_config: configs/model_tiny.yaml
+    synthetic: true
+    epochs: 1
+    token_budget: 256
+    steps_per_epoch: 4
+    limit_train_batches: 2
+    limit_val_batches: 1
+    val_batches: 1
+    num_workers: 0
+    warmup_steps: 1
+    learning_rate: 1.0e-3
+    require_mamba_kernel: false

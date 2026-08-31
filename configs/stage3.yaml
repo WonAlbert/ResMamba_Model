@@ -1,18 +1,17 @@
 # 阶段三：单任务 Hybrid-LoRA+ + TaskAdapter + 该任务头
+# 数据与吞吐对齐 stage2；PEFT / 学习率保持本阶段配方
 model_config: configs/model.yaml
 rfdata_root: /root/autodl-tmp/ResMamba_Signal_Model/dataset
 iq_normalize: none
+skip_revin: true
 sequence_packing: true
-encoder_pool_type: attn_pool
-model:
-  encoder_pool_type: attn_pool
 mix_strategy: token_share
 combine_then_pack: false
 homogeneous_batch: true
 balanced_sampling: false
 balanced_sampling_strategy: length_bucket
-token_budget: 4096
-steps_per_epoch: 200
+token_budget: 8192
+steps_per_epoch: 600
 val_batches: 50
 val_seed: 0
 seed: 0
@@ -21,18 +20,28 @@ min_ratio: 0.05
 synthetic: false
 amp: true
 amp_dtype: bfloat16
-epochs: 5
+epochs: 20
 checkpoint_monitor: val/monitor
 checkpoint_mode: min
-early_stopping_patience: 3
-num_workers: 4
+save_last: true
+early_stopping_patience: 8
+early_stopping_min_delta: 0.001
+num_workers: 20
+prefetch_factor: 4
+cache_iq_in_memory: auto
 max_grad_norm: 1.0
 learning_rate: 2.0e-4
 heads_lr: 5.0e-5
-warmup_steps: 50
+warmup_steps: 200
 lr_schedule: warmup_cosine
 lr_min_ratio: 0.1
 token_normalized_loss: true
+clustering_view2: true
+cluster_utilization_weight: 0.0
+cluster_balance_mix: 0.0
+cluster_sinkhorn_epsilon: 0.1
+cluster_consistency_weight: 1.0
+supervised_clustering: true
 lambda_recon: 0.0
 use_dataset_bias: false
 train_encoder: false
@@ -70,8 +79,21 @@ task_pools:
   tx_modulation: [downstream_comm_modulation_train, downstream_comm_modulation_val]
   ld_clustering: [clustering_radar_train, clustering_radar_val]
   tx_clustering: [clustering_comm_train, clustering_comm_val]
-  prediction: [prediction_train, prediction_val]
+  prediction: [downstream_prediction_train, downstream_prediction_val]
 profiles:
+  # 六任务串行总墙钟 ~8–10h（目标≤12h）：对齐 stage2 加速项 + 略提 LR 促收敛
+  disc_fast:
+    steps_per_epoch: 400
+    epochs: 14
+    val_batches: 24
+    check_val_every_n_epoch: 2
+    early_stopping_patience: 5
+    num_workers: 12
+    cache_iq_in_memory: true
+    clustering_view2: false
+    learning_rate: 3.0e-4
+    heads_lr: 8.0e-5
+    warmup_steps: 80
   tiny:
     model_config: configs/model_tiny.yaml
     synthetic: true
@@ -109,13 +131,14 @@ profiles:
     checkpoint_mode: max
   ld_clustering:
     task: ld_clustering
-    checkpoint_monitor: val/nmi_within_domain
+    checkpoint_monitor: val/nmi_ld_clustering
     checkpoint_mode: max
   tx_clustering:
     task: tx_clustering
-    checkpoint_monitor: val/nmi_within_domain
+    checkpoint_monitor: val/nmi_tx_clustering
     checkpoint_mode: max
   prediction:
     task: prediction
     checkpoint_monitor: val/mse_prediction
     checkpoint_mode: min
+    epochs: 30

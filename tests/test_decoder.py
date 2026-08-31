@@ -24,11 +24,26 @@ def _decoder() -> SharedDecoder:
     )
 
 
-def test_decoder_single_mamba_block() -> None:
+def test_decoder_mamba_blocks_match_config() -> None:
     dec = _decoder()
     assert len(dec.blocks) == 1
     assert isinstance(dec.blocks[0], DecoderBlock)
     assert isinstance(dec.blocks[0].mamba, BiMamba2Block)
+    dec2 = SharedDecoder(
+        d_model=32,
+        patch_size=8,
+        decoder_mamba_layers=2,
+        attn_num_heads=4,
+        dropout=0.0,
+        sequence_packing=True,
+        d_state=8,
+        headdim=16,
+        require_mamba_kernel=False,
+        allow_fallback_mamba=True,
+        norm_type="rmsnorm",
+    )
+    assert len(dec2.blocks) == 2
+    assert all(isinstance(block, DecoderBlock) for block in dec2.blocks)
 
 
 def test_visible_only_scatter_fills_mask() -> None:

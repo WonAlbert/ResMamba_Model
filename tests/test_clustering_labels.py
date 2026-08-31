@@ -7,6 +7,7 @@ from resmamba_signal_model.training.clustering_labels import (
     GLOBAL_LABEL_NAMESPACE,
     global_cluster_labels,
     local_cluster_label,
+    resolve_cluster_eval_labels,
     resolve_modulation_labels,
 )
 from resmamba_signal_model.training.selection import (
@@ -41,6 +42,15 @@ def test_global_cluster_labels_torch() -> None:
     src = torch.tensor([-1, -1])
     global_id = global_cluster_labels(dataset_id, mod, emit, src)
     assert global_id.tolist() == [1 * GLOBAL_LABEL_NAMESPACE + 4, 2 * GLOBAL_LABEL_NAMESPACE + 9]
+
+
+def test_resolve_cluster_eval_labels_local_only() -> None:
+    mod = torch.tensor([3, -1, -1])
+    emit = torch.tensor([-1, 5, -1])
+    src = torch.tensor([-1, -1, 2])
+    labels = resolve_cluster_eval_labels(mod, emit, src)
+    assert labels is not None
+    assert labels.tolist() == [3, 5, 2]
 
 
 def test_resolve_modulation_labels_fallback_source() -> None:

@@ -133,7 +133,7 @@ def test_label_columns_passthrough_collate_and_merge() -> None:
     assert "global_emitter_id" in batch
     assert torch.is_tensor(batch["canonical_mod_label_id"])
     assert builtin_spec("tx_modulation").label_field == "canonical_mod_label_id"
-    assert builtin_spec("ld_model").label_field == "global_emitter_id"
+    assert builtin_spec("ld_model").label_field == "mod_label_id"
 
     second_key = dm.source_names[1] if len(dm.source_names) > 1 else dm.source_names[0]
     merged = merge_source_batches(
@@ -147,6 +147,24 @@ def test_label_columns_passthrough_collate_and_merge() -> None:
     assert "receiver_id" in merged
 
 
+def test_infer_task_label_tensor_ld_model_uses_mod_label_id() -> None:
+    import infer as infer_script
+
+    lookup = torch.tensor([-1] * 32, dtype=torch.long)
+    lookup[10] = 0
+    lookup[31] = 15
+    batch = {
+        "dataset_id": torch.tensor([10, 31]),
+        "mod_label_id": torch.tensor([3, 2]),
+        "global_emitter_id": torch.tensor([-1, -1]),
+    }
+    assert infer_script.task_label_tensor(
+        "ld_model",
+        batch,
+        ld_model_offset_lookup=lookup,
+    ).tolist() == [3, 17]
+
+
 def test_infer_task_label_tensor_uses_canonical_and_global_emitter() -> None:
     import infer as infer_script
 
@@ -158,7 +176,113 @@ def test_infer_task_label_tensor_uses_canonical_and_global_emitter() -> None:
         "global_label_id": torch.tensor([100, 101]),
     }
     assert infer_script.task_label_tensor("tx_modulation", batch).tolist() == [3, 4]
-    assert infer_script.task_label_tensor("ld_model", batch).tolist() == [10, 11]
+    assert infer_script.task_label_tensor("ld_model", batch).tolist() == [1, 2]
+
+
+def test_stage2_task_schedule_optimizer_registers_all_heads() -> None:
+    from resmamba_signal_model.models.model import SignalFoundationModel, SignalModelConfig
+    from resmamba_signal_model.training.freeze import apply_stage_freeze
+    from resmamba_signal_model.training.lit_module import SignalLitModule
+
+    model_cfg = SignalModelConfig(
+        d_model=32,
+        mamba_d_state=8,
+        mamba_headdim=16,
+        require_mamba_kernel=False,
+        allow_fallback_mamba=True,
+        attn_num_heads=4,
+        patch_size=8,
+        stem_channels=8,
+        freq_bands=4,
+        dropout=0.0,
+        p_trunc=0.0,
+        num_datasets=4,
+        num_mod_classes=5,
+        num_emitters=6,
+        build_task_heads=True,
+        build_task_interface=False,
+    )
+    model_cfg.num_intrapulse_classes = 3
+    model_cfg.num_ld_model_classes = 6
+    model = SignalFoundationModel(model_cfg)
+    train_cfg = {
+        "task_schedule": [{"task": "ld_intrapulse", "epochs": 1}, {"task": "ld_model", "epochs": 1}],
+        "active_train_tasks": ["ld_intrapulse"],
+        "truncate_backward": True,
+        "skip_recon": True,
+        "learning_rate": 1.0e-3,
+        "steps_per_epoch": 2,
+        "epochs": 2,
+        "warmup_steps": 1,
+    }
+    apply_stage_freeze(model, "stage2", task="ld_intrapulse", train_cfg=train_cfg)
+    lit = SignalLitModule(model, train_cfg, stage="stage2")
+    configured = lit.configure_optimizers()
+    optimizer = configured["optimizer"]
+    opt_ids = {id(p) for group in optimizer.param_groups for p in group["params"]}
+    assert id(model.ld_intrapulse_head.classifier.weight) in opt_ids
+    assert id(model.ld_model_head.classifier.weight) in opt_ids
+    assert id(model.z_linear_probes["ld_model"].weight) in opt_ids
+    assert not model.ld_model_head.classifier.weight.requires_grad
+
+    apply_stage_freeze(model, "stage2", task="ld_model", train_cfg=train_cfg)
+    assert model.ld_model_head.classifier.weight.requires_grad
+    before = model.ld_model_head.classifier.weight.detach().clone()
+    model.ld_model_head.classifier.weight.grad = torch.ones_like(model.ld_model_head.classifier.weight)
+    optimizer.step()
+    assert not torch.allclose(model.ld_model_head.classifier.weight, before)
+
+
+def test_sync_optimizer_adds_newly_unfrozen_head_after_task_switch() -> None:
+    from resmamba_signal_model.models.model import SignalFoundationModel, SignalModelConfig
+    from resmamba_signal_model.training.freeze import apply_stage_freeze
+    from resmamba_signal_model.training.lit_module import SignalLitModule
+
+    model_cfg = SignalModelConfig(
+        d_model=32,
+        mamba_d_state=8,
+        mamba_headdim=16,
+        require_mamba_kernel=False,
+        allow_fallback_mamba=True,
+        attn_num_heads=4,
+        patch_size=8,
+        stem_channels=8,
+        freq_bands=4,
+        dropout=0.0,
+        p_trunc=0.0,
+        num_datasets=4,
+        num_mod_classes=5,
+        num_emitters=6,
+        build_task_heads=True,
+        build_task_interface=False,
+    )
+    model_cfg.num_intrapulse_classes = 3
+    model_cfg.num_ld_model_classes = 6
+    model = SignalFoundationModel(model_cfg)
+    train_cfg = {
+        "task_schedule": [{"task": "ld_intrapulse", "epochs": 1}, {"task": "tx_modulation", "epochs": 1}],
+        "active_train_tasks": ["ld_intrapulse"],
+        "truncate_backward": True,
+        "skip_recon": True,
+        "learning_rate": 1.0e-3,
+        "steps_per_epoch": 2,
+        "epochs": 2,
+        "warmup_steps": 1,
+    }
+    apply_stage_freeze(model, "stage2", task="ld_intrapulse", train_cfg=train_cfg)
+    lit = SignalLitModule(model, train_cfg, stage="stage2")
+    # 模拟旧 run：优化器只含首个任务头
+    old_style = torch.optim.AdamW(
+        [p for p in model.ld_intrapulse_head.parameters() if p.requires_grad],
+        lr=1.0e-3,
+    )
+    lit.trainer = type("T", (), {"optimizers": [old_style]})()
+
+    apply_stage_freeze(model, "stage2", task="tx_modulation", train_cfg={**train_cfg, "active_train_tasks": ["tx_modulation"]})
+    added = lit.sync_optimizer_trainable_params()
+    assert added > 0
+    opt_ids = {id(p) for g in old_style.param_groups for p in g["params"]}
+    assert id(model.tx_modulation_head.classifier.weight) in opt_ids
 
 
 def test_configure_optimizers_uses_build_lr_scheduler() -> None:
@@ -225,7 +349,7 @@ def test_train_sampler_fields_are_label_firewall() -> None:
         fields = train_sampler_label_fields(task)
         assert "global_label_id" not in fields
     assert train_sampler_label_fields("tx_modulation")[0] == "canonical_mod_label_id"
-    assert train_sampler_label_fields("ld_model")[0] == "global_emitter_id"
+    assert train_sampler_label_fields("ld_model")[0] == "mod_label_id"
 
 
 def test_continual_sessions_and_osr_metrics() -> None:
@@ -251,7 +375,7 @@ def test_continual_sessions_and_osr_metrics() -> None:
 
 
 def test_ema_teacher_is_shadow_not_child() -> None:
-    train_cfg = _synthetic_cfg(ema_teacher=True, loss_weights={"mae": 1.0, "latent": 0.3})
+    train_cfg = _synthetic_cfg(ema_teacher=True, loss_weights={"mse": 1.0, "vicreg": 0.3})
     model_cfg = SignalModelConfig(
         d_model=32,
         mamba_d_state=8,

@@ -46,13 +46,22 @@ from resmamba_signal_model.training.losses import _first_present  # noqa: E402
 from resmamba_signal_model.training.task_catalog import builtin_spec  # noqa: E402
 from resmamba_signal_model.training.emitter_labels import (  # noqa: E402
     build_global_emitter_label_map,
+    build_global_radar_model_label_map,
     global_emitter_labels,
 )
 from resmamba_signal_model.training.modulation_labels import (  # noqa: E402
-    build_compact_modulation_label_map,
+    build_global_comm_modulation_label_map,
+    global_comm_modulation_labels,
     remap_modulation_labels,
 )
-from resmamba_signal_model.training.compact_labels import compact_emitter_class_mask  # noqa: E402
+from resmamba_signal_model.training.pool_filters import load_pretrain_datasets  # noqa: E402
+from resmamba_signal_model.training.compact_labels import (  # noqa: E402
+    compact_emitter_class_mask,
+    compact_ld_model_class_mask,
+    compact_tx_modulation_class_mask,
+    radar_model_map_from_train_cfg,
+    tx_modulation_map_from_train_cfg,
+)
 
 TASKS = ("modulation", "emitter", "prediction", "clustering", "imputation", "encode")
 TASK_DATASETS: dict[str, list[str]] = {
@@ -85,7 +94,9 @@ def resolve_compact_overrides(
     model_section = dict(train_cfg.get("model") or {})
     n_mod = _tensor_class_dim(
         state,
+        "tx_modulation_head.classifier.weight",
         "modulation_head.classifier.weight",
+        "z_linear_probes.tx_modulation.weight",
         "z_linear_probes.modulation.weight",
     )
     n_emit = _tensor_class_dim(
@@ -97,7 +108,9 @@ def resolve_compact_overrides(
         n_mod = int(model_section["num_mod_classes"])
     if n_emit is None and model_section.get("num_emitters") is not None:
         n_emit = int(model_section["num_emitters"])
-    if train_cfg.get("compact_modulation", {}).get("num_classes") is not None:
+    if train_cfg.get("compact_tx_modulation", {}).get("num_classes") is not None:
+        n_mod = int(train_cfg["compact_tx_modulation"]["num_classes"])
+    elif train_cfg.get("compact_modulation", {}).get("num_classes") is not None:
         n_mod = int(train_cfg["compact_modulation"]["num_classes"])
     if train_cfg.get("compact_emitter", {}).get("num_emitters") is not None:
         n_emit = int(train_cfg["compact_emitter"]["num_emitters"])
@@ -115,8 +128,8 @@ def resolve_compact_overrides(
         except (FileNotFoundError, KeyError, OSError):
             pass
         try:
-            compact_m = build_compact_modulation_label_map(rfdata_root, train_cfg=train_cfg)
-            if n_mod is not None and int(n_mod) == int(compact_m.num_classes):
+            comm_map, _canonical = build_global_comm_modulation_label_map(rfdata_root, train_cfg=train_cfg)
+            if n_mod is not None and int(n_mod) == int(comm_map.num_emitters):
                 use_compact = True
         except (FileNotFoundError, KeyError, OSError):
             pass
@@ -129,7 +142,9 @@ def task_label_tensor(
     batch: dict[str, Any],
     *,
     emitter_offset_lookup: torch.Tensor | None = None,
+    ld_model_offset_lookup: torch.Tensor | None = None,
     modulation_compact_lookup: torch.Tensor | None = None,
+    modulation_offset_lookup: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """与训练/验证相同的标签列；紧凑模式下做连续 ID 重映射。"""
     try:
@@ -141,16 +156,44 @@ def task_label_tensor(
             value = global_emitter_labels(batch["dataset_id"], batch["emitter_id"], emitter_offset_lookup)
         else:
             value = batch.get(field or "global_emitter_id", batch.get("emitter_id"))
-    elif task == "clustering":
-        value = batch.get(field or "global_label_id")
+    elif task == "ld_model":
+        if ld_model_offset_lookup is not None and "mod_label_id" in batch and "dataset_id" in batch:
+            value = global_emitter_labels(batch["dataset_id"], batch["mod_label_id"], ld_model_offset_lookup)
+        else:
+            value = batch.get(field or "mod_label_id", batch.get("mod_label_id"))
+    if task == "clustering" or task in ("ld_clustering", "tx_clustering"):
+        from resmamba_signal_model.training.clustering_labels import resolve_cluster_eval_labels
+
+        value = resolve_cluster_eval_labels(
+            batch.get("mod_label_id"),
+            batch.get("emitter_id"),
+            batch.get("source_label_id"),
+        )
+        if value is None:
+            value = batch.get(field or "global_label_id")
     elif task in ("prediction", "imputation", "encode"):
         return None
-    else:
+    elif task in ("tx_modulation", "modulation", "ld_intrapulse"):
         value = batch.get(
             field or "canonical_mod_label_id",
             batch.get("mod_label_id", batch.get("source_label_id")),
         )
-        if value is not None and modulation_compact_lookup is not None:
+        if (
+            task in ("tx_modulation", "modulation")
+            and modulation_offset_lookup is not None
+            and modulation_compact_lookup is not None
+            and value is not None
+            and "dataset_id" in batch
+        ):
+            if not torch.is_tensor(value):
+                value = torch.as_tensor(value)
+            value = global_comm_modulation_labels(
+                batch["dataset_id"],
+                value,
+                modulation_compact_lookup,
+                modulation_offset_lookup,
+            )
+        elif value is not None and modulation_compact_lookup is not None:
             if not torch.is_tensor(value):
                 value = torch.as_tensor(value)
             value = remap_modulation_labels(value, modulation_compact_lookup)
@@ -239,7 +282,9 @@ def run_task(
     task: str,
     *,
     emitter_offset_lookup: torch.Tensor | None = None,
+    ld_model_offset_lookup: torch.Tensor | None = None,
     modulation_compact_lookup: torch.Tensor | None = None,
+    modulation_offset_lookup: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     model.eval()
     preds: list[torch.Tensor] = []
@@ -253,7 +298,9 @@ def run_task(
     mode = "encode" if task == "encode" else "task"
     label_kw = {
         "emitter_offset_lookup": emitter_offset_lookup,
+        "ld_model_offset_lookup": ld_model_offset_lookup,
         "modulation_compact_lookup": modulation_compact_lookup,
+        "modulation_offset_lookup": modulation_offset_lookup,
     }
     for batch in tqdm(loader, desc=f"infer:{task}"):
         batch = move_batch(batch, device)
@@ -280,7 +327,14 @@ def run_task(
                 labels.append(label)
         elif task in ("prediction", "imputation") or "pred_patches" in out:
             pred, target, mask = reconstruction_eval_pair(out)
-            ssim_vals.append(float(ssim_iq(pred, target, mask)))
+            ssim_pred = out.get("mae_pred") if out.get("mae_pred") is not None else pred
+            ssim_tgt = out.get("patch_targets") if out.get("patch_targets") is not None else target
+            wave_len = out.get("iq_length")
+            if torch.is_tensor(wave_len):
+                wave_len = int(wave_len.reshape(-1)[0].item())
+            elif wave_len is not None:
+                wave_len = int(wave_len)
+            ssim_vals.append(float(ssim_iq(ssim_pred, ssim_tgt, mask, length=wave_len)))
             mse_vals.append(float(masked_patch_mse(pred, target, mask).item()))
         score = out.get("openset_score", out.get("openset_energy"))
         if score is not None:
@@ -313,6 +367,48 @@ def run_task(
     return metrics
 
 
+def _macro_recon_metrics(per_dataset: dict[str, dict[str, Any]]) -> dict[str, float]:
+    rows = [
+        row
+        for row in per_dataset.values()
+        if row.get("impute_mse") is not None or row.get("ssim") is not None
+    ]
+    if not rows:
+        return {}
+    mse_vals = [float(row["impute_mse"]) for row in rows if row.get("impute_mse") is not None]
+    ssim_vals = [float(row["ssim"]) for row in rows if row.get("ssim") is not None]
+    out: dict[str, float] = {}
+    if mse_vals:
+        out["macro_mse"] = float(sum(mse_vals) / len(mse_vals))
+    if ssim_vals:
+        out["macro_ssim"] = float(sum(ssim_vals) / len(ssim_vals))
+    out["num_datasets"] = float(len(rows))
+    return out
+
+
+def _print_prediction_table(per_dataset: dict[str, dict[str, Any]], macro: dict[str, float]) -> None:
+    print("dataset          mse        ssim     batches", flush=True)
+    for name in sorted(per_dataset):
+        row = per_dataset[name]
+        mse = row.get("impute_mse")
+        ssim = row.get("ssim")
+        n = row.get("num_batches", 0)
+        if mse is None and ssim is None:
+            err = row.get("error", "skip")
+            print(f"{name:16s}  —          —        {err}", flush=True)
+            continue
+        print(
+            f"{name:16s}  {float(mse):.6f}  {float(ssim):.6f}  {int(n)}",
+            flush=True,
+        )
+    if macro:
+        print(
+            f"macro            {macro.get('macro_mse', 0):.6f}  {macro.get('macro_ssim', 0):.6f}  "
+            f"datasets={int(macro.get('num_datasets', 0))}",
+            flush=True,
+        )
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="SignalFoundationModel 下游推理")
     p.add_argument("--task", required=True, help="任务名或 all；可为目录中任意下游任务")
@@ -329,6 +425,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=None, help="已弃用：infer 复用 val 的 token-budget 协议")
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--device", default=None)
+    p.add_argument(
+        "--per-dataset",
+        action="store_true",
+        help="prediction/imputation：按 datasets 逐项评测并汇总 macro 指标",
+    )
+    p.add_argument(
+        "--pretrain-sources",
+        action="store_true",
+        help="使用 configs/datasets.yaml pretrain 白名单作为 --datasets",
+    )
     return p.parse_args()
 
 
@@ -364,21 +470,43 @@ def main() -> None:
     compact_overrides = resolve_compact_overrides(state, train_cfg, rfdata_root)
     use_compact = bool(compact_overrides.pop("_use_compact", False))
     emitter_offset_lookup = None
+    ld_model_offset_lookup = None
     modulation_compact_lookup = None
+    modulation_offset_lookup = None
     compact_emitter_map = None
+    ld_model_map = None
+    tx_map = None
+    tx_canonical = None
     if use_compact:
         try:
             compact_emitter_map = build_global_emitter_label_map(rfdata_root, train_cfg=train_cfg)
-            emitter_offset_lookup = compact_emitter_map.offset_lookup()
-            compact_overrides.setdefault("num_emitters", int(compact_emitter_map.num_emitters))
+            if int(compact_emitter_map.num_emitters) > 0:
+                emitter_offset_lookup = compact_emitter_map.offset_lookup()
+                compact_overrides.setdefault("num_emitters", int(compact_emitter_map.num_emitters))
+            else:
+                compact_emitter_map = None
         except (FileNotFoundError, KeyError, OSError):
             compact_emitter_map = None
-        try:
-            compact_mod = build_compact_modulation_label_map(rfdata_root, train_cfg=train_cfg)
-            modulation_compact_lookup = compact_mod.lookup()
-            compact_overrides.setdefault("num_mod_classes", int(compact_mod.num_classes))
-        except (FileNotFoundError, KeyError, OSError):
-            modulation_compact_lookup = None
+        ld_model_map = radar_model_map_from_train_cfg(train_cfg)
+        if ld_model_map is None:
+            try:
+                ld_model_map = build_global_radar_model_label_map(rfdata_root, train_cfg=train_cfg)
+            except (FileNotFoundError, KeyError, OSError):
+                ld_model_map = None
+        if ld_model_map is not None and int(ld_model_map.num_emitters) > 0:
+            ld_model_offset_lookup = ld_model_map.offset_lookup()
+            compact_overrides.setdefault("num_ld_model_classes", int(ld_model_map.num_emitters))
+        tx_map, tx_canonical = tx_modulation_map_from_train_cfg(train_cfg)
+        if tx_map is None:
+            try:
+                tx_map, tx_canonical = build_global_comm_modulation_label_map(rfdata_root, train_cfg=train_cfg)
+            except (FileNotFoundError, KeyError, OSError):
+                tx_map, tx_canonical = None, None
+        if tx_map is not None and int(tx_map.num_emitters) > 0:
+            modulation_offset_lookup = tx_map.offset_lookup()
+            compact_overrides.setdefault("num_mod_classes", int(tx_map.num_emitters))
+            if tx_canonical is not None:
+                modulation_compact_lookup = tx_canonical.lookup()
 
     lora_tasks = blob.get("peft_tasks") or infer_lora_tasks(state) or list(DEFAULT_TASKS)
     catalog_names = [t for t in lora_tasks if t != "shared"]
@@ -404,7 +532,18 @@ def main() -> None:
         peft_cfg.shared_lora = peft_cfg.shared_lora or ("shared" in lora_tasks)
         inject_hybrid_lora(model, lora_tasks, peft_cfg)
         print(f"[infer] injected Hybrid-LoRA+ tasks={lora_tasks}", flush=True)
-    if compact_emitter_map is not None:
+    if ld_model_map is not None:
+        mask = compact_ld_model_class_mask(ld_model_map, num_datasets=int(model.cfg.num_datasets))
+        model.load_emitter_dataset_class_mask(rfdata_root, mask=mask)
+    elif tx_map is not None and tx_canonical is not None:
+        tx_mask = compact_tx_modulation_class_mask(
+            tx_map,
+            tx_canonical,
+            rfdata_root,
+            num_datasets=int(model.cfg.num_datasets),
+        )
+        model.load_tx_modulation_dataset_class_mask(tx_mask)
+    elif compact_emitter_map is not None:
         mask = compact_emitter_class_mask(
             compact_emitter_map,
             num_datasets=int(model.cfg.num_datasets),
@@ -452,9 +591,53 @@ def main() -> None:
         "tasks": {},
     }
     for task in tasks:
-        datasets = args.datasets or TASK_DATASETS.get(task) or []
+        if args.pretrain_sources:
+            datasets = load_pretrain_datasets(rfdata_root)
+        else:
+            datasets = args.datasets or TASK_DATASETS.get(task) or []
         if not datasets:
             print(f"[infer] skip {task}: 未指定 datasets")
+            continue
+        infer_task = None if task == "encode" else task
+        if args.per_dataset and task in ("prediction", "imputation"):
+            per_dataset: dict[str, dict[str, Any]] = {}
+            for ds in datasets:
+                try:
+                    h5_path = resolve_dataset_h5(rfdata_root, ds, args.split)
+                except FileNotFoundError:
+                    per_dataset[ds] = {"error": f"missing {ds}_{args.split}.h5"}
+                    print(f"[infer] {task}/{ds}: missing H5 for split={args.split}", flush=True)
+                    continue
+                loader = build_loader(
+                    rfdata_root,
+                    [ds],
+                    split=args.split,
+                    token_budget=token_budget,
+                    patch_size=patch_size,
+                    val_batches=val_batches,
+                    val_seed=val_seed,
+                    num_workers=args.num_workers,
+                    task=infer_task,
+                )
+                per_dataset[ds] = run_task(
+                    model,
+                    loader,
+                    device,
+                    task,
+                    emitter_offset_lookup=emitter_offset_lookup,
+                    ld_model_offset_lookup=ld_model_offset_lookup,
+                    modulation_compact_lookup=modulation_compact_lookup,
+                    modulation_offset_lookup=modulation_offset_lookup,
+                )
+                print(f"[infer] {task}/{ds}: {per_dataset[ds]}", flush=True)
+            macro = _macro_recon_metrics(per_dataset)
+            _print_prediction_table(per_dataset, macro)
+            report["tasks"][task] = {
+                "datasets": datasets,
+                "split": args.split,
+                "per_dataset": per_dataset,
+                **macro,
+            }
             continue
         loader = build_loader(
             rfdata_root,
@@ -465,7 +648,7 @@ def main() -> None:
             val_batches=val_batches,
             val_seed=val_seed,
             num_workers=args.num_workers,
-            task=None if task == "encode" else task,
+            task=infer_task,
         )
         metrics = run_task(
             model,
@@ -473,7 +656,9 @@ def main() -> None:
             device,
             task,
             emitter_offset_lookup=emitter_offset_lookup,
+            ld_model_offset_lookup=ld_model_offset_lookup,
             modulation_compact_lookup=modulation_compact_lookup,
+            modulation_offset_lookup=modulation_offset_lookup,
         )
         report["tasks"][task] = {"datasets": datasets, "split": args.split, **metrics}
         print(f"[infer] {task}: {metrics}")

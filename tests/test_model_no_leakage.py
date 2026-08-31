@@ -129,7 +129,7 @@ def test_discriminative_task_can_bypass_query_reconstruction() -> None:
 
 
 
-def test_prediction_uses_generation_head_not_decoder() -> None:
+def test_prediction_unified_generation_uses_decoder_not_head() -> None:
     torch.manual_seed(3)
     model = SignalFoundationModel(_cfg()).eval()
     iq = torch.randn(2, 2, 64)
@@ -138,25 +138,56 @@ def test_prediction_uses_generation_head_not_decoder() -> None:
     with torch.no_grad():
         for param in model.prediction_head.parameters():
             param.add_(1.5)
-    after = model(iq, mask, mode="task", task="prediction")["pred_patches"]
-    assert not torch.allclose(before, after, atol=1.0e-5)
+    after_head = model(iq, mask, mode="task", task="prediction")["pred_patches"]
+    assert torch.allclose(before, after_head, atol=1.0e-5)
+    with torch.no_grad():
+        model.decoder.query_decoder.output.weight.add_(0.25)
+    after_decoder = model(iq, mask, mode="task", task="prediction")["pred_patches"]
+    assert not torch.allclose(before, after_decoder, atol=1.0e-5)
 
 
-def test_stage2_prediction_grads_go_to_head_not_frozen_decoder() -> None:
+def test_stage2_unified_prediction_skips_head_training() -> None:
     torch.manual_seed(5)
     model = SignalFoundationModel(_cfg())
-    apply_stage_freeze(model, "stage2", train_cfg={"truncate_backward": True, "skip_recon": True})
-    model.train()
+    apply_stage_freeze(
+        model,
+        "stage2",
+        task="prediction",
+        train_cfg={"truncate_backward": True, "skip_recon": True},
+    )
+    assert not any(param.requires_grad for param in model.prediction_head.parameters())
+
+
+def test_stage2_legacy_prediction_trains_head() -> None:
+    torch.manual_seed(6)
+    model = SignalFoundationModel(_cfg(use_legacy_generation_heads=True, force_unified_generation=True))
+    apply_stage_freeze(
+        model,
+        "stage2",
+        task="prediction",
+        train_cfg={"truncate_backward": True, "skip_recon": True},
+    )
+    assert any(param.requires_grad for param in model.prediction_head.parameters())
+    assert not any(param.requires_grad for param in model.encoder.parameters())
+    assert not any(param.requires_grad for param in model.decoder.parameters())
+
+
+def test_legacy_prediction_head_affects_outputs_and_skips_decoder_recon() -> None:
+    torch.manual_seed(7)
+    model = SignalFoundationModel(
+        _cfg(use_legacy_generation_heads=True, force_unified_generation=True, build_task_heads=True)
+    )
+    model.skip_recon = True
+    model.eval()
     iq = torch.randn(2, 2, 64)
     mask = torch.ones(2, 64, dtype=torch.bool)
-    out = model(iq, mask, mode="task", task="prediction")
-    pred = out["pred_patches"]
-    assert pred.requires_grad
-    pred.float().pow(2).mean().backward()
-    head_grads = [param.grad for param in model.prediction_head.parameters() if param.requires_grad]
-    assert any(grad is not None and float(grad.abs().sum()) > 0.0 for grad in head_grads)
-    for param in model.decoder.parameters():
-        assert param.grad is None
+    before = model(iq, mask, mode="task", task="prediction")["pred_patches"].clone()
+    assert model(iq, mask, mode="task", task="prediction").get("query_h") is None
+    with torch.no_grad():
+        for param in model.prediction_head.parameters():
+            param.add_(1.5)
+    after = model(iq, mask, mode="task", task="prediction")["pred_patches"]
+    assert not torch.allclose(before, after, atol=1.0e-5)
 
 
 def test_pretrain_ignores_dataset_id_in_decoder_condition() -> None:

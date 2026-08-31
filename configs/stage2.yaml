@@ -1,37 +1,45 @@
 # 阶段二：冻结骨干 + 截断反传，只训当前任务头（+ 可选 z_enc 线性探针）
+# LP 加速：更少 steps/epoch、更短任务日程、更高头 LR、关无用 view2、IQ 内存缓存、验证变稀
 model_config: configs/model.yaml
 rfdata_root: /root/autodl-tmp/ResMamba_Signal_Model/dataset
 iq_normalize: none
+skip_revin: true
 sequence_packing: true
 mix_strategy: token_share
 combine_then_pack: false
 homogeneous_batch: true
 balanced_sampling: false
 balanced_sampling_strategy: length_bucket
-token_budget: 12288
-steps_per_epoch: 1000
-val_batches: 50
+token_budget: 8192
+steps_per_epoch: 300
+val_batches: 24
 val_seed: 0
 seed: 0
-check_val_every_n_epoch: 1
+check_val_every_n_epoch: 2
 min_ratio: 0.05
 synthetic: false
 amp: true
 amp_dtype: bfloat16
 epochs: 20
-checkpoint_monitor: val/multitask_geomean
+checkpoint_monitor: val/classification_geomean
 checkpoint_mode: max
-early_stopping_patience: 0
-num_workers: 20
+save_last: true
+early_stopping_patience: 4
+early_stopping_min_delta: 0.001
+# prediction 与分类头同属 LP：冻结骨干只训 PredictionHead（见 use_legacy_generation_heads）
+composite_exclude_tasks: []
+num_workers: 12
 prefetch_factor: 4
-cache_iq_in_memory: auto
+cache_iq_in_memory: true
 max_grad_norm: 1.0
-learning_rate: 1.0e-3
-warmup_steps: 500
+# 只训头：LR 可比全量微调更高，缩短 warmup
+learning_rate: 2.0e-3
+warmup_steps: 100
 lr_schedule: warmup_cosine
 lr_min_ratio: 0.1
 token_normalized_loss: true
-clustering_view2: true
+# supervised_clustering 不用 view2 一致性损失；关掉避免聚类段双倍前向
+clustering_view2: false
 distill_weight: 0.0
 prototype_anchor_weight: 0.0
 replay_strategy: class_center
@@ -44,10 +52,14 @@ replay_scan_token_budget: 2048
 absorb_unknown: false
 lambda_recon: 0.0
 z_probe_weight: 0.5
-z_contrastive_weight: 0.1
-supervised_clustering: false
-cluster_utilization_weight: 0.15
-cluster_balance_mix: 0.7
+z_contrastive_weight: 0.0
+modulation_contrastive_weight: 0.0
+emitter_contrastive_weight: 0.0
+supervised_clustering: true
+# 雷达/通信分任务头；评估用单 H5 局部标签 + within-domain NMI
+# 减轻过分割：关闭 Sinkhorn 均摊与 prototype 利用率强迫
+cluster_utilization_weight: 0.0
+cluster_balance_mix: 0.0
 cluster_sinkhorn_epsilon: 0.1
 cluster_consistency_weight: 1.0
 use_dataset_bias: false
@@ -56,30 +68,33 @@ train_decoder: false
 train_heads: true
 truncate_backward: true
 skip_recon: true
+# 下游 prediction：token MLP 头（非 stage3 decoder LoRA）；输入仍遮未来，encode 含目标位
+use_legacy_generation_heads: true
 compact_task_labels: true
 loss_weights:
   physical: 0.0
   domain: 0.0
+# 日程顺序：上次 LP 最差优先（ld_model≪聚类/分类≪prediction）
 tasks:
-  - ld_intrapulse
   - ld_model
-  - tx_modulation
   - ld_clustering
+  - ld_intrapulse
+  - tx_modulation
   - tx_clustering
   - prediction
 task_schedule:
-  - task: ld_intrapulse
-    epochs: 15
   - task: ld_model
-    epochs: 15
-  - task: tx_modulation
-    epochs: 20
+    epochs: 12
   - task: ld_clustering
-    epochs: 15
+    epochs: 10
+  - task: ld_intrapulse
+    epochs: 12
+  - task: tx_modulation
+    epochs: 12
   - task: tx_clustering
-    epochs: 15
+    epochs: 10
   - task: prediction
-    epochs: 5
+    epochs: 10
 task_joint_epochs: 0
 task_pools:
   ld_intrapulse: [downstream_radar_modulation_train, downstream_radar_modulation_val]
@@ -87,7 +102,7 @@ task_pools:
   tx_modulation: [downstream_comm_modulation_train, downstream_comm_modulation_val]
   ld_clustering: [clustering_radar_train, clustering_radar_val]
   tx_clustering: [clustering_comm_train, clustering_comm_val]
-  prediction: [prediction_train, prediction_val]
+  prediction: [downstream_prediction_train, downstream_prediction_val]
 profiles:
   tiny:
     model_config: configs/model_tiny.yaml
@@ -104,6 +119,7 @@ profiles:
     require_mamba_kernel: false
     compact_task_labels: false
     task_joint_epochs: 0
+    check_val_every_n_epoch: 1
     task_schedule:
       - task: ld_intrapulse
         epochs: 1

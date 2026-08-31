@@ -29,8 +29,8 @@ def resolve_val_label_field(stage: str, task: str) -> str:
         return "global_emitter_id"
     if task == "modulation":
         return "canonical_mod_label_id"
-    if task == "clustering":
-        return "global_label_id"
+    if task in ("clustering", "ld_clustering", "tx_clustering"):
+        return "auto"
     if task == "prediction":
         return "auto"
     return "auto"

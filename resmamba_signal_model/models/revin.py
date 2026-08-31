@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -249,6 +250,103 @@ class RevIN(nn.Module):
             [aux.log_scale, aux.log_peak, aux.papr_preclip, aux.scale_gap],
             dim=-1,
         )
+
+
+def batch_joint_energy_preprocess(
+    iq: np.ndarray,
+    *,
+    device: str = "cpu",
+    std_min: float = 0.01,
+    winsorize_top_frac: float = 0.01,
+    peak_papr_clip: float = 16.0,
+    clip: float = 8.0,
+    chunk_size: int = 256,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """离线 joint_energy 预处理（与 ``RevIN(scale_mode=joint_energy)`` 对齐）。
+
+    输入 ``[N,2,L]`` float32；返回归一化 IQ 与 per-sample 统计（供 H5 / 训练跳过在线 RevIN）。
+    """
+    batch = np.asarray(iq, dtype=np.float32)
+    if batch.ndim != 3 or batch.shape[1] != 2:
+        raise ValueError(f"batch_joint_energy_preprocess 期望 [N,2,L]，实际 {batch.shape}")
+    n = int(batch.shape[0])
+    if n == 0:
+        empty = np.empty((0, 2, batch.shape[2]), dtype=np.float32)
+        zeros = np.empty(0, dtype=np.float32)
+        return empty, {
+            "revin_mean": np.empty((0, 2), dtype=np.float32),
+            "norm_scale": zeros,
+            "log_scale": zeros,
+            "log_peak": zeros,
+            "papr_preclip": zeros,
+            "scale_gap": zeros,
+        }
+
+    revin = RevIN(
+        num_channels=2,
+        std_min=float(std_min),
+        clip=float(clip),
+        affine=False,
+        scale_mode="joint_energy",
+        winsorize_top_frac=float(winsorize_top_frac),
+        peak_papr_clip=float(peak_papr_clip),
+        shared_affine=True,
+    ).to(device)
+
+    out_iq = np.empty_like(batch)
+    mean_out = np.empty((n, 2), dtype=np.float32)
+    norm_scale = np.empty(n, dtype=np.float32)
+    log_scale = np.empty(n, dtype=np.float32)
+    log_peak = np.empty(n, dtype=np.float32)
+    papr_preclip = np.empty(n, dtype=np.float32)
+    scale_gap = np.empty(n, dtype=np.float32)
+
+    dev = torch.device(device)
+    with torch.no_grad():
+        for start in range(0, n, int(chunk_size)):
+            end = min(start + int(chunk_size), n)
+            x = torch.from_numpy(np.ascontiguousarray(batch[start:end])).to(device=dev, dtype=torch.float32)
+            x_norm, stats = revin.normalize(x, None)
+            x_norm = clip_normalized(x_norm, clip)
+            out_iq[start:end] = x_norm.cpu().numpy()
+            mean_out[start:end] = stats.mean.cpu().numpy()
+            std_row = stats.std[:, 0].cpu().numpy()
+            norm_scale[start:end] = std_row
+            aux = stats.amp_aux
+            if aux is None:
+                raise RuntimeError("joint_energy 预处理缺少 amp_aux")
+            log_scale[start:end] = aux.log_scale.cpu().numpy()
+            log_peak[start:end] = aux.log_peak.cpu().numpy()
+            papr_preclip[start:end] = aux.papr_preclip.cpu().numpy()
+            scale_gap[start:end] = aux.scale_gap.cpu().numpy()
+
+    return out_iq, {
+        "revin_mean": mean_out,
+        "norm_scale": norm_scale,
+        "log_scale": log_scale,
+        "log_peak": log_peak,
+        "papr_preclip": papr_preclip,
+        "scale_gap": scale_gap,
+    }
+
+
+def revin_stats_from_precomputed(
+    mean: torch.Tensor,
+    norm_scale: torch.Tensor,
+    log_scale: torch.Tensor,
+    log_peak: torch.Tensor,
+    papr_preclip: torch.Tensor,
+    scale_gap: torch.Tensor,
+) -> RevINStats:
+    """由 H5 预存统计重建 ``RevINStats``（``std`` 为 joint_energy 标量按通道广播）。"""
+    std = norm_scale.unsqueeze(-1).expand_as(mean)
+    amp_aux = AmplitudeAux(
+        log_scale=log_scale,
+        log_peak=log_peak,
+        papr_preclip=papr_preclip,
+        scale_gap=scale_gap,
+    )
+    return RevINStats(mean=mean, std=std, amp_aux=amp_aux)
 
     def forward(
         self,

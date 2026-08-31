@@ -29,8 +29,14 @@ from resmamba_signal_model.models.moe import (
     uniform_route_weights,
 )
 from resmamba_signal_model.models.physics import project_patch_energy, restore_absolute_log_power, sequence_physics
-from resmamba_signal_model.models.prototypes import DEVICE_NAMESPACE, CONTENT_NAMESPACE, PrototypeRegistry
-from resmamba_signal_model.models.revin import RevIN, RevINStats, clip_normalized
+from resmamba_signal_model.models.prototypes import (
+    CONTENT_NAMESPACE,
+    DEFAULT_NAMESPACES,
+    DEVICE_NAMESPACE,
+    PrototypeRegistry,
+    clustering_registry_namespace,
+)
+from resmamba_signal_model.models.revin import RevIN, RevINStats, clip_normalized, revin_stats_from_precomputed
 from resmamba_signal_model.models.signal_adapter import SignalAdapterRegistry, SignalSpec
 from resmamba_signal_model.models.task_interface import (
     DEFAULT_TASKS,
@@ -40,6 +46,7 @@ from resmamba_signal_model.models.task_interface import (
     default_task_spec,
 )
 from resmamba_signal_model.training.task_catalog import BUILTIN_HEAD_ATTR, KIND_MASK_MODE, normalize_kind
+from resmamba_signal_model.models.elastic_sampler import gather_elastic_patches
 from resmamba_signal_model.models.tokenizer import TimeFreqTokenizer, TimeFreqTokenizerConfig
 from resmamba_signal_model.models.varlen import (
     apply_truncation_aug,
@@ -53,6 +60,31 @@ from resmamba_signal_model.models.varlen import (
 )
 
 
+def clustering_num_prototypes_for_task(cfg: SignalModelConfig, task: str) -> int:
+    if str(task) == "ld_clustering":
+        n = getattr(cfg, "ld_clustering_num_prototypes", None) or cfg.clustering_num_prototypes
+    elif str(task) == "tx_clustering":
+        n = getattr(cfg, "tx_clustering_num_prototypes", None) or cfg.clustering_num_prototypes
+    else:
+        n = cfg.clustering_num_prototypes
+    return int(n if n is not None else cfg.num_prototypes)
+
+
+def _prototype_registry_spec(cfg: SignalModelConfig, task_names: tuple[str, ...] | list[str]) -> tuple[tuple[str, ...], dict[str, int]]:
+    names = list(DEFAULT_NAMESPACES)
+    counts: dict[str, int] = {
+        CONTENT_NAMESPACE: int(cfg.num_prototypes),
+        DEVICE_NAMESPACE: int(cfg.num_prototypes),
+    }
+    for task in task_names:
+        if str(task) in ("ld_clustering", "tx_clustering"):
+            ns = clustering_registry_namespace(str(task))
+            if ns not in names:
+                names.append(ns)
+            counts[ns] = clustering_num_prototypes_for_task(cfg, str(task))
+    return tuple(names), counts
+
+
 def _ensure_min_visible(visible: torch.Tensor, patch_mask: torch.Tensor) -> torch.Tensor:
     none = (visible.sum(dim=1) == 0) & (patch_mask.sum(dim=1) > 0)
     if not none.any():
@@ -61,6 +93,21 @@ def _ensure_min_visible(visible: torch.Tensor, patch_mask: torch.Tensor) -> torc
     first = patch_mask.to(dtype=torch.long).argmax(dim=1)
     visible[none, first[none]] = True
     return visible
+
+
+def adaptive_mae_mask_ratios(
+    num_valid: torch.Tensor,
+    *,
+    base: float = 0.5,
+    ref_patches: int = 8,
+    min_ratio: float = 0.45,
+    max_ratio: float = 0.75,
+    log_scale: float = 0.10,
+) -> torch.Tensor:
+    """``ratio = clip(base + log_scale * log2(n_valid / ref), min, max)``。"""
+    ref = max(int(ref_patches), 1)
+    scale = torch.log2(num_valid.to(dtype=torch.float32).clamp_min(1.0) / float(ref))
+    return (float(base) + float(log_scale) * scale).clamp(min=float(min_ratio), max=float(max_ratio))
 
 
 @dataclass
@@ -72,7 +119,7 @@ class SignalModelConfig:
     query_decoder_dim: int = 320
     legacy_decoder_reconstruction: bool = False
     use_legacy_generation_heads: bool = False
-    force_unified_generation: bool = False
+    force_unified_generation: bool = True
     legacy_target_energy_projection: bool = False
     mamba_d_state: int = 64
     mamba_d_conv: int = 4
@@ -92,6 +139,13 @@ class SignalModelConfig:
     dropout: float = 0.1
     patch_size: int = 16
     mask_ratio: float = 0.5
+    # 按有效 patch 数调节 mask：短序列（RML L=128→8 tok）保持 base；长序列提高难度，
+    # 缓解同质 batch 下 L=1024 过易（mae≈0.01）与 L=128 尖峰的对比。
+    adaptive_mae_mask: bool = False
+    mae_mask_ref_patches: int = 8
+    mae_mask_ratio_min: float = 0.45
+    mae_mask_ratio_max: float = 0.75
+    mae_mask_log_scale: float = 0.10
     stem_channels: int = 64
     freq_bands: int = 8
     physics_bias: bool = True
@@ -121,9 +175,12 @@ class SignalModelConfig:
     p_trunc: float = 0.3
     num_datasets: int = 32
     num_mod_classes: int = 256
+    num_intrapulse_classes: int | None = None
     num_emitters: int = 512
     num_prototypes: int = 32
     clustering_num_prototypes: int | None = None
+    ld_clustering_num_prototypes: int | None = None
+    tx_clustering_num_prototypes: int | None = None
     use_dataset_bias: bool = False
     low_rank_prototype: bool = True
     prototype_rank: int = 64
@@ -155,8 +212,10 @@ class SignalModelConfig:
     tokenizer: TimeFreqTokenizerConfig = field(default_factory=TimeFreqTokenizerConfig)
 
     def __post_init__(self) -> None:
-        if int(self.decoder_mamba_layers) != 1:
-            raise ValueError("decoder_mamba_layers 必须为 1")
+        if int(self.encoder_mamba_layers) < 1:
+            raise ValueError("encoder_mamba_layers 必须 >= 1")
+        if int(self.decoder_mamba_layers) < 1:
+            raise ValueError("decoder_mamba_layers 必须 >= 1")
         if isinstance(self.chunk_overlap, (int, float)) and self.chunk_overlap > 1:
             self.chunk_overlap = float(self.chunk_overlap) / float(self.chunk_len)
         self.tokenizer.d_model = self.d_model
@@ -296,6 +355,7 @@ class SignalFoundationModel(nn.Module):
         self.peft = None
         self.truncate_backward = False
         self.skip_recon = False
+        self.skip_revin = False
         self._skip_recon = False
         self._active_task: str | None = None
         self._negcos_temperature: float | None = None
@@ -333,9 +393,11 @@ class SignalFoundationModel(nn.Module):
         if cfg.build_shared_adapter:
             self.shared_adapter = SharedTaskAdapter(cfg.d_model, down_dim=cfg.adapter_down_dim)
         if cfg.build_prototype_registry or cfg.build_task_heads:
+            reg_names, reg_counts = _prototype_registry_spec(cfg, task_names)
             self.prototype_registry = PrototypeRegistry(
                 int(cfg.d_model),
-                num_prototypes=int(cfg.num_prototypes),
+                num_prototypes=reg_counts,
+                namespaces=reg_names,
             )
         self.apply_train_flags(cfg.train_encoder, cfg.train_decoder, cfg.train_heads)
 
@@ -374,7 +436,12 @@ class SignalFoundationModel(nn.Module):
         kinds = getattr(self.cfg, "task_kinds", None) or {}
         if name == "ld_model":
             return int(getattr(self.cfg, "num_ld_model_classes", None) or self.cfg.num_emitters)
-        if name in ("ld_intrapulse", "tx_modulation") or kinds.get(name) == "classification":
+        if name == "ld_intrapulse":
+            n = getattr(self.cfg, "num_intrapulse_classes", None)
+            if n:
+                return int(n)
+            return int(self.cfg.num_mod_classes)
+        if name in ("tx_modulation",) or kinds.get(name) == "classification":
             return int(self.cfg.num_mod_classes)
         return int(self.cfg.num_mod_classes)
 
@@ -422,8 +489,7 @@ class SignalFoundationModel(nn.Module):
                 kwargs.setdefault("low_rank_prototype", True)
                 kwargs.setdefault("prototype_rank", prototype_rank)
         elif cls is PrototypeClusteringHead:
-            extra_k = getattr(self.cfg, "clustering_num_prototypes", None)
-            n_proto = int(extra_k) if extra_k else int(self.cfg.num_prototypes)
+            n_proto = clustering_num_prototypes_for_task(self.cfg, name)
             kwargs.setdefault("proj_dim", max(64, self.cfg.d_model // 2))
             kwargs.setdefault("num_prototypes", n_proto)
             if head_rank:
@@ -712,6 +778,16 @@ class SignalFoundationModel(nn.Module):
             )
         head.set_dataset_class_mask(mask)
 
+    def load_tx_modulation_dataset_class_mask(
+        self,
+        mask: torch.Tensor | None,
+    ) -> None:
+        """tx_modulation 头按数据集掩码（RML 三库 11 槽位 / 33 类方案 A）。"""
+        head = getattr(self, "tx_modulation_head", None)
+        if head is None or not hasattr(head, "set_dataset_class_mask") or mask is None:
+            return
+        head.set_dataset_class_mask(mask)
+
     def register_signal_adapter(
         self,
         spec: SignalSpec | dict[str, Any],
@@ -822,11 +898,34 @@ class SignalFoundationModel(nn.Module):
             return torch.tensor(flags[:batch_size], device=device, dtype=torch.bool)
         return torch.ones(batch_size, device=device, dtype=torch.bool)
 
+    def resolve_mae_mask_ratios(
+        self,
+        num_valid: torch.Tensor,
+        mask_ratio: float | None = None,
+    ) -> torch.Tensor:
+        """返回每样本 mask 比例；``adaptive_mae_mask`` 时随有效 patch 数对数升高。"""
+        device = num_valid.device
+        dtype = torch.float32
+        n = num_valid.shape[0]
+        if mask_ratio is not None:
+            return torch.full((n,), float(mask_ratio), device=device, dtype=dtype)
+        base = float(self.cfg.mask_ratio)
+        if not bool(getattr(self.cfg, "adaptive_mae_mask", False)):
+            return torch.full((n,), base, device=device, dtype=dtype)
+        return adaptive_mae_mask_ratios(
+            num_valid,
+            base=base,
+            ref_patches=int(getattr(self.cfg, "mae_mask_ref_patches", 8)),
+            min_ratio=float(getattr(self.cfg, "mae_mask_ratio_min", 0.45)),
+            max_ratio=float(getattr(self.cfg, "mae_mask_ratio_max", 0.75)),
+            log_scale=float(getattr(self.cfg, "mae_mask_log_scale", 0.10)),
+        )
+
     def make_mae_mask(self, patch_mask: torch.Tensor, mask_ratio: float | None = None) -> torch.Tensor:
-        ratio = self.cfg.mask_ratio if mask_ratio is None else mask_ratio
         rand = torch.rand(patch_mask.shape, device=patch_mask.device).masked_fill(~patch_mask, 2.0)
         num_valid = patch_mask.sum(dim=-1).clamp_min(1)
-        num_mask = (num_valid.float() * ratio).round().long().clamp(min=1)
+        ratios = self.resolve_mae_mask_ratios(num_valid, mask_ratio=mask_ratio)
+        num_mask = (num_valid.float() * ratios).round().long().clamp(min=1)
         mae_mask = torch.zeros_like(patch_mask)
         for b in range(patch_mask.shape[0]):
             n_valid = int(num_valid[b].item())
@@ -836,14 +935,15 @@ class SignalFoundationModel(nn.Module):
         return mae_mask & patch_mask
 
     def make_span_mask(self, patch_mask: torch.Tensor, mask_ratio: float | None = None, max_span: int = 8) -> torch.Tensor:
-        ratio = self.cfg.mask_ratio if mask_ratio is None else mask_ratio
         span_mask = torch.zeros_like(patch_mask)
+        num_valid = patch_mask.sum(dim=-1).clamp_min(1)
+        ratios = self.resolve_mae_mask_ratios(num_valid, mask_ratio=mask_ratio)
         for i in range(patch_mask.shape[0]):
             valid_idx = patch_mask[i].nonzero(as_tuple=False).flatten()
             n_valid = int(valid_idx.numel())
             if n_valid <= 1:
                 continue
-            n_mask = max(1, int(round(n_valid * ratio)))
+            n_mask = max(1, int(round(n_valid * float(ratios[i].item()))))
             filled = 0
             while filled < n_mask:
                 span = int(torch.randint(1, min(max_span, n_valid) + 1, ()).item())
@@ -856,14 +956,23 @@ class SignalFoundationModel(nn.Module):
         return span_mask & patch_mask
 
     def make_suffix_mask(self, patch_mask: torch.Tensor, mask_ratio: float | None = None) -> torch.Tensor:
-        ratio = 0.25 if mask_ratio is None else mask_ratio
         suffix = torch.zeros_like(patch_mask)
+        num_valid = patch_mask.sum(dim=-1).clamp_min(1)
+        if mask_ratio is None:
+            ratios = self.resolve_mae_mask_ratios(num_valid)
+        else:
+            ratios = torch.full(
+                (patch_mask.shape[0],),
+                float(mask_ratio),
+                device=patch_mask.device,
+                dtype=torch.float32,
+            )
         for i in range(patch_mask.shape[0]):
             valid_idx = patch_mask[i].nonzero(as_tuple=False).flatten()
             n_valid = int(valid_idx.numel())
             if n_valid <= 1:
                 continue
-            n_mask = max(1, int(round(n_valid * ratio)))
+            n_mask = max(1, int(round(n_valid * float(ratios[i].item()))))
             n_mask = min(n_mask, n_valid - 1)
             suffix[i, valid_idx[-n_mask:]] = True
         return suffix & patch_mask
@@ -888,6 +997,9 @@ class SignalFoundationModel(nn.Module):
             strategy = mask_mode
         else:
             strategy = "mixed"
+        if strategy == "suffix":
+            suff = self.make_suffix_mask(patch_mask)
+            return zeros, suff, zeros, "suffix"
         if strategy == "random":
             mae = self.make_mae_mask(patch_mask)
             return mae, zeros, zeros, "random"
@@ -938,6 +1050,14 @@ class SignalFoundationModel(nn.Module):
             iq, sample_mask = random_train_chunk(iq, sample_mask, self.cfg.chunk_len)
         return iq, sample_mask
 
+    def _legacy_generation_head_encode_all(self, target_mask: torch.Tensor | None) -> bool:
+        """legacy Prediction/Imputation 头需要目标位 h_enc；输入侧仍已遮住真值。"""
+        if not bool(getattr(self.cfg, "use_legacy_generation_heads", False)):
+            return False
+        if target_mask is None or not torch.is_tensor(target_mask):
+            return False
+        return bool(target_mask.any())
+
     def _encode_tokens(
         self,
         tokens: torch.Tensor,
@@ -945,12 +1065,14 @@ class SignalFoundationModel(nn.Module):
         patch_mask: torch.Tensor,
         *,
         moe_route_weights: torch.Tensor | None = None,
+        encode_all_patches: bool = False,
     ) -> tuple[torch.Tensor, bool]:
         visible = _ensure_min_visible(visible, patch_mask)
-        if self.cfg.encode_visible_only:
-            if int(visible.sum()) == 0:
+        encode_mask = patch_mask if encode_all_patches else visible
+        if self.cfg.encode_visible_only and not encode_all_patches:
+            if int(encode_mask.sum()) == 0:
                 return tokens.new_zeros(1, 0, tokens.shape[-1]), True
-            packed, cu_seqlens, seq_idx = pack_valid_tokens(tokens, visible)
+            packed, cu_seqlens, seq_idx = pack_valid_tokens(tokens, encode_mask)
             if packed.shape[1] == 0:
                 return packed, True
             return (
@@ -962,7 +1084,7 @@ class SignalFoundationModel(nn.Module):
                 ),
                 True,
             )
-        if self.cfg.sequence_packing:
+        if self.cfg.sequence_packing or encode_all_patches:
             packed, cu_seqlens, seq_idx = pack_valid_tokens(tokens, patch_mask)
             return (
                 self.encoder(
@@ -1072,6 +1194,76 @@ class SignalFoundationModel(nn.Module):
             recon = project_patch_energy(recon, orig, mask=project_mask[:, :n])
         return recon
 
+    def _precomputed_revin_from_batch(
+        self,
+        batch: dict[str, Any] | None,
+        *,
+        device: torch.device,
+        batch_size: int,
+    ) -> RevINStats | None:
+        if batch is None or "revin_mean" not in batch:
+            return None
+        flag = batch.get("iq_preprocessed")
+        if flag is False:
+            return None
+        if torch.is_tensor(flag) and flag.numel() > 0 and not bool(flag.all()):
+            return None
+        if flag is not True and not (torch.is_tensor(flag) and bool(flag.all())):
+            return None
+        required = ("revin_mean", "norm_scale", "log_scale", "log_peak", "papr_preclip", "scale_gap")
+        if not all(k in batch for k in required):
+            return None
+
+        def _as_vec(key: str) -> torch.Tensor:
+            raw = batch[key]
+            if torch.is_tensor(raw):
+                t = raw.to(device=device, dtype=torch.float32)
+            else:
+                t = torch.as_tensor(raw, device=device, dtype=torch.float32)
+            if t.ndim == 0:
+                return t.reshape(1).expand(batch_size)
+            if t.shape[0] == 1 and batch_size > 1:
+                return t.reshape(1).expand(batch_size)
+            return t
+
+        mean = batch["revin_mean"]
+        if not torch.is_tensor(mean):
+            return None
+        mean = mean.to(device=device, dtype=torch.float32)
+        if mean.ndim == 1:
+            mean = mean.unsqueeze(0).expand(batch_size, -1)
+        return revin_stats_from_precomputed(
+            mean,
+            _as_vec("norm_scale"),
+            _as_vec("log_scale"),
+            _as_vec("log_peak"),
+            _as_vec("papr_preclip"),
+            _as_vec("scale_gap"),
+        )
+
+    @staticmethod
+    def _identity_revin_stats(batch_size: int, *, device: torch.device) -> RevINStats:
+        """H5/预处理已 joint_energy 归一化、但 batch 未带统计时的占位（不再在线 normalize）。"""
+        return RevINStats(
+            mean=torch.zeros(batch_size, 2, device=device, dtype=torch.float32),
+            std=torch.ones(batch_size, 2, device=device, dtype=torch.float32),
+            amp_aux=None,
+        )
+
+    def _resolve_revin_stats(
+        self,
+        batch: dict[str, Any] | None,
+        *,
+        device: torch.device,
+        batch_size: int,
+        task_mode: bool,
+    ) -> RevINStats | None:
+        """解析 RevIN 统计：下游 ``skip_revin`` 时永不回退到在线 ``revin.normalize``。"""
+        precomputed = self._precomputed_revin_from_batch(batch, device=device, batch_size=batch_size)
+        if bool(getattr(self, "skip_revin", False)) and task_mode:
+            return precomputed if precomputed is not None else self._identity_revin_stats(batch_size, device=device)
+        return precomputed
+
     def _core_forward(
         self,
         iq: torch.Tensor,
@@ -1084,6 +1276,7 @@ class SignalFoundationModel(nn.Module):
         complex_pair: torch.Tensor | bool | None = True,
         mae_strategy: str | None = None,
         moe_route_weights: torch.Tensor | None = None,
+        precomputed_revin: RevINStats | None = None,
     ) -> dict[str, Any]:
         orig_patches, orig_patch_mask = patchify_iq(iq, sample_mask, self.cfg.patch_size)
         mae_mask, suffix_mask, span_mask, mask_strategy = self._mask_for_mode(
@@ -1094,20 +1287,26 @@ class SignalFoundationModel(nn.Module):
         target_mask = (mae_mask | suffix_mask | span_mask) & orig_patch_mask
         observed_sample_mask = self._observed_sample_mask(sample_mask, target_mask)
         iq_observed = iq.masked_fill(~observed_sample_mask.unsqueeze(1), 0.0)
-        iq_norm, stats = self.revin.normalize(
-            iq_observed,
-            sample_mask,
-            observed_mask=observed_sample_mask,
-        )
+        if precomputed_revin is not None:
+            stats = precomputed_revin
+            iq_norm = clip_normalized(iq_observed, self.cfg.revin_clip)
+            target_norm_wave = clip_normalized(
+                iq.masked_fill(~observed_sample_mask.unsqueeze(1), 0.0),
+                self.cfg.revin_clip,
+            )
+        else:
+            iq_norm, stats = self.revin.normalize(
+                iq_observed,
+                sample_mask,
+                observed_mask=observed_sample_mask,
+            )
+            target_norm_wave = clip_normalized(
+                self.revin.apply_stats(iq, stats, sample_mask),
+                self.cfg.revin_clip,
+            )
         log_scale = None if stats.amp_aux is None else stats.amp_aux.log_scale
         amp_aux_vec = self.revin.amp_aux_vector(stats)
-        # observed-only std 在静默背景上会塌缩；clip 只限制幅度，不把目标写进 stats。
-        target_norm_wave = clip_normalized(
-            self.revin.apply_stats(iq, stats, sample_mask),
-            self.cfg.revin_clip,
-        )
         iq_norm = clip_normalized(iq_norm, self.cfg.revin_clip)
-        norm_patches, _ = patchify_iq(target_norm_wave, sample_mask, self.cfg.patch_size)
         batch_size = int(iq.shape[0])
         if modality_id is None:
             modality_id = self._resolve_modality_id(batch_size, device=iq.device)
@@ -1135,9 +1334,22 @@ class SignalFoundationModel(nn.Module):
         )
         tokens = tok["tokens"]
         patch_mask = tok["patch_mask"]
+        elastic_starts = tok.get("elastic_start_indices")
+        if elastic_starts is not None:
+            orig_patches, _ = gather_elastic_patches(
+                iq, elastic_starts, self.cfg.patch_size, sample_mask=sample_mask
+            )
+            norm_patches, _ = gather_elastic_patches(
+                target_norm_wave, elastic_starts, self.cfg.patch_size, sample_mask=sample_mask
+            )
+        else:
+            norm_patches, _ = patchify_iq(target_norm_wave, sample_mask, self.cfg.patch_size)
         n = min(tokens.shape[1], orig_patches.shape[1], patch_mask.shape[1], norm_patches.shape[1])
         tokens = tokens[:, :n]
-        patch_mask = patch_mask[:, :n] & orig_patch_mask[:, :n]
+        if elastic_starts is None:
+            patch_mask = patch_mask[:, :n] & orig_patch_mask[:, :n]
+        else:
+            patch_mask = patch_mask[:, :n]
         orig_patches = orig_patches[:, :n]
         norm_patches = norm_patches[:, :n]
         phys = tok["patch_physics"][:, :n]
@@ -1156,52 +1368,82 @@ class SignalFoundationModel(nn.Module):
         mae_mask = mae_mask & target_mask
         suffix_mask = suffix_mask & target_mask
         span_mask = span_mask & target_mask
+        encode_all = self._legacy_generation_head_encode_all(target_mask)
         h_vis, packed_enc = self._encode_tokens(
             tokens,
             visible,
             patch_mask,
             moe_route_weights=moe_route_weights,
+            encode_all_patches=encode_all,
         )
-        z_enc, h_enc = self._pool_encoder_identity(
-            tokens,
-            patch_mask,
-            h_vis=h_vis,
-            packed_enc=packed_enc,
-            visible=visible,
-        )
-        dec = self.decoder(
-            h_vis,
-            tokens,
-            patch_mask,
-            visible,
-            phys_dec,
-            packed_encoder=packed_enc,
-            sequence_packing=self.cfg.sequence_packing,
-            skip_recon=bool(getattr(self, "_skip_recon", False)),
-            target_mask=target_mask,
-            context_physics=context_phys,
-            task_context=task_context,
-            physics_mask=phys_mask,
-            amp_aux=amp_aux_vec,
-            moe_route_weights=moe_route_weights,
-        )
-        skip_recon = dec["recon_norm"] is None
-        if skip_recon:
+        if encode_all:
+            h_enc = self.decoder.scatter_encoder(h_vis, patch_mask, patch_mask, packed=packed_enc)
+            pool_mask = visible & patch_mask
+            z_enc = self._finalize_encoder_z(
+                self.encoder_pool(
+                    h_enc.masked_fill(~pool_mask.unsqueeze(-1), 0.0),
+                    key_padding_mask=~pool_mask,
+                ),
+                h_enc.dtype,
+            )
+        else:
+            z_enc, h_enc = self._pool_encoder_identity(
+                tokens,
+                patch_mask,
+                h_vis=h_vis,
+                packed_enc=packed_enc,
+                visible=visible,
+            )
+        skip_dec_recon = bool(getattr(self, "_skip_recon", False))
+        if skip_dec_recon and encode_all:
             recon_norm = torch.zeros_like(norm_patches)
             recon = torch.zeros_like(orig_patches)
+            patch_h = h_enc
+            z_recon = z_enc
+            h_dec = None
+            h_full = h_enc
+            query_h = None
+            global_phys_pred = context_phys
         else:
-            recon_norm = dec["recon_norm"][:, :n]
-            if self.cfg.legacy_target_energy_projection:
-                project_mask = target_mask if target_mask.any() else patch_mask
-            else:
-                project_mask = visible
-            recon = self._denorm_recon(
-                recon_norm, orig_patches, stats, int(iq.shape[-1]), project_mask, sample_mask=sample_mask
+            dec_tokens = h_enc if encode_all else h_vis
+            dec_packed = False if encode_all else packed_enc
+            dec = self.decoder(
+                dec_tokens,
+                tokens,
+                patch_mask,
+                visible,
+                phys_dec,
+                packed_encoder=dec_packed,
+                sequence_packing=self.cfg.sequence_packing,
+                skip_recon=skip_dec_recon,
+                target_mask=target_mask,
+                context_physics=context_phys,
+                task_context=task_context,
+                physics_mask=phys_mask,
+                amp_aux=amp_aux_vec,
+                moe_route_weights=moe_route_weights,
             )
-        n = min(n, recon.shape[1], recon_norm.shape[1], dec["patch_h"].shape[1], h_enc.shape[1])
-        patch_h = dec["patch_h"][:, :n]
+            if dec["recon_norm"] is None:
+                recon_norm = torch.zeros_like(norm_patches)
+                recon = torch.zeros_like(orig_patches)
+            else:
+                recon_norm = dec["recon_norm"][:, :n]
+                if self.cfg.legacy_target_energy_projection:
+                    project_mask = target_mask if target_mask.any() else patch_mask
+                else:
+                    project_mask = visible
+                recon = self._denorm_recon(
+                    recon_norm, orig_patches, stats, int(iq.shape[-1]), project_mask, sample_mask=sample_mask
+                )
+            patch_h = dec["patch_h"]
+            z_recon = dec["z"]
+            h_dec = dec["h_dec"]
+            h_full = dec["h_full"]
+            query_h = dec.get("query_h")
+            global_phys_pred = dec["global_phys_pred"]
+        n = min(n, recon.shape[1], recon_norm.shape[1], patch_h.shape[1], h_enc.shape[1])
+        patch_h = patch_h[:, :n]
         h_enc = h_enc[:, :n]
-        z_recon = dec["z"]
         representations: dict[str, torch.Tensor] = {
             "z_general": z_enc,
             "h_general": h_enc,
@@ -1243,11 +1485,11 @@ class SignalFoundationModel(nn.Module):
             "h_enc": h_enc,
             "h_general": h_enc,
             "h_recon": patch_h,
-            "h_dec": dec["h_dec"],
-            "h_full": dec["h_full"],
+            "h_dec": h_dec,
+            "h_full": h_full[:, :n] if h_full is not None and h_full.dim() == 3 else h_full,
             "patch_h": patch_h,
-            "query_h": dec.get("query_h"),
-            "global_phys_pred": dec["global_phys_pred"],
+            "query_h": query_h,
+            "global_phys_pred": global_phys_pred,
             "global_phys_target": global_phys_target,
             "context_physics": context_phys,
             "domain_logits": domain_logits,
@@ -1276,6 +1518,7 @@ class SignalFoundationModel(nn.Module):
         complex_pair: torch.Tensor | bool | None = True,
         mae_strategy: str | None = None,
         moe_route_weights: torch.Tensor | None = None,
+        precomputed_revin: RevINStats | None = None,
     ) -> dict[str, Any]:
         length = int(iq.shape[-1])
         overlap = self.cfg.chunk_overlap_samples
@@ -1300,6 +1543,7 @@ class SignalFoundationModel(nn.Module):
                 complex_pair=complex_pair,
                 mae_strategy=mae_strategy,
                 moe_route_weights=moe_route_weights,
+                precomputed_revin=precomputed_revin,
             )
             if not out["patch_mask"].any():
                 continue
@@ -1321,6 +1565,7 @@ class SignalFoundationModel(nn.Module):
                 complex_pair=complex_pair,
                 mae_strategy=mae_strategy,
                 moe_route_weights=moe_route_weights,
+                precomputed_revin=precomputed_revin,
             )
         assert last is not None
         stacked = torch.stack(zs, dim=1)
@@ -1447,6 +1692,7 @@ class SignalFoundationModel(nn.Module):
         complex_pair: torch.Tensor | bool | None = True,
         mae_strategy: str | None = None,
         moe_route_weights: torch.Tensor | None = None,
+        precomputed_revin: RevINStats | None = None,
     ) -> dict[str, Any]:
         if (not is_train) and int(mask_t.sum(dim=1).max().item()) > self.cfg.chunk_len:
             return self._forward_chunked(
@@ -1459,6 +1705,7 @@ class SignalFoundationModel(nn.Module):
                 complex_pair=complex_pair,
                 mae_strategy=mae_strategy,
                 moe_route_weights=moe_route_weights,
+                precomputed_revin=precomputed_revin,
             )
         return self._core_forward(
             iq_t,
@@ -1470,6 +1717,7 @@ class SignalFoundationModel(nn.Module):
             complex_pair=complex_pair,
             mae_strategy=mae_strategy,
             moe_route_weights=moe_route_weights,
+            precomputed_revin=precomputed_revin,
         )
 
     @staticmethod
@@ -1542,6 +1790,14 @@ class SignalFoundationModel(nn.Module):
                 complex_pair=(batch or {}).get("complex_pair") if batch is not None else None,
                 signal_spec=signal_spec,
             )
+            batch_size = int(iq_t.shape[0]) if torch.is_tensor(iq_t) else len(iq_t)
+            device = iq_t.device if torch.is_tensor(iq_t) else iq_t[0].device
+            precomputed_revin = self._resolve_revin_stats(
+                batch,
+                device=device,
+                batch_size=batch_size,
+                task_mode=bool(getattr(self, "skip_revin", False)),
+            )
             return self._run_backbone(
                 iq_t,
                 mask_t,
@@ -1551,27 +1807,77 @@ class SignalFoundationModel(nn.Module):
                 modality_id=modality_id,
                 complex_pair=complex_pair,
                 moe_route_weights=self._resolve_moe_route_weights(
-                    batch_size=int(iq_t.shape[0]) if torch.is_tensor(iq_t) else len(iq_t),
-                    device=iq_t.device if torch.is_tensor(iq_t) else iq_t[0].device,
+                    batch_size=batch_size,
+                    device=device,
                     mode="encode",
                     task=None,
                     batch=batch,
                 ),
+                precomputed_revin=precomputed_revin,
             )
         finally:
             self._skip_recon = prev_skip
 
     def _should_use_generation_head(self, kind: str, head: nn.Module | None) -> bool:
-        """有 Prediction/Imputation 头时默认走 head，避免 stage2 冻 decoder 后变成零预测。
+        """``force_unified_generation=true``（默认）时 prediction/imputation 走 decoder ``recon_norm``。
 
-        ``use_legacy_generation_heads=true`` 仍强制走头；
-        仅当头缺失或 ``force_unified_generation=true`` 时回退 decoder ``recon_norm``。
+        ``use_legacy_generation_heads=true`` 仍强制走独立生成头（encoder token MLP）。
         """
         if kind not in ("prediction", "imputation") or head is None:
             return False
         if bool(getattr(self.cfg, "use_legacy_generation_heads", False)):
             return True
         return not bool(getattr(self.cfg, "force_unified_generation", False))
+
+    def _finalize_generation_head_outputs(
+        self,
+        out: dict[str, Any],
+        patch_mask: torch.Tensor,
+    ) -> None:
+        pred = out["pred_patches"]
+        n = min(pred.shape[1], out["patch_targets"].shape[1], patch_mask.shape[1])
+        pred = pred[:, :n]
+        out["pred_patches"] = pred
+        out["recon_norm"] = pred
+        stats = out.get("revin_stats")
+        length = int(out["iq_length"]) if "iq_length" in out else n * self.cfg.patch_size
+        project_mask = out.get("visible", patch_mask)[:, :n]
+        if isinstance(stats, RevINStats):
+            out["mae_pred"] = self._denorm_recon(
+                pred,
+                out["patch_targets"][:, :n],
+                stats,
+                length,
+                project_mask,
+            )
+        else:
+            out["mae_pred"] = pred
+
+    def _finalize_decoder_generation_outputs(
+        self,
+        out: dict[str, Any],
+        patch_mask: torch.Tensor,
+    ) -> None:
+        recon = out.get("recon_norm")
+        if recon is None:
+            return
+        n = min(recon.shape[1], out["patch_targets"].shape[1], patch_mask.shape[1])
+        pred = recon[:, :n]
+        out["pred_patches"] = pred
+        out["recon_norm"] = pred
+        stats = out.get("revin_stats")
+        length = int(out["iq_length"]) if "iq_length" in out else n * self.cfg.patch_size
+        project_mask = out.get("visible", patch_mask)[:, :n]
+        if isinstance(stats, RevINStats):
+            out["mae_pred"] = self._denorm_recon(
+                pred,
+                out["patch_targets"][:, :n],
+                stats,
+                length,
+                project_mask,
+            )
+        else:
+            out["mae_pred"] = pred
 
     def _downstream_features(
         self,
@@ -1624,11 +1930,12 @@ class SignalFoundationModel(nn.Module):
         out["task_readout"] = features.readout
         head = self.get_task_head(task)
         kind = self.task_kind(task)
+        use_generation_head = self._should_use_generation_head(kind, head)
         if head is not None:
             if kind == "classification":
                 out.update(head(features, dataset_id=dataset_id))
             elif kind == "clustering":
-                ns = CONTENT_NAMESPACE if task == "tx_clustering" else DEVICE_NAMESPACE
+                ns = clustering_registry_namespace(task)
                 out.update(
                     head(
                         features,
@@ -1637,9 +1944,11 @@ class SignalFoundationModel(nn.Module):
                         temperature=self._negcos_temperature,
                     )
                 )
-            elif kind == "prediction":
+            elif kind == "prediction" and use_generation_head:
                 out.update(head(features))
-            else:
+            elif kind == "imputation" and use_generation_head:
+                out.update(head(features, span_mask=out.get("span_mask")))
+            elif kind not in ("prediction", "imputation"):
                 out.update(head(features))
             if self.prototype_registry is not None and kind == "classification":
                 pooled = out.get("task_pooled", features.pooled)
@@ -1648,25 +1957,11 @@ class SignalFoundationModel(nn.Module):
                 if pooled is not None and logits is not None and pooled.shape[-1] == self.prototype_registry.dim:
                     tau = float(self._negcos_temperature or 0.1)
                     out.update(self.prototype_registry.score(ns, pooled, logits, temperature=tau))
-        if kind == "prediction" and "pred_patches" in out:
-            pred = out["pred_patches"]
-            n = min(pred.shape[1], out["patch_targets"].shape[1], patch_mask.shape[1])
-            pred = pred[:, :n]
-            out["pred_patches"] = pred
-            out["recon_norm"] = pred
-            stats = out.get("revin_stats")
-            length = int(out["iq_length"]) if "iq_length" in out else n * self.cfg.patch_size
-            project_mask = out.get("visible", patch_mask)[:, :n]
-            if isinstance(stats, RevINStats):
-                out["mae_pred"] = self._denorm_recon(
-                    pred,
-                    out["patch_targets"][:, :n],
-                    stats,
-                    length,
-                    project_mask,
-                )
-            else:
-                out["mae_pred"] = pred
+        if kind in ("prediction", "imputation"):
+            if use_generation_head and "pred_patches" in out:
+                self._finalize_generation_head_outputs(out, patch_mask)
+            elif not use_generation_head:
+                self._finalize_decoder_generation_outputs(out, patch_mask)
         if task in self.z_linear_probes and kind == "classification":
             z_feat = out.get("z_enc", out.get("z_general", out["z"]))
             z_feat = F.normalize(z_feat.float(), dim=-1).to(dtype=z_feat.dtype)
@@ -1725,10 +2020,15 @@ class SignalFoundationModel(nn.Module):
         elif mask_mode == "mae":
             mae_strategy = self.sample_mae_mask_strategy()
         generation_task = bool(task and self.task_kind(task) in ("prediction", "imputation"))
+        legacy_generation_head = generation_task and bool(
+            getattr(self.cfg, "use_legacy_generation_heads", False)
+        )
+        # 统一 query decoder 需要重建；legacy PredictionHead LP 可跳过 decoder
+        need_decoder_recon = generation_task and not legacy_generation_head
         skip_recon = bool(
             getattr(self, "skip_recon", False)
             and task_mode
-            and not generation_task
+            and not need_decoder_recon
         )
         truncate = bool(getattr(self, "truncate_backward", False) and task_mode)
         self._skip_recon = skip_recon
@@ -1782,6 +2082,12 @@ class SignalFoundationModel(nn.Module):
             task=task,
             batch=batch,
         )
+        precomputed_revin = self._resolve_revin_stats(
+            batch,
+            device=iq_t.device if torch.is_tensor(iq_t) else iq_t[0].device,
+            batch_size=batch_size,
+            task_mode=task_mode,
+        )
         if truncate:
             with torch.no_grad():
                 out = self._run_backbone(
@@ -1795,6 +2101,7 @@ class SignalFoundationModel(nn.Module):
                     complex_pair=complex_pair,
                     mae_strategy=mae_strategy,
                     moe_route_weights=moe_route_weights,
+                    precomputed_revin=precomputed_revin,
                 )
             out = self._detach_output(out)
         else:
@@ -1809,6 +2116,7 @@ class SignalFoundationModel(nn.Module):
                 complex_pair=complex_pair,
                 mae_strategy=mae_strategy,
                 moe_route_weights=moe_route_weights,
+                precomputed_revin=precomputed_revin,
             )
         if task_metadata is not None:
             out["task_metadata"] = task_metadata

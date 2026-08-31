@@ -7,13 +7,30 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from resmamba_signal_model.training.task_schedule import (
+    TaskScheduleEarlyStoppingCallback,
     expand_task_schedule_with_joint,
+    next_session_start_epoch,
     replay_tasks_for_epoch,
     resolve_task_schedule,
     schedule_session_for_epoch,
+    session_bounds_for_epoch,
     sources_for_tasks,
+    task_schedule_early_stopping_enabled,
     total_schedule_epochs,
 )
+
+
+def test_resolve_task_schedule_eval_only_flag() -> None:
+    sessions = resolve_task_schedule(
+        {
+            "task_schedule": [
+                {"task": "prediction", "epochs": 1, "eval_only": True},
+            ],
+        }
+    )
+    assert len(sessions) == 1
+    assert sessions[0]["tasks"] == ["prediction"]
+    assert sessions[0]["eval_only"] is True
 
 
 def test_resolve_task_schedule_and_epoch_mapping() -> None:
@@ -58,6 +75,78 @@ def test_expand_task_schedule_inserts_joint_after_each_solo() -> None:
     assert expanded[2]["epochs"] == 2
     assert total_schedule_epochs(expanded) == 3 + 4 + 2
     assert schedule_session_for_epoch(expanded, 7)["joint"] is True
+
+
+def test_next_session_start_epoch_and_bounds() -> None:
+    sessions = [
+        {"task": "ld_intrapulse", "epochs": 30},
+        {"task": "ld_model", "epochs": 20},
+    ]
+    assert session_bounds_for_epoch(sessions, 0)[:2] == (0, 30)
+    assert session_bounds_for_epoch(sessions, 29)[:2] == (0, 30)
+    assert next_session_start_epoch(sessions, 10) == 30
+    assert next_session_start_epoch(sessions, 29) == 30
+    assert session_bounds_for_epoch(sessions, 30)[:2] == (30, 50)
+    assert next_session_start_epoch(sessions, 49) == 50
+
+
+def test_task_schedule_early_stopping_enabled() -> None:
+    cfg = {"early_stopping_patience": 0, "task_schedule": [{"task": "a", "epochs": 1, "early_stopping_patience": 3}]}
+    sessions = resolve_task_schedule(cfg)
+    assert task_schedule_early_stopping_enabled(cfg, stage="stage2", sessions=sessions)
+    assert not task_schedule_early_stopping_enabled(cfg, stage="pretrain", sessions=sessions)
+    assert not task_schedule_early_stopping_enabled({"early_stopping_patience": 0}, stage="stage2", sessions=[])
+
+
+def test_task_schedule_early_stopping_callback_jumps_session() -> None:
+    sessions = [
+        {"name": "a", "tasks": ["ld_intrapulse"], "epochs": 10},
+        {"name": "b", "tasks": ["ld_model"], "epochs": 5},
+    ]
+    cfg = {
+        "early_stopping_patience": 1,
+        "early_stopping_min_delta": 0.0,
+        "tasks": ["ld_intrapulse", "ld_model"],
+    }
+    cb = TaskScheduleEarlyStoppingCallback(sessions, cfg, stage="stage2")
+    cb._reset_stopper(sessions[0], "ld_intrapulse")
+    assert cb._stopper is not None
+    assert not cb._stopper.step(0.5)
+    assert cb._stopper.step(0.5)
+    cb._pending_jump = next_session_start_epoch(sessions, 2)
+    assert cb._pending_jump == 10
+
+    class _ProgressCurrent:
+        def __init__(self) -> None:
+            self.ready = 0
+            self.started = 0
+            self.processed = 0
+            self.completed = 0
+
+    class _ProgressTotal(_ProgressCurrent):
+        pass
+
+    class _Progress:
+        def __init__(self) -> None:
+            self.current = _ProgressCurrent()
+            self.total = _ProgressTotal()
+
+    class _FitLoop:
+        def __init__(self) -> None:
+            self.epoch_progress = _Progress()
+
+    class _Trainer:
+        def __init__(self) -> None:
+            self.current_epoch = 2
+            self.fit_loop = _FitLoop()
+            self.should_stop = False
+            self.callbacks = []
+
+    trainer = _Trainer()
+    cb.on_train_epoch_end(trainer, pl_module=None)
+    assert trainer.fit_loop.epoch_progress.current.processed == 10
+    assert trainer.fit_loop.epoch_progress.current.completed == 9
+    assert cb._pending_jump is None
 
 
 def test_empty_schedule_keeps_mixed_training() -> None:

@@ -13,6 +13,19 @@ def scale_lr_for_grad_accum(base_lr: float, gradient_accumulation_steps: int, *,
     return float(base_lr) * gradient_accumulation_steps
 
 
+def optimizer_steps_per_epoch(train_cfg: dict[str, Any]) -> int:
+    """Lightning ``global_step`` 每 ``accumulate_grad_batches`` 个 microbatch 才 +1。"""
+    steps_per_epoch = max(1, int(train_cfg.get("steps_per_epoch", 100)))
+    accum = max(1, int(train_cfg.get("gradient_accumulation_steps", 1)))
+    return max(1, steps_per_epoch // accum)
+
+
+def total_optimizer_steps_from_cfg(train_cfg: dict[str, Any]) -> int:
+    """余弦 / warmup 总长必须按 optimizer step，不能按 microbatch ``steps_per_epoch``。"""
+    epochs = max(1, int(train_cfg.get("epochs", 1)))
+    return max(optimizer_steps_per_epoch(train_cfg) * epochs, 2)
+
+
 class LinearWarmupLR:
     """优化器步级别的线性 warmup，warmup 结束后保持 peak_lr。"""
 

@@ -50,9 +50,9 @@ def test_pretrain_objectives_and_z_enc() -> None:
     losses = foundation_pretrain_losses(
         out,
         batch,
-        include={"mae", "structure", "latent", "vicreg"},
+        include={"mse", "structure", "latent", "vicreg"},
     )
-    for key in ("mae", "structure", "latent", "vicreg"):
+    for key in ("mse", "structure", "latent", "vicreg"):
         assert key in losses
         assert torch.isfinite(losses[key])
     assert float(losses["structure"].detach()) > 0.0
@@ -146,9 +146,9 @@ def test_quiet_observed_masked_pulse_mae_stays_below_clamp() -> None:
     assert float(out["patch_targets_norm"].detach().abs().max()) <= 8.0 + 1.0e-5
     losses = foundation_pretrain_losses(
         out,
-        include={"mae", "impute", "physical", "structure"},
+        include={"mse", "impute", "physical", "structure"},
     )
-    assert float(losses["mae"].detach()) < 10.0
+    assert float(losses["mse"].detach()) < 10.0
     assert float(losses["structure"].detach()) <= 10.0
     assert float(losses["structure_spectrum"].detach()) <= 10.0
     assert float(losses["structure_time"].detach()) <= 10.0

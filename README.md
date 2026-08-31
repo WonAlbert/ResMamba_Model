@@ -61,7 +61,7 @@ pytest -q
 ## 架构要点
 
 - **Encoder**：`M-M-M-M-M-T`。预训练 `encode_visible_only`：只对可见 token 编码并 **GatingPool**（默认；可切 `attn_pool`）→ **`z_enc` / `h_enc`**（`z_general` / `z` 别名；默认 L2 归一化）。下游无 mask 时对全有效 patch 池化。
-- **Decoder**：1 层 `DecoderBlock`；token 通路重建；`[DEC]` + AttnPool → **`z_recon`**（重建 / 物理 readout，不作分类身份）。
+- **Decoder**：默认 2 层 `DecoderBlock`；token 通路重建；`[DEC]` + AttnPool → **`z_recon`**（重建 / 物理 readout，不作分类身份）。
 - **下游**：冻结 `z_enc` → TaskAdapter → 六任务独立头；联合仅 `SharedTaskAdapter`。
 - **MoE**：Tokenizer / Encoder / Decoder 共用三路专家（`ld_intrapulse` / `ld_model` / `tx_modulation`）；预训练按 H5 stem、下游按 task 硬路由；`phase_plugin: true`。
 - **归一化**：`revin_scale_mode: joint_energy`（抗峰 Winsorize + 逐时刻 PAPR 钳制）；`amp_aux` 保留 RSSI 供 Decoder / 物理损失，不进分类表征。
@@ -75,7 +75,7 @@ pytest -q
 
 唯一入口：`scripts/train.py`。正式宽度使用 `configs/model.yaml`（需 Mamba kernel）。数据根由 `RFDATA_ROOT` 或各 YAML 的 `rfdata_root` 指定（默认 `dataset/`）。全阶段 `homogeneous_batch: true`（`HomogeneousTokenBudgetSampler`，每 batch 单一 H5）；预训练另设 `combine_then_pack: false`。
 
-阶段顺序：`pretrain` → `stage2` → `stage3`（六任务各训一次）→ `joint`。日志与 checkpoint：`runs/experiments/<run_name>/`。
+阶段顺序：`pretrain` → `stage2` → `stage3`（六任务各训一次）→ `joint` →（可选）`continual`。日志与 checkpoint：`runs/experiments/<run_name>/`。
 
 | 阶段 | 配置 | 冻结策略 |
 |------|------|----------|
@@ -83,16 +83,21 @@ pytest -q
 | 二 LP 探测 | `configs/stage2.yaml` | 冻结骨干；训当前任务头（+ 可选 `z_enc` 探针）；截断反传 |
 | 三 单任务适配 | `configs/stage3.yaml` `--task <name>` | Hybrid-LoRA+ + TaskAdapter + 该任务头 |
 | 四 联合 | `configs/joint.yaml` | 各任务 LoRA/Adapter/头 + `SharedTaskAdapter` |
+| 五 持续学习 | `configs/continual.yaml` | 共享 LoRA + 原型吸收 + 置信蒸馏（不解冻骨干） |
 
 ### 正式命令
 
 ```bash
-# 阶段一：MAE 预训练
+# 阶段一：MAE 预训练（同质 H5 + 长度分桶；见 homogeneous_length_bucket）
 python scripts/train.py --stage pretrain --config configs/pretrain.yaml
+# 在 tmux won-0（你 attach 的 won 会话）前台跑完整流水线
+bash scripts/run_in_tmux_won.sh
+# 查看：tmux attach -t won-0  → 窗口 pipeline（Ctrl+b w 切换）
 
-# 阶段二：六任务 LP 探测（task_schedule 串行；ld_intrapulse 15 · ld_model 15 · tx_modulation 20 · ld_clustering 15 · tx_clustering 15 · prediction 5 epoch）
+# 阶段二：六任务 LP 探测（prediction 仅 eval_only 零样本；composite 门控 val/classification_geomean）
 python scripts/train.py --stage stage2 --config configs/stage2.yaml \
   --init-from runs/experiments/<pretrain_run>/ckpts/best.ckpt
+# 汇总分类指标：python scripts/summarize_stage2_metrics.py runs/experiments/<stage2_run>
 
 # 阶段三：单任务 Hybrid-LoRA+（每个任务独立 run；从 stage2 best 初始化）
 python scripts/train.py --stage stage3 --config configs/stage3.yaml --task ld_intrapulse \
@@ -117,6 +122,10 @@ python scripts/train.py --stage joint --config configs/joint.yaml \
   --adapter-dir ld_clustering=runs/experiments/stage3_ld_clustering_<ts> \
   --adapter-dir tx_clustering=runs/experiments/stage3_tx_clustering_<ts> \
   --adapter-dir prediction=runs/experiments/stage3_prediction_<ts>
+
+# 阶段五（可选）：持续学习 — 共享 LoRA + 原型吸收 + 置信蒸馏
+python scripts/train.py --stage continual --config configs/continual.yaml \
+  --init-from runs/experiments/<joint_or_stage2_run>/ckpts/best.ckpt
 ```
 
 阶段二可用 `--start-task <name>` 从 `task_schedule` 中间任务续训。阶段三任务名：`ld_intrapulse` / `ld_model` / `tx_modulation` / `ld_clustering` / `tx_clustering` / `prediction`；各任务 checkpoint monitor 见 `configs/stage3.yaml` 的 `profiles`。
@@ -136,6 +145,7 @@ python scripts/train.py --stage stage3 --config configs/stage3.yaml --task ld_cl
 python scripts/train.py --stage stage3 --config configs/stage3.yaml --task tx_clustering --profile tiny --synthetic
 python scripts/train.py --stage stage3 --config configs/stage3.yaml --task prediction --profile tiny --synthetic
 python scripts/train.py --stage joint --config configs/joint.yaml --profile tiny --synthetic
+python scripts/train.py --stage continual --config configs/continual.yaml --profile tiny --synthetic
 pytest -q
 ```
 
@@ -155,10 +165,13 @@ pytest -q
 | `configs/stage2.yaml` | 冻结骨干 LP 探测 |
 | `configs/stage3.yaml` | 单任务 Hybrid-LoRA+ |
 | `configs/joint.yaml` | 联合 PEFT |
+| `configs/continual.yaml` | 持续学习：共享 LoRA + 原型吸收 + 置信蒸馏 |
 | `configs/datasets.yaml` | 数据池白名单（pretrain = 各阶段 train 并集） |
 | `configs/val_subset.yaml` | 验证子集 |
 
-更完整的 Agent 约定、代码树与门控细节见 [`AGENTS.md`](AGENTS.md)。
+可选诊断 overlay：`configs/stage2_probe_*.yaml`、`configs/pretrain_per_dataset_probe.yaml`、`configs/pretrain_canonical.yaml`。
+
+更完整的 Agent 约定、代码树与门控细节见 [`AGENTS.md`](AGENTS.md)。数据预处理见 [`docs/data_preprocess.md`](docs/data_preprocess.md)。
 
 
 ## 待实现的idea（不得擅自删除或修改）

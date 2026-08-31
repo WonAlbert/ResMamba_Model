@@ -27,6 +27,18 @@ from resmamba_signal_model.data.labels import build_emitter_namespace, build_mod
 from resmamba_signal_model.data.splits import parse_split_filename
 
 
+def _h5_moe_route_stem(path: Path) -> str:
+    try:
+        name, _ = parse_split_filename(path.name)
+        return name
+    except ValueError:
+        stem = path.stem
+        for suffix in ("_train", "_val", "_test"):
+            if stem.endswith(suffix):
+                return stem[: -len(suffix)]
+        return stem
+
+
 @dataclass(frozen=True)
 class RFDataSample:
     iq: torch.Tensor
@@ -53,6 +65,13 @@ _TRAIN_INT_KEYS = (
     "global_emitter_id",
     "source_label_id",
     "global_label_id",
+)
+_PRECOMPUTED_FLOAT_KEYS = (
+    "norm_scale",
+    "log_scale",
+    "log_peak",
+    "papr_preclip",
+    "scale_gap",
 )
 _LABEL_KEYS = (
     "mod_label_id",
@@ -300,6 +319,10 @@ class RFDataH5Dataset(Dataset):
         self._capture_metadata: dict[str, np.ndarray] = {}
         self._sample_rate_hz: np.ndarray | None = None
         self._default_sample_rate_hz = float("nan")
+        self._default_dataset_id = 0
+        self._default_task_type_id = 0
+        self._iq_preprocessed = False
+        self._precomputed: dict[str, np.ndarray] = {}
         with open_rfdata_h5(self.h5_path) as f:
             self._len = int(f["iq"].shape[0])
             iq_shape = f["iq"].shape
@@ -328,6 +351,16 @@ class RFDataH5Dataset(Dataset):
                 self._length = length_arr
             self._dataset_id = _read_int_column(f, "dataset_id", self._len)
             self._task_type_id = _read_int_column(f, "task_type_id", self._len)
+            if self._dataset_id is None and "dataset_id" in f.attrs:
+                try:
+                    self._default_dataset_id = int(f.attrs["dataset_id"])
+                except (TypeError, ValueError):
+                    pass
+            if self._task_type_id is None and "task_type_id" in f.attrs:
+                try:
+                    self._default_task_type_id = int(f.attrs["task_type_id"])
+                except (TypeError, ValueError):
+                    pass
             if use_labels:
                 for key in _LABEL_KEYS:
                     col = _read_int_column(f, key, self._len)
@@ -337,11 +370,11 @@ class RFDataH5Dataset(Dataset):
             for key in CAPTURE_METADATA_KEYS:
                 if key in f and int(f[key].shape[0]) == self._len:
                     self._capture_metadata[key] = np.asarray(f[key][:])
-            for key in ("sample_rate_hz", "sampling_rate"):
+            for key in ("sample_rate_hz", "sampling_rate_hz", "sampling_rate"):
                 if key in f and int(f[key].shape[0]) == self._len:
                     self._sample_rate_hz = np.asarray(f[key][:], dtype=np.float32)
                     break
-            for key in ("sample_rate_hz", "sampling_rate"):
+            for key in ("sample_rate_hz", "sampling_rate_hz", "sampling_rate"):
                 if key in f.attrs:
                     try:
                         value = float(f.attrs[key])
@@ -350,6 +383,12 @@ class RFDataH5Dataset(Dataset):
                     if math.isfinite(value) and value > 0:
                         self._default_sample_rate_hz = value
                         break
+            self._iq_preprocessed = str(f.attrs.get("iq_preprocessed", "")).strip().lower() == "joint_energy"
+            if "revin_mean" in f and int(f["revin_mean"].shape[0]) == self._len:
+                self._precomputed["revin_mean"] = np.asarray(f["revin_mean"][:], dtype=np.float32)
+            for key in _PRECOMPUTED_FLOAT_KEYS:
+                if key in f and int(f[key].shape[0]) == self._len:
+                    self._precomputed[key] = np.asarray(f[key][:], dtype=np.float32)
             if include_extra_metadata:
                 for key in FLOAT_METADATA_KEYS:
                     if key in f:
@@ -534,15 +573,23 @@ class RFDataH5Dataset(Dataset):
             "modality_id": "rf",
             "complex_pairs": self.signal_spec.complex_pairs,
             "signal_spec": self.signal_spec,
+            "moe_route_stem": _h5_moe_route_stem(self.h5_path),
             "sample_rate_hz": (
                 float(self._sample_rate_hz[idx])
                 if self._sample_rate_hz is not None
                 else self._default_sample_rate_hz
             ),
         }
+        if self._iq_preprocessed:
+            out["iq_preprocessed"] = True
+        for key, col in self._precomputed.items():
+            if key == "revin_mean":
+                out["revin_mean"] = torch.from_numpy(np.asarray(col[idx], dtype=np.float32))
+            else:
+                out[key] = float(col[idx])
         if self.use_labels:
-            out["dataset_id"] = max(0, self._int_at(self._dataset_id, idx, 0))
-            out["task_type_id"] = self._int_at(self._task_type_id, idx, 0)
+            out["dataset_id"] = max(0, self._int_at(self._dataset_id, idx, self._default_dataset_id))
+            out["task_type_id"] = self._int_at(self._task_type_id, idx, self._default_task_type_id)
             for key in _LABEL_KEYS:
                 out[key] = self._int_at(self._labels.get(key), idx, -1)
             for key in CAPTURE_METADATA_KEYS:
@@ -636,21 +683,42 @@ def rfdata_dataloader_worker_init(_worker_id: int) -> None:
         close_rfdata_handles(worker_info.dataset)
 
 
-def load_task_pool(rfdata_root: str | Path, pool_name: str) -> list[str]:
+def load_task_pool(
+    rfdata_root: str | Path,
+    pool_name: str,
+    *,
+    include_stems: list[str] | tuple[str, ...] | None = None,
+) -> list[str]:
     """加载 task pool 对应的 H5 文件名列表。
 
     数据划分约定（H5 文件名后缀，白名单见 ``configs/datasets.yaml``）：
     - ``*_train.h5``：无标签 MAE 预训练（``pretrain_train``）
     - ``*_test.h5``：阶段二/三有标签训练（``downstream_*_train``、``clustering_train``）
     - ``*_val.h5``：各阶段唯一验证集（早停 / 选模 / 指标报告；``infer`` 默认 ``--split val``）
+
+    ``include_stems``：只保留这些数据集 stem（如 ``xidian14``）；用于单库探针。
     """
+    from resmamba_signal_model.data.sampling import h5_dataset_stem
+
     root = Path(rfdata_root)
     with (root / "label_maps.json").open("r", encoding="utf-8") as f:
         label_maps = json.load(f)
     pools = label_maps.get("task_pools", {})
     if pool_name not in pools:
         raise KeyError(f"未知 RFData pool {pool_name!r}，可选项为：{sorted(pools)}")
-    return list(pools[pool_name])
+    names = list(pools[pool_name])
+    if include_stems is None:
+        return names
+    allowed = {str(s).strip() for s in include_stems if str(s).strip()}
+    if not allowed:
+        raise ValueError("include_stems 为空")
+    filtered = [name for name in names if h5_dataset_stem(name) in allowed]
+    if not filtered:
+        available = sorted({h5_dataset_stem(name) for name in names})
+        raise ValueError(
+            f"pool {pool_name!r} 在 include_stems={sorted(allowed)} 下无文件；可用 stem={available}"
+        )
+    return filtered
 
 
 def build_rfdata_pool(
@@ -662,8 +730,11 @@ def build_rfdata_pool(
     iq_augment: str = "none",
     include_extra_metadata: bool = False,
     cache_iq_in_memory: Any = False,
+    include_stems: list[str] | tuple[str, ...] | None = None,
 ) -> RFDataPoolDataset:
     root = Path(rfdata_root)
+    names = load_task_pool(root, pool_name, include_stems=include_stems)
+    tag = pool_name if include_stems is None else f"{pool_name}:{'+'.join(sorted(str(s) for s in include_stems))}"
     return RFDataPoolDataset([
         RFDataH5Dataset(
             root / "h5" / name,
@@ -673,8 +744,8 @@ def build_rfdata_pool(
             include_extra_metadata=include_extra_metadata,
             cache_iq_in_memory=cache_iq_in_memory,
         )
-        for name in load_task_pool(root, pool_name)
-    ], pool_name=pool_name)
+        for name in names
+    ], pool_name=tag)
 
 
 def rfdata_loader_worker_kwargs(
@@ -709,6 +780,27 @@ def _collate_metadata(batch: list[dict[str, Any]], out: dict[str, Any]) -> dict[
             out[key] = [str(item.get(key, MISSING_METADATA)) for item in batch]
     if "h5_path" in first:
         out["h5_path"] = [str(item["h5_path"]) for item in batch]
+    if "moe_route_stem" in first:
+        out["moe_route_stem"] = [str(item.get("moe_route_stem", "")) for item in batch]
+    if "iq_preprocessed" in first:
+        flags = [bool(item.get("iq_preprocessed", False)) for item in batch]
+        if flags and all(flags):
+            out["iq_preprocessed"] = True
+        elif flags and not any(flags):
+            out["iq_preprocessed"] = False
+        else:
+            out["iq_preprocessed"] = torch.as_tensor(flags, dtype=torch.bool)
+    if "revin_mean" in first:
+        out["revin_mean"] = torch.stack(
+            [item["revin_mean"] if torch.is_tensor(item["revin_mean"]) else torch.as_tensor(item["revin_mean"], dtype=torch.float32) for item in batch],
+            dim=0,
+        )
+    for key in _PRECOMPUTED_FLOAT_KEYS:
+        if key in first:
+            out[key] = torch.as_tensor(
+                [float(item.get(key, float("nan"))) for item in batch],
+                dtype=torch.float32,
+            )
     return out
 
 

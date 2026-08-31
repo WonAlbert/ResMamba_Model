@@ -3,6 +3,7 @@
 .vscode
 .pytest_cache
 *.pytest_cache
+.ipynb_checkpoints/
 __pycache__/
 *.pyc
 .ssh
@@ -28,6 +29,7 @@ dataset/
 
 # Training runs, logs, checkpoints, TensorBoard
 runs/
+outputs/
 checkpoints/
 *.ckpt
 *.pt

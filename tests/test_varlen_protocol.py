@@ -9,9 +9,9 @@ from resmamba_signal_model.models.varlen import apply_truncation_aug, assert_min
 def _cfg(**kwargs) -> SignalModelConfig:
     base = dict(
         d_model=32,
-        encoder_mamba_layers=5,
+        encoder_mamba_layers=4,
         encoder_transformer_layers=1,
-        decoder_mamba_layers=1,
+        decoder_mamba_layers=2,
         mamba_d_state=8,
         mamba_headdim=16,
         require_mamba_kernel=False,

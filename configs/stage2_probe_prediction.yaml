@@ -1,0 +1,73 @@
+# Stage2 probe: prediction only, 1 epoch
+model_config: configs/model.yaml
+rfdata_root: /root/autodl-tmp/ResMamba_Signal_Model/dataset
+iq_normalize: none
+sequence_packing: true
+mix_strategy: token_share
+combine_then_pack: false
+homogeneous_batch: true
+balanced_sampling: false
+balanced_sampling_strategy: length_bucket
+token_budget: 8192
+steps_per_epoch: 600
+val_batches: 50
+val_seed: 0
+seed: 0
+check_val_every_n_epoch: 1
+min_ratio: 0.05
+synthetic: false
+amp: true
+amp_dtype: bfloat16
+epochs: 1
+checkpoint_monitor: val/mse_prediction
+checkpoint_mode: min
+early_stopping_patience: 0
+num_workers: 20
+prefetch_factor: 4
+cache_iq_in_memory: auto
+max_grad_norm: 1.0
+learning_rate: 1.0e-3
+warmup_steps: 500
+lr_schedule: warmup_cosine
+lr_min_ratio: 0.1
+token_normalized_loss: true
+clustering_view2: true
+distill_weight: 0.0
+prototype_anchor_weight: 0.0
+replay_strategy: class_center
+replay_mix_ratio: 0.0
+replay_samples_per_class: 20
+replay_baseline_classes_per_task: 11
+replay_memory_total_exemplars: 0
+replay_scan_max_samples: 4096
+replay_scan_token_budget: 2048
+absorb_unknown: false
+lambda_recon: 0.0
+z_probe_weight: 0.5
+z_contrastive_weight: 0.0
+modulation_contrastive_weight: 0.0
+emitter_contrastive_weight: 0.0
+supervised_clustering: false
+cluster_utilization_weight: 0.05
+cluster_balance_mix: 0.3
+cluster_sinkhorn_epsilon: 0.1
+cluster_consistency_weight: 1.0
+use_dataset_bias: false
+train_encoder: false
+train_decoder: false
+train_heads: true
+truncate_backward: true
+skip_recon: true
+compact_task_labels: true
+loss_weights:
+  physical: 0.0
+  domain: 0.0
+tasks:
+  - prediction
+task_schedule:
+  - task: prediction
+    epochs: 1
+    eval_only: true
+task_joint_epochs: 0
+task_pools:
+  prediction: [downstream_prediction_train, downstream_prediction_val]

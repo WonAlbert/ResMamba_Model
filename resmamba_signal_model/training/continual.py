@@ -72,6 +72,8 @@ def absorb_unknown_embeddings(
 
 def apply_continual_freeze(model: nn.Module) -> None:
     """只打开共享低秩 adapter、原型与任务头；不新建 per-task LoRA。"""
+    from resmamba_signal_model.training.task_catalog import BUILTIN_HEAD_ATTR
+
     for param in model.parameters():
         param.requires_grad = False
     for name in ("shared_adapter", "prototype_registry"):
@@ -79,12 +81,12 @@ def apply_continual_freeze(model: nn.Module) -> None:
         if isinstance(module, nn.Module):
             for param in module.parameters():
                 param.requires_grad = True
-    extra = getattr(model, "extra_task_heads", None)
-    heads = []
-    for attr in ("modulation_head", "emitter_head", "clustering_head", "prediction_head", "imputation_head"):
+    heads: list[nn.Module] = []
+    for attr in BUILTIN_HEAD_ATTR.values():
         head = getattr(model, attr, None)
         if isinstance(head, nn.Module):
             heads.append(head)
+    extra = getattr(model, "extra_task_heads", None)
     if isinstance(extra, nn.ModuleDict):
         heads.extend(list(extra.values()))
     for head in heads:

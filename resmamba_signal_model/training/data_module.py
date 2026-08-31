@@ -30,6 +30,7 @@ from resmamba_signal_model.data.sampling import (
     h5_dataset_stem,
     plan_fixed_token_budget_batches,
     pool_sample_lengths,
+    pool_sample_stems,
     regroup_token_batches_by_length,
     resolve_balanced_sampling_strategy,
     resolve_length_bucket_weight_mode,
@@ -91,6 +92,16 @@ CONTRACT_LIST_KEYS = (
     *CAPTURE_METADATA_KEYS,
 )
 
+REVIN_BATCH_KEYS = (
+    "revin_mean",
+    "norm_scale",
+    "log_scale",
+    "log_peak",
+    "papr_preclip",
+    "scale_gap",
+    "iq_preprocessed",
+)
+
 PRETRAIN_BLOCKED_KEYS = frozenset(
     {
         "mod_label_id",
@@ -106,16 +117,44 @@ PRETRAIN_BLOCKED_KEYS = frozenset(
     }
 )
 
+# z_supcon 等可分损失需要的标签键：collate 可保留，模型前向前仍由 lit 防火墙剥离。
+PRETRAIN_DISC_LABEL_KEYS = frozenset(
+    {
+        "global_label_id",
+        "mod_label_id",
+        "emitter_id",
+        "source_label_id",
+        "dataset_id",
+    }
+)
+
 
 def is_pretrain_blocked_key(key: str) -> bool:
     name = str(key)
     return name in PRETRAIN_BLOCKED_KEYS or name.startswith("global_")
 
 
-def pretrain_collate_firewall(batch: dict[str, Any]) -> dict[str, Any]:
+def pretrain_needs_labels(train_cfg: dict[str, Any] | None) -> bool:
+    """预训练读标签：显式 ``pretrain_use_labels`` 或 ``loss_weights.z_supcon > 0``。"""
+    if not isinstance(train_cfg, dict):
+        return False
+    if bool(train_cfg.get("pretrain_use_labels", False)):
+        return True
+    weights = train_cfg.get("loss_weights") or {}
+    if not isinstance(weights, dict):
+        return False
+    return float(weights.get("z_supcon", 0.0) or 0.0) > 0.0
+
+
+def pretrain_collate_firewall(
+    batch: dict[str, Any],
+    *,
+    keep_disc_labels: bool = False,
+) -> dict[str, Any]:
     """预训练模型 batch 不得含标签 / dataset_id / 采集元数据 / 文件身份。
 
     ``moe_route_stem`` 由 ``h5_path`` 派生，仅用于 MoE family 路由，不进入标签空间。
+    ``keep_disc_labels=True`` 时保留 ``PRETRAIN_DISC_LABEL_KEYS``（仅供损失，不进表征）。
     """
     if "h5_path" in batch and "moe_route_stem" not in batch:
         paths = batch["h5_path"]
@@ -123,12 +162,17 @@ def pretrain_collate_firewall(batch: dict[str, Any]) -> dict[str, Any]:
             batch["moe_route_stem"] = [h5_dataset_stem(Path(path).name) for path in paths]
         else:
             batch["moe_route_stem"] = h5_dataset_stem(Path(paths).name)
-    return {key: value for key, value in batch.items() if not is_pretrain_blocked_key(key)}
+    keep = PRETRAIN_DISC_LABEL_KEYS if keep_disc_labels else frozenset()
+    return {
+        key: value
+        for key, value in batch.items()
+        if (not is_pretrain_blocked_key(key)) or key in keep
+    }
 
 # 训练 sampler 不得使用 global_label_id（仅 val 聚类指标）。
 TRAIN_SAMPLER_LABEL_FIELDS: dict[str, tuple[str, ...]] = {
     "ld_intrapulse": ("canonical_mod_label_id", "mod_label_id"),
-    "ld_model": ("global_emitter_id", "emitter_id"),
+    "ld_model": ("mod_label_id", "canonical_mod_label_id"),
     "tx_modulation": ("canonical_mod_label_id", "mod_label_id"),
     "ld_clustering": ("dataset_id",),
     "tx_clustering": ("dataset_id",),
@@ -293,6 +337,25 @@ def merge_source_batches(batches: dict[str, Any] | list[Any]) -> dict[str, Any]:
                 lists[key].extend(list(value))
             else:
                 lists[key].extend([value] * n)
+        for key in REVIN_BATCH_KEYS:
+            value = batch.get(key)
+            if value is None:
+                continue
+            if key not in stacked:
+                stacked[key] = []
+            if key == "iq_preprocessed":
+                if value is True:
+                    stacked[key].append(torch.ones(n, dtype=torch.bool))
+                elif value is False:
+                    stacked[key].append(torch.zeros(n, dtype=torch.bool))
+                elif torch.is_tensor(value):
+                    stacked[key].append(value.to(dtype=torch.bool))
+                else:
+                    stacked[key].append(torch.as_tensor([bool(value)] * n, dtype=torch.bool))
+            elif torch.is_tensor(value):
+                stacked[key].append(value)
+            else:
+                stacked[key].append(torch.as_tensor([value] * n, dtype=torch.float32))
     out: dict[str, Any] = {
         "iq": iq,
         "values": iq,
@@ -302,9 +365,19 @@ def merge_source_batches(batches: dict[str, Any] | list[Any]) -> dict[str, Any]:
     if has_view2:
         out["view2"] = view2
     for key, parts in stacked.items():
+        if key == "iq_preprocessed":
+            continue
         out[key] = torch.cat(parts, dim=0)
     for key, values in lists.items():
         out[key] = values
+    if "iq_preprocessed" in stacked:
+        flags = stacked["iq_preprocessed"]
+        if flags and all(bool(part.all()) for part in flags):
+            out["iq_preprocessed"] = True
+        elif flags and not any(bool(part.any()) for part in flags):
+            out["iq_preprocessed"] = False
+        else:
+            out["iq_preprocessed"] = torch.cat(flags, dim=0)
     return out
 
 
@@ -369,6 +442,7 @@ def _collate_with_source(
     *,
     attach_view2: bool = False,
     stage: str | None = None,
+    keep_disc_labels: bool = False,
 ):
     def _collate(samples: list[Any]) -> dict[str, Any]:
         batch = variable_length_collate(samples)
@@ -379,7 +453,7 @@ def _collate_with_source(
         if attach_view2:
             attach_clustering_view2(batch)
         if stage == "pretrain":
-            batch = pretrain_collate_firewall(batch)
+            batch = pretrain_collate_firewall(batch, keep_disc_labels=keep_disc_labels)
         return batch
 
     return _collate
@@ -403,11 +477,14 @@ def _plan_fixed_eval_batches(
     patch_size: int,
     num_batches: int,
     seed: int,
+    full_stems: list[str] | tuple[str, ...] | None = None,
 ) -> tuple[list[int], list[list[int]]]:
     if isinstance(dataset, RFDataPoolDataset):
         lengths = pool_sample_lengths(dataset)
+        stem_ids = pool_sample_stems(dataset) if full_stems else None
     else:
         lengths = [int(dataset[i]["length"]) for i in range(len(dataset))]
+        stem_ids = None
     raw = plan_fixed_token_budget_batches(
         lengths,
         token_budget=max(1, int(token_budget)),
@@ -415,6 +492,8 @@ def _plan_fixed_eval_batches(
         num_batches=max(1, int(num_batches)),
         seed=int(seed),
         class_ids=dataset_class_ids(dataset),
+        stem_ids=stem_ids,
+        full_stems=full_stems,
     )
     plan = regroup_token_batches_by_length(
         raw,
@@ -443,6 +522,7 @@ def _make_loader(
     batch_sampler: Sampler[list[int]] | None = None,
     attach_view2: bool = False,
     stage: str | None = None,
+    keep_disc_labels: bool = False,
 ) -> DataLoader:
     if batch_sampler is not None:
         sampler: Sampler[list[int]] = batch_sampler
@@ -466,7 +546,13 @@ def _make_loader(
     return DataLoader(
         dataset,
         batch_sampler=sampler,
-        collate_fn=_collate_with_source(source_name, task, attach_view2=attach_view2, stage=stage),
+        collate_fn=_collate_with_source(
+            source_name,
+            task,
+            attach_view2=attach_view2,
+            stage=stage,
+            keep_disc_labels=keep_disc_labels,
+        ),
         num_workers=num_workers,
         pin_memory=pin_memory,
         **kwargs,
@@ -557,10 +643,23 @@ def build_train_batch_sampler(
     task: str | None = None,
     stage: str | None = None,
 ) -> Sampler[list[int]]:
+    from resmamba_signal_model.data.chronos_sampling import (
+        ChronosShuffledBatchSampler,
+        parse_chronos_sampling_cfg,
+    )
+
+    chronos = parse_chronos_sampling_cfg(train_cfg)
     homo_cfg = train_cfg.get("homogeneous_batch")
     use_homo = stage == "pretrain" if homo_cfg is None else bool(homo_cfg)
     if use_homo and isinstance(dataset, RFDataPoolDataset):
-        return HomogeneousTokenBudgetSampler(
+        max_share = train_cfg.get("max_within_family_share")
+        if chronos.get("enabled") and chronos.get("stem_share_cap") is not None:
+            cap = float(chronos["stem_share_cap"])
+            max_share = cap if max_share is None else min(float(max_share), cap)
+        sticky = int(train_cfg.get("homogeneous_stem_sticky_batches", 0) or 0)
+        if chronos.get("enabled"):
+            sticky = int(chronos.get("stem_sticky_batches", 0) or 0)
+        sampler: Sampler[list[int]] = HomogeneousTokenBudgetSampler(
             dataset,
             token_budget=max(1, int(token_budget)),
             patch_size=int(patch_size),
@@ -569,7 +668,19 @@ def build_train_batch_sampler(
             lengths=lengths,
             source_groups=train_cfg.get("source_groups"),
             family_quotas=train_cfg.get("family_quotas"),
+            within_family_weight=train_cfg.get("within_family_weight"),
+            max_within_family_share=None if max_share is None else float(max_share),
+            stem_sample_weights=train_cfg.get("stem_sample_weights"),
+            homogeneous_length_bucket=bool(train_cfg.get("homogeneous_length_bucket", False)),
+            homogeneous_length_bucket_weight=train_cfg.get("homogeneous_length_bucket_weight"),
+            homogeneous_length_tier=bool(train_cfg.get("homogeneous_length_tier", False)),
+            homogeneous_stem_sticky_batches=sticky,
+            chronos_length_tier_pool=bool(chronos.get("enabled") and chronos.get("length_tier_pool")),
         )
+        buf = int(chronos.get("shuffle_buffer_batches", 0) or 0) if chronos.get("enabled") else 0
+        if buf > 0:
+            sampler = ChronosShuffledBatchSampler(sampler, buffer_batches=buf, seed=int(seed) + 17)
+        return sampler
     enabled = bool(train_cfg.get("balanced_sampling", False))
     strategy = resolve_balanced_sampling_strategy(
         enabled=enabled,
@@ -799,6 +910,11 @@ class SignalDataModule(LightningDataModule):
         """setup 时从 val 集按类别分层均匀抽出固定 token-budget batch，之后每个 epoch 复用。"""
         self._cached_val_loader = None
         self._val_batch_plan = {}
+        full_stems = [
+            str(s).strip()
+            for s in (self.train_cfg.get("val_full_stems") or self.train_cfg.get("val_subset_full_datasets") or [])
+            if str(s).strip()
+        ]
         for name, dataset in self._val_sets.items():
             _lengths, plan = _plan_fixed_eval_batches(
                 dataset,
@@ -806,8 +922,14 @@ class SignalDataModule(LightningDataModule):
                 patch_size=self.patch_size,
                 num_batches=max(1, self.val_batches),
                 seed=self.val_seed,
+                full_stems=full_stems or None,
             )
             self._val_batch_plan[name] = plan
+            if full_stems:
+                print(
+                    f"val plan {name}: batches={len(plan)} full_stems={full_stems}",
+                    flush=True,
+                )
 
     def setup(self, stage: str | None = None) -> None:
         if self.source_names and self.mix is not None:
@@ -846,10 +968,20 @@ class SignalDataModule(LightningDataModule):
             return
 
         root = self.train_cfg.get("rfdata_root") or "dataset"
-        pool_cache: dict[tuple[str, bool | None], Dataset] = {}
+        pool_cache: dict[tuple[Any, ...], Dataset] = {}
+
+        pretrain_stems = self.train_cfg.get("pretrain_stems")
+        if pretrain_stems is not None and not isinstance(pretrain_stems, (list, tuple)):
+            pretrain_stems = [pretrain_stems]
+        include_stems = (
+            [str(s) for s in pretrain_stems]
+            if self.stage == "pretrain" and pretrain_stems
+            else None
+        )
 
         def get_pool(pool_name: str, *, use_labels: bool | None = None) -> Dataset:
-            cached = pool_cache.get((pool_name, use_labels))
+            cache_key = (pool_name, use_labels, tuple(include_stems) if include_stems else None)
+            cached = pool_cache.get(cache_key)
             if cached is not None:
                 return cached
             label_flag = use_labels if use_labels is not None else (self.stage != "pretrain")
@@ -859,13 +991,15 @@ class SignalDataModule(LightningDataModule):
                 use_labels=label_flag,
                 iq_normalize=self.train_cfg.get("iq_normalize", "none"),
                 cache_iq_in_memory=self.cache_iq_in_memory,
+                include_stems=include_stems,
             )
-            pool_cache[(pool_name, use_labels)] = pool
+            pool_cache[cache_key] = pool
             return pool
 
         if self.stage == "pretrain":
-            pool = get_pool(self.train_cfg.get("pool", "pretrain_train"), use_labels=False)
-            val_pool = get_pool(self.train_cfg.get("val_pool", "pretrain_val"), use_labels=False)
+            want_labels = pretrain_needs_labels(self.train_cfg)
+            pool = get_pool(self.train_cfg.get("pool", "pretrain_train"), use_labels=want_labels)
+            val_pool = get_pool(self.train_cfg.get("val_pool", "pretrain_val"), use_labels=want_labels)
             self._train_sets = {"pretrain": pool}
             self._val_sets = {"pretrain": val_pool}
         else:
@@ -875,7 +1009,7 @@ class SignalDataModule(LightningDataModule):
                 "tx_modulation": ("downstream_comm_modulation_train", "downstream_comm_modulation_val"),
                 "ld_clustering": ("clustering_radar_train", "clustering_radar_val"),
                 "tx_clustering": ("clustering_comm_train", "clustering_comm_val"),
-                "prediction": ("prediction_train", "prediction_val"),
+                "prediction": ("downstream_prediction_train", "downstream_prediction_val"),
             }
             catalog = resolve_task_catalog(self.train_cfg)
             if self.stage == "stage3":
@@ -964,6 +1098,7 @@ class SignalDataModule(LightningDataModule):
                 and bool(self.train_cfg.get("clustering_view2", True))
             )
             pin_memory = self.pin_memory and not (workers > 0 and persistent)
+            keep_disc = self.stage == "pretrain" and pretrain_needs_labels(self.train_cfg)
             loaders[name] = _make_loader(
                 dataset,
                 lengths=lengths,
@@ -981,6 +1116,7 @@ class SignalDataModule(LightningDataModule):
                 batch_sampler=sampler if train else None,
                 attach_view2=attach_view2,
                 stage=self.stage,
+                keep_disc_labels=keep_disc,
             )
         return loaders
 
@@ -1013,7 +1149,8 @@ class SignalDataModule(LightningDataModule):
         cache_key = tuple(val_sets.keys())
         if self._cached_val_loader is None or getattr(self, "_cached_val_key", None) != cache_key:
             loaders = self._loaders(val_sets, train=False)
-            val_steps = max(1, self.val_batches) * max(1, len(loaders))
+            # 以实际 FixedBatchSampler 长度为准（full_stems / length regroup 会改变 batch 数）
+            val_steps = sum(max(1, len(loader)) for loader in loaders.values())
             self._cached_val_loader = SizedCombinedLoader(loaders, mode="sequential", length=val_steps)
             self._cached_val_key = cache_key
         return self._cached_val_loader

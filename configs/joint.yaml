@@ -2,6 +2,7 @@
 model_config: configs/model.yaml
 rfdata_root: /root/autodl-tmp/ResMamba_Signal_Model/dataset
 iq_normalize: none
+skip_revin: true
 sequence_packing: true
 mix_strategy: token_share
 combine_then_pack: false
@@ -35,9 +36,9 @@ distill_weight: 0.0
 prototype_anchor_weight: 0.0
 absorb_unknown: false
 lambda_recon: 0.0
-supervised_clustering: false
-cluster_utilization_weight: 0.15
-cluster_balance_mix: 0.7
+supervised_clustering: true
+cluster_utilization_weight: 0.0
+cluster_balance_mix: 0.0
 cluster_sinkhorn_epsilon: 0.1
 cluster_consistency_weight: 1.0
 use_dataset_bias: false
@@ -76,7 +77,7 @@ task_pools:
   tx_modulation: [downstream_comm_modulation_train, downstream_comm_modulation_val]
   ld_clustering: [clustering_radar_train, clustering_radar_val]
   tx_clustering: [clustering_comm_train, clustering_comm_val]
-  prediction: [prediction_train, prediction_val]
+  prediction: [downstream_prediction_train, downstream_prediction_val]
 profiles:
   tiny:
     model_config: configs/model_tiny.yaml
