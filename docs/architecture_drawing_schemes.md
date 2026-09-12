@@ -202,80 +202,99 @@ Pretrain does not inject dataset_id into Decoder/UTI condition.
 
 ---
 
-## 2. Tokenizer Scheme — TimeFreqTokenizer
+## 2. Tokenizer 结构图 — TimeFreqTokenizer
 
 **建议文件名**：`fig_tokenizer.svg`  
-**布局**：底部输入 → 中部分叉（Time / Freq）→ 顶部 Gate 融合（仿论文「双支汇入」）。
+**布局**：底部输入 → 切 patch → 三路专家并行 → MoEFusion 硬路由融合 → 物理偏置与 Norm。  
+**说明约定**：图中中文为流程介绍；模块名、张量名、算子名保持英文。
 
 ### 2.1 整体结构
 
 ```
-                    tokens [B,N,D]
-                          ▲
+                         输出 tokens [B,N,D]
+                                  ▲
                     LayerNorm + Dropout
-                          ▲
-              ┌───────────┴───────────┐
-              │ + PhysicsProj (opt)   │  ← patch_physics [B,N,P]
-              │ + PhaseProj (opt,虚线) │
-              └───────────┬───────────┘
-                          ▲
-                 Gate ⊙ Time + (1-Gate) ⊙ Freq
-                          ▲
-              ┌───────────┴───────────┐
-              │  σ( Linear([T‖F]) )   │  Gate
-              └───────────┬───────────┘
-                    ┌─────┴─────┐
-                    │           │
-              Time branch   Freq branch
-                    ▲           ▲
-              Stem+DW-MS     Patch FFT
-                    │           │
-                    └─────┬─────┘
-                          │
-                 iq_norm [B,2,L]
+                    （无效 patch 按 ~patch_mask 置零）
+                                  ▲
+              ┌───────────────────┴───────────────────┐
+              │  + PhysicsProj（可选）                 │  ← patch_physics [B,N,PHYS_DIM]
+              │  （phys.detach 后 Linear→d_model）     │
+              └───────────────────┬───────────────────┘
+                                  ▲
+                         MoEFusion（硬路由加权）
+                    预训练按 H5 stem / 下游按 task 名
+                                  ▲
+           ┌──────────────────────┼──────────────────────┐
+           │                      │                      │
+   专家① ld_intrapulse    专家② ld_model      专家③ tx_modulation
+   （时域细尺度+相位）      （多尺度时域）          （频谱分带）
+           ▲                      ▲                      ▲
+    ┌──────┴──────┐        ┌──────┴──────┐        patch FFT
+    │ elastic 模式 │        │ elastic 模式 │        log|·| → fftshift
+    │ MLP(2P→D→D) │        │ MLP(2P→D→D) │        → Band Pool(8)
+    │ + PhaseProj │        │              │        → Linear→D
+    ├─────────────┤        ├─────────────┤
+    │ fixed 模式  │        │ fixed 模式  │
+    │ Stem→DWConv │        │ Stem→DWConv │
+    │ k∈{16,32,64}│        │ k∈{4,8,16,32}│
+    └──────┬──────┘        └──────┬──────┘
+           │                      │
+           └──────────┬───────────┘
+                      │
+         ElasticRoVSampler 或 fixed patchify
+              → iq_patches [B,N,2,P]
+                      ▲
+              iq_norm [B,2,L]（仅 I/Q，无 task embedding）
 ```
 
-### 2.2 左支：Time Path（绿色系）
+### 2.2 专家①：ld_intrapulse（时域细尺度）
 
-自下而上盒：
+自下而上：
 
-1. **Stem**：`Conv1d(2 → C, k=7, pad=3)`，`C = stem_channels (64)`  
-2. **Multi-scale Depthwise**：并排 4 个小盒  
-   - `DWConv k∈{4,8,16,32}`，`stride = patch_size`，`groups = C`  
-   - 上方横条：`Concat → Conv1d 1×1 → d_model`（`time_fuse`）  
-3. 输出：`time_tok [B, N, D]`
+1. **切分**：与其它专家共享 `iq_patches`（`elastic_rov` 或 fixed `patchify`）。  
+2. **嵌入**  
+   - `elastic_rov`：`_ElasticPatchExpert`，`Linear(2·patch_size → d_model → d_model)`  
+   - `fixed_patch`：共享 `Stem`（`Conv1d(2→stem_channels, k=7)`）+ `DWConv` 多尺度 `k∈{16,32,64}`，`stride=patch_size`，再 `1×1` 融到 `d_model`  
+3. **PhaseProj**（可选，`phase_plugin`）：相对相位增量 Δφ 统计 + 相邻样本共轭相关 → `Linear(4 → d_model)`，加到本专家输出。  
+4. 输出：`intrapulse` token `[B,N,D]`
 
-### 2.3 右支：Freq Path（黄色系）
+### 2.3 专家②：ld_model（多尺度时域）
 
-自下而上盒：
+1. 输入同为 `iq_patches` / `Stem` 特征。  
+2. **嵌入**  
+   - `elastic_rov`：独立 `_ElasticPatchExpert` MLP  
+   - `fixed_patch`：`DWConv k∈{4,8,16,32}` + `1×1` fuse  
+3. 输出：`model_tok [B,N,D]`（无 PhaseProj）
 
-1. **Patchify**：`iq → patches [B, N, 2, P]`，`P = patch_size`  
-2. **Complex FFT**：`z = I + jQ` → `fft` → `log|·|` → **`fftshift`**  
-3. **Band Pool**：双侧频谱均分 `freq_bands = 8`  
-4. **Linear**：`freq_bands → d_model` → `freq_tok`
+### 2.4 专家③：tx_modulation（频谱）
 
-### 2.4 融合与偏置
+1. **Patchify** 后的复数 patch：`z = I + jQ`  
+2. **Complex FFT** → `log|·|` → **`fftshift`**（保留负频）  
+3. **Band Pool**：双侧频谱均分为 `freq_bands=8`  
+4. **Linear**：`freq_bands → d_model` → `tx_tok [B,N,D]`
 
-| 步骤 | 标签 | 说明 |
-|------|------|------|
-| Gate | `Gated Fusion` | `gate = σ(W [time‖freq])`；`tok = g⊙time + (1-g)⊙freq` |
-| Physics | `+ Physics Bias` | `Linear(PHYS_DIM → D)`；特征含 log_power / PAPR / IQ corr / var ratio / spectral centroid |
-| Phase | `+ Phase Plugin`（虚线框） | 相对相位增量 + 相邻共轭相关 → `Linear(4 → D)` |
-| Norm | `LayerNorm` | 后接 Dropout；`~patch_mask` 置零 |
+### 2.5 融合与偏置
 
-### 2.5 输出端口（右侧小标签）
+| 步骤 | 英文标签 | 中文说明 |
+|------|----------|----------|
+| 路由融合 | `MoEFusion` | 三路专家输出按硬路由权重加权；**非**内容 gate。预训练按 H5 stem，下游按 task 名（见 `TASK_MOE_ROUTES` / `PRETRAIN_STEM_MOE_PATTERNS`） |
+| 物理偏置 | `PhysicsProj` | `Linear(PHYS_DIM → D)`；特征含 log_power / PAPR / IQ corr / var ratio / spectral centroid 等；`phys.detach()` |
+| 相位插件 | `PhaseProj` | 仅叠在 `ld_intrapulse` 支路 |
+| 归一化 | `LayerNorm` + `Dropout` | 随后对 `~patch_mask` 位置置零 |
 
-- `tokens`  
-- `patch_mask` / `token_mask`  
-- `iq_patch_targets`  
-- `patch_physics` + `physics_mask`
+### 2.6 输出端口（图右侧标注）
 
-### 2.6 绘图要点
+- `tokens` — 送入 Encoder 的主表征  
+- `patch_mask` / `token_mask` — 有效 patch  
+- `iq_patch_targets` — MAE 重建目标  
+- `patch_physics` + `physics_mask` — 供 Decoder FiLM / 物理损失  
 
-- **无** dataset / task token 注入（图中勿画 task embedding）。  
-- Time / Freq 左右对称，中间 Gate 用紫色浅盒，类似论文中 Add 汇合点。  
-- 在 Freq 支路旁用小号字写：`keep negative freqs; fftshift then equal bands`。
+### 2.7 绘图要点
 
+- **不要**画 dataset / task embedding；Tokenizer 只吃 I/Q。  
+- 三路专家并排，顶部用 `MoEFusion` 汇合（硬路由箭头旁可注明 stem / task）。  
+- 频谱支路旁用小号英文标注：`keep negative freqs; fftshift then equal bands`。  
+- 当前正式配置默认 `tokenization_mode: elastic_rov`；图中可同时用虚线标出 `fixed_patch` 的 Stem+DWConv 路径。
 ---
 
 ## 3. Encoder Scheme — HybridEncoder + Identity Pool
@@ -608,10 +627,13 @@ blue for pooling, pink for physics. Label tensors on arrows.
 
 ```
 Scientific diagram, Attention-Is-All-You-Need paper style, white background.
-Time-Freq Tokenizer: input iq_norm splits into Time branch
-(Conv stem + four depthwise multi-scale kernels 4/8/16/32 fused to d_model)
-and Freq branch (complex FFT, log-mag, fftshift, 8-band pool, linear).
-Gated fusion, optional physics bias and phase plugin, LayerNorm.
+TimeFreqTokenizer（中文流程标注，术语保留英文）：
+iq_norm → ElasticRoVSampler / patchify → 三路专家并行
+  ① ld_intrapulse（elastic MLP 或 Stem+DWConv{16,32,64} + PhaseProj）
+  ② ld_model（elastic MLP 或 Stem+DWConv{4,8,16,32}）
+  ③ tx_modulation（complex FFT, log-mag, fftshift, 8-band pool, Linear）
+→ MoEFusion 硬路由（stem/task，非内容 gate）
+→ PhysicsProj + LayerNorm + Dropout → tokens。
 Bottom-to-top arrows, thin boxes, pastel green/yellow/purple.
 ```
 

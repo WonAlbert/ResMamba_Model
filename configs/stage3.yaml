@@ -15,7 +15,7 @@ steps_per_epoch: 600
 val_batches: 50
 val_seed: 0
 seed: 0
-check_val_every_n_epoch: 1
+check_val_every_n_epoch: 2
 min_ratio: 0.05
 synthetic: false
 amp: true
@@ -44,6 +44,8 @@ cluster_consistency_weight: 1.0
 supervised_clustering: true
 lambda_recon: 0.0
 use_dataset_bias: false
+# 关闭低秩原型头：用完整 residual MLP + 高维 Cosine（覆盖 model.yaml）
+low_rank_prototype: false
 train_encoder: false
 train_decoder: false
 train_heads: true
@@ -142,3 +144,7 @@ profiles:
     checkpoint_monitor: val/mse_prediction
     checkpoint_mode: min
     epochs: 30
+    # 与 stage2 对齐：token MLP 头 + encode 目标位；避免 decoder-only 路径 TaskAdapter 无梯度
+    use_legacy_generation_heads: true
+    skip_recon: true
+    heads_lr: 8.0e-5

@@ -146,6 +146,28 @@ def test_prediction_unified_generation_uses_decoder_not_head() -> None:
     assert not torch.allclose(before, after_decoder, atol=1.0e-5)
 
 
+def test_unified_prediction_task_adapter_receives_decoder_gradients() -> None:
+    from resmamba_signal_model.models.peft import PeftConfig, inject_hybrid_lora
+    from resmamba_signal_model.training.freeze import apply_stage_freeze
+    from resmamba_signal_model.training.losses import downstream_task_loss
+
+    torch.manual_seed(8)
+    model = SignalFoundationModel(
+        _cfg(build_adapters=True, force_unified_generation=True, use_legacy_generation_heads=False)
+    )
+    inject_hybrid_lora(model, ["prediction"], PeftConfig(r_attn=2, r_mamba=2, lora_alpha_attn=2, lora_alpha_mamba=2))
+    apply_stage_freeze(model, "stage3", task="prediction", train_cfg={"skip_recon": False})
+    model.train()
+    iq = torch.randn(2, 2, 128)
+    mask = torch.ones(2, 128, dtype=torch.bool)
+    out = model(iq, mask, mode="task", task="prediction")
+    loss, _ = downstream_task_loss(out, {}, "prediction", phys_weight=0.0)
+    loss.backward()
+    adapter_grad = model.task_adapters.prediction.net[-1].weight.grad
+    assert adapter_grad is not None
+    assert float(adapter_grad.norm()) > 0.0
+
+
 def test_stage2_unified_prediction_skips_head_training() -> None:
     torch.manual_seed(5)
     model = SignalFoundationModel(_cfg())

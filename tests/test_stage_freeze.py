@@ -99,7 +99,21 @@ def test_stage3_only_current_task() -> None:
     assert not any(n.startswith("task_interface.") for n in names)
 
 
-def test_joint_only_shared_adapter_and_task_params() -> None:
+def test_stage3_prediction_trains_legacy_head_and_adapter() -> None:
+    from scripts.train import load_train_bundle
+
+    cfg = load_train_bundle("configs/stage3.yaml", profile="prediction", model_config="configs/model_tiny.yaml")
+    model = _tiny(force_unified_generation=True, use_legacy_generation_heads=True)
+    inject_hybrid_lora(
+        model,
+        ["prediction"],
+        PeftConfig(r_attn=2, r_mamba=2, lora_alpha_attn=2, lora_alpha_mamba=2),
+    )
+    apply_stage_freeze(model, "stage3", task="prediction", train_cfg=cfg)
+    names = _trainable_names(model)
+    assert any(n.startswith("prediction_head.") for n in names)
+    assert any(n.startswith("task_adapters.prediction.") for n in names)
+    assert not any(n.startswith("decoder.") and "lora" not in n for n in names)
     model = _tiny()
     inject_hybrid_lora(
         model,

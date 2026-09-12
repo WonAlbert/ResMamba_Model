@@ -1407,6 +1407,12 @@ class SignalFoundationModel(nn.Module):
         else:
             dec_tokens = h_enc if encode_all else h_vis
             dec_packed = False if encode_all else packed_enc
+            task = self._active_task
+            if task is not None and not encode_all:
+                kind = self.task_kind(task)
+                head = self.get_task_head(task)
+                if kind in ("prediction", "imputation") and not self._should_use_generation_head(kind, head):
+                    dec_tokens = self._adapt_generation_tokens(dec_tokens, task)
             dec = self.decoder(
                 dec_tokens,
                 tokens,
@@ -1878,6 +1884,17 @@ class SignalFoundationModel(nn.Module):
             )
         else:
             out["mae_pred"] = pred
+
+    def _adapt_generation_tokens(self, tokens: torch.Tensor, task: str) -> torch.Tensor:
+        """统一 decoder 生成：在进 SharedDecoder 前注入任务 adapter（与 head 路径共享权重）。"""
+        adapters = self.task_adapters
+        if adapters is None or task not in adapters:
+            return tokens
+        out = tokens + adapters[task].residual(tokens)
+        shared = self.shared_adapter
+        if shared is not None:
+            out = out + shared.residual(out)
+        return out
 
     def _downstream_features(
         self,

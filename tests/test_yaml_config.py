@@ -80,6 +80,9 @@ def test_stage_yaml_profiles() -> None:
     assert s3["loraplus_lr_ratio"] == 16
     s3_clu = load_yaml_config("configs/stage3.yaml", profile="ld_clustering")
     assert s3_clu["checkpoint_monitor"] == "val/nmi_ld_clustering"
+    s3_pred = load_yaml_config("configs/stage3.yaml", profile="prediction")
+    assert s3_pred.get("use_legacy_generation_heads") is True
+    assert s3_pred.get("skip_recon") is True
     joint = load_yaml_config("configs/joint.yaml")
     assert joint["checkpoint_monitor"] == "val/specialist_geomean"
     assert joint["peft"]["shared_lora"] is False

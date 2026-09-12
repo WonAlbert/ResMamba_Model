@@ -63,6 +63,8 @@ cluster_balance_mix: 0.0
 cluster_sinkhorn_epsilon: 0.1
 cluster_consistency_weight: 1.0
 use_dataset_bias: false
+# 关闭低秩原型头：完整 residual MLP + 高维 Cosine（覆盖 model.yaml）
+low_rank_prototype: false
 train_encoder: false
 train_decoder: false
 train_heads: true
